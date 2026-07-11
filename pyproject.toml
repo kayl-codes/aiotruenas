@@ -1,0 +1,44 @@
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[project]
+name = "aiotruenas"
+version = "0.1.0"
+description = "Asyncio-native Python client for the TrueNAS JSON-RPC WebSocket API"
+readme = "README.md"
+license = "Apache-2.0"
+license-files = ["LICENSE"]
+requires-python = ">=3.13"
+authors = [{ name = "kayl-codes" }]
+keywords = ["truenas", "websocket", "jsonrpc", "asyncio"]
+classifiers = [
+    "Development Status :: 3 - Alpha",
+    "Intended Audience :: Developers",
+    "License :: OSI Approved :: Apache Software License",
+    "Programming Language :: Python :: 3.13",
+    "Topic :: Software Development :: Libraries :: Python Modules",
+    "Typing :: Typed",
+]
+dependencies = ["websockets>=15.0.1"]
+
+[project.urls]
+Homepage = "https://github.com/kayl-codes/aiotruenas"
+Issues = "https://github.com/kayl-codes/aiotruenas/issues"
+
+[project.optional-dependencies]
+dev = ["pytest>=8", "pytest-asyncio>=0.24", "ruff>=0.6", "trustme>=1.1"]
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/aiotruenas"]
+
+[tool.ruff]
+line-length = 88
+target-version = "py313"
+
+[tool.ruff.lint]
+select = ["E", "F", "W", "I", "UP", "ASYNC"]
+
+[tool.pytest.ini_options]
+asyncio_mode = "auto"
+testpaths = ["tests"]

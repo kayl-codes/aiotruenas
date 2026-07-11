@@ -17,26 +17,29 @@ before making architectural changes.
 
 ## Status
 
-Implementation of the initial client (per PROMPT.md) is **in progress**. Until that lands, most of
-the sections below are placeholders describing the *planned* shape, not existing code — check the
-current tree before relying on any file path mentioned here.
+The initial client (per PROMPT.md) is implemented: `TrueNASClient`, the exception hierarchy, error
+classification, job polling, a fake-server test suite, and CI are all in place. Not yet done: real-world
+verification against a live TrueNAS instance, and the later, separate step of integrating this package
+into the `truenas_ce` Home Assistant custom integration.
 
 ## Commands
 
-Planned to mirror `kayl-codes/homeassistant-truenas`'s CI pattern:
+Mirrors `kayl-codes/homeassistant-truenas`'s CI pattern ([.github/workflows/ci.yml](.github/workflows/ci.yml)):
 
 ```bash
-ruff check .            # lint (rules E, F, W, I, UP, ASYNC; py313, line-length 88) — TODO: not yet configured
-ruff format --check .   # formatting check; drop --check to auto-format         — TODO: not yet configured
-pytest                  # unit tests against a mock websockets server            — TODO: no tests/ yet
+ruff check .            # lint (rules E, F, W, I, UP, ASYNC; py313, line-length 88)
+ruff format --check .   # formatting check; drop --check to auto-format
+pytest                  # unit tests against a fake websockets server (tests/fake_server.py)
 ```
 
 - Python target: **3.13** (`requires-python = ">=3.13"`).
-- Single runtime dependency: `websockets>=15.0.1`.
-- `pyproject.toml`, `ruff` config, `pytest`/`pytest-asyncio` setup, and CI (`.github/workflows/`) do
-  not exist yet — this is tracked as part of the PROMPT.md implementation, not assumed to be present.
+- Single runtime dependency: `websockets>=15.0.1`. Dev deps (`pytest`, `pytest-asyncio`, `ruff`,
+  `trustme`) are in `pyproject.toml`'s `[project.optional-dependencies].dev`; install with
+  `pip install -e ".[dev]"`.
+- `pre-commit` is configured ([.pre-commit-config.yaml](.pre-commit-config.yaml)) with the same ruff
+  hooks as CI.
 
-## Architecture (planned — see PROMPT.md for full detail)
+## Architecture (see PROMPT.md for full detail)
 
 - **`TrueNASClient`**: the sole public entry point. Asyncio-native, no threads, no `RLock` — a
   single `asyncio.Lock` serializes send/recv on the shared WebSocket connection. Public shape:
