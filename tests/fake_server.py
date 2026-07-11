@@ -20,6 +20,25 @@ from websockets.asyncio.server import Server, ServerConnection, serve
 #: nor "error", to exercise the malformed-response path.
 NO_RESULT = object()
 
+_JSONRPC_VERSION = "2.0"
+_KEY_ERROR = "error"
+_KEY_RESULT = "result"
+
+
+def _envelope(rpc_id: Any, **fields: Any) -> str:
+    return json.dumps({"jsonrpc": _JSONRPC_VERSION, "id": rpc_id, **fields})
+
+
+@dataclass
+class RawEnvelope:
+    """Send exactly these extra envelope fields, bypassing the "a dict
+    containing an 'error' key means send an error" convention used for plain
+    dict response values -- needed to test envelope-level edge cases like a
+    falsy ``"error"`` field alongside a real ``"result"``.
+    """
+
+    fields: dict[str, Any]
+
 
 @dataclass
 class FakeTrueNASServer:
@@ -63,13 +82,15 @@ class FakeTrueNASServer:
         if method == "auth.login_with_api_key":
             await self._handle_login(ws, rpc_id, params)
             return
-        if method == "core.get_jobs":
-            await self._handle_get_jobs(ws, rpc_id, params)
-            return
         if method in self.close_on_method:
             await ws.close()
             return
         if method in self.drop_response_for:
+            return
+        # Job-state simulation only kicks in when the test hasn't configured
+        # an explicit canned response for core.get_jobs itself.
+        if method == "core.get_jobs" and method not in self.responses:
+            await self._handle_get_jobs(ws, rpc_id, params)
             return
 
         await self._handle_generic(ws, rpc_id, method, params)
@@ -82,15 +103,20 @@ class FakeTrueNASServer:
             return
         key = params[0] if params else None
         result = key == self.valid_api_key
-        await ws.send(json.dumps({"jsonrpc": "2.0", "id": rpc_id, "result": result}))
+        await ws.send(_envelope(rpc_id, **{_KEY_RESULT: result}))
 
     async def _handle_get_jobs(
         self, ws: ServerConnection, rpc_id: Any, params: list
     ) -> None:
         job_id = params[0][0][2]
-        queue = self.job_states.get(job_id, [])
+        if job_id not in self.job_states:
+            # No queue configured for this id at all: simulate "job not
+            # found" (e.g. a stale/pruned id) rather than a synthetic SUCCESS.
+            await ws.send(_envelope(rpc_id, **{_KEY_RESULT: []}))
+            return
+        queue = self.job_states[job_id]
         state = queue.pop(0) if queue else {"id": job_id, "state": "SUCCESS"}
-        await ws.send(json.dumps({"jsonrpc": "2.0", "id": rpc_id, "result": [state]}))
+        await ws.send(_envelope(rpc_id, **{_KEY_RESULT: [state]}))
 
     async def _handle_generic(
         self, ws: ServerConnection, rpc_id: Any, method: str, params: list
@@ -101,17 +127,17 @@ class FakeTrueNASServer:
                 "message": "Method does not exist",
                 "data": {"error": 601, "errname": "ENOMETHOD", "reason": None},
             }
-            await ws.send(json.dumps({"jsonrpc": "2.0", "id": rpc_id, "error": error}))
+            await ws.send(_envelope(rpc_id, **{_KEY_ERROR: error}))
             return
 
         entry = self.responses[method]
         value = entry(params) if callable(entry) else entry
 
-        if value is NO_RESULT:
-            await ws.send(json.dumps({"jsonrpc": "2.0", "id": rpc_id}))
-        elif isinstance(value, dict) and "error" in value:
-            await ws.send(
-                json.dumps({"jsonrpc": "2.0", "id": rpc_id, "error": value["error"]})
-            )
+        if isinstance(value, RawEnvelope):
+            await ws.send(_envelope(rpc_id, **value.fields))
+        elif value is NO_RESULT:
+            await ws.send(_envelope(rpc_id))
+        elif isinstance(value, dict) and _KEY_ERROR in value:
+            await ws.send(_envelope(rpc_id, **{_KEY_ERROR: value[_KEY_ERROR]}))
         else:
-            await ws.send(json.dumps({"jsonrpc": "2.0", "id": rpc_id, "result": value}))
+            await ws.send(_envelope(rpc_id, **{_KEY_RESULT: value}))

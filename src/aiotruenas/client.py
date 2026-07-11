@@ -18,7 +18,6 @@ from .exceptions import (
     TrueNASCallTimeoutError,
     TrueNASConnectionClosedError,
     TrueNASConnectionError,
-    TrueNASHandshakeTimeoutError,
     TrueNASMalformedResponseError,
 )
 
@@ -38,6 +37,14 @@ _MAX_MESSAGE_SIZE = 16 * 1024 * 1024
 
 _JOB_TERMINAL_STATES = {"SUCCESS", "FAILED", "ABORTED"}
 _JOB_POLL_INTERVAL = 1.0
+#: How many consecutive empty core.get_jobs lookups to tolerate before
+#: concluding the job id will never appear (e.g. a stale/pruned id) and
+#: raising instead of polling forever.
+_JOB_MISSING_RETRY_LIMIT = 5
+
+_JSONRPC_VERSION = "2.0"
+_KEY_ERROR = "error"
+_KEY_RESULT = "result"
 
 
 def _normalize_params(params: list | dict | None) -> list | dict:
@@ -144,7 +151,7 @@ class TrueNASClient:
                     )
                     await asyncio.sleep(_HANDSHAKE_RETRY_DELAY)
                     continue
-                raise TrueNASHandshakeTimeoutError(str(exc)) from exc
+                raise classify_connect_exception(exc) from exc
             except (OSError, WebSocketException) as exc:
                 raise classify_connect_exception(exc) from exc
 
@@ -173,7 +180,7 @@ class TrueNASClient:
     async def _login(self, ws: ClientConnection) -> None:
         rpc_id = self._next_id()
         payload = {
-            "jsonrpc": "2.0",
+            "jsonrpc": _JSONRPC_VERSION,
             "id": rpc_id,
             "method": "auth.login_with_api_key",
             "params": [self._api_key],
@@ -182,40 +189,48 @@ class TrueNASClient:
             await ws.send(json.dumps(payload))
             async with asyncio.timeout(self._query_timeout):
                 response = await self._await_response(ws, rpc_id)
-        except ConnectionClosed as exc:
-            raise TrueNASConnectionClosedError(str(exc), phase="login") from exc
         except TimeoutError as exc:
             raise TrueNASCallTimeoutError(
                 "timed out while waiting for login response"
             ) from exc
+        except (ConnectionClosed, OSError, WebSocketException) as exc:
+            raise TrueNASConnectionClosedError(str(exc), phase="login") from exc
 
-        if response.get("error") is not None:
-            raise build_call_error(response["error"])
+        if response.get(_KEY_ERROR):
+            raise build_call_error(response[_KEY_ERROR])
 
-        if response.get("result") is not True:
+        if response.get(_KEY_RESULT) is not True:
             raise TrueNASAuthenticationError("TrueNAS rejected the API key")
 
     async def connect(self) -> None:
         """Open the WebSocket connection and log in.
 
         Raises a subclass of :class:`~aiotruenas.exceptions.TrueNASError` on
-        any failure. Idempotent: does nothing if already connected.
+        any failure. Idempotent: does nothing if already connected. Serialized
+        against :meth:`call` and :meth:`close` via the same lock, so
+        concurrent ``connect()`` calls cannot race and clobber ``self._ws``.
         """
-        if self._ws is not None:
-            return
+        async with self._lock:
+            if self._ws is not None:
+                return
 
-        ws = await self._open_websocket()
-        try:
-            await self._login(ws)
-        except Exception:
-            with contextlib.suppress(WebSocketException, OSError):
-                await ws.close()
-            raise
+            ws = await self._open_websocket()
+            try:
+                await self._login(ws)
+            except Exception:
+                with contextlib.suppress(WebSocketException, OSError):
+                    await ws.close()
+                raise
 
-        self._ws = ws
+            self._ws = ws
 
     async def close(self) -> None:
         """Close the WebSocket connection, if any. Safe to call repeatedly."""
+        async with self._lock:
+            await self._disconnect_locked()
+
+    async def _disconnect_locked(self) -> None:
+        """Close ``self._ws``. Caller must already hold ``self._lock``."""
         ws = self._ws
         self._ws = None
         if ws is not None:
@@ -240,61 +255,72 @@ class TrueNASClient:
         ``core.get_jobs`` until it reaches a terminal state; the job's own
         result (or error) is returned/raised instead.
         """
+        effective_timeout = self._query_timeout if timeout is None else timeout
+
         async with self._lock:
             if self._ws is None:
                 raise TrueNASConnectionError("not connected; call connect() first")
 
             rpc_id = self._next_id()
             payload = {
-                "jsonrpc": "2.0",
+                "jsonrpc": _JSONRPC_VERSION,
                 "id": rpc_id,
                 "method": method,
                 "params": _normalize_params(params),
             }
             try:
                 await self._ws.send(json.dumps(payload))
-                async with asyncio.timeout(timeout or self._query_timeout):
+                async with asyncio.timeout(effective_timeout):
                     response = await self._await_response(self._ws, rpc_id)
-            except ConnectionClosed as exc:
-                await self.close()
-                raise TrueNASConnectionClosedError(str(exc), phase="call") from exc
             except TimeoutError as exc:
-                await self.close()
+                await self._disconnect_locked()
                 raise TrueNASCallTimeoutError(
                     f"timed out while waiting for response to {method!r}"
                 ) from exc
+            except (ConnectionClosed, OSError, WebSocketException) as exc:
+                await self._disconnect_locked()
+                raise TrueNASConnectionClosedError(str(exc), phase="call") from exc
 
-        if response.get("error") is not None:
-            raise build_call_error(response["error"])
-        if "result" not in response:
+        if response.get(_KEY_ERROR):
+            raise build_call_error(response[_KEY_ERROR])
+        if _KEY_RESULT not in response:
             raise TrueNASMalformedResponseError(
                 f"response for {method!r} has no result"
             )
 
-        result = response["result"]
+        result = response[_KEY_RESULT]
         if job:
             return await self._wait_for_job(result)
         return result
 
     async def _wait_for_job(self, job_id: Any) -> Any:
-        if not isinstance(job_id, int):
+        if not isinstance(job_id, int) or isinstance(job_id, bool):
             raise TrueNASMalformedResponseError(
                 f"job=True expected an integer job id, got {job_id!r}"
             )
 
+        missing_count = 0
         while True:
             jobs = await self.call("core.get_jobs", [[["id", "=", job_id]]])
             if jobs:
+                missing_count = 0
                 state = jobs[0].get("state")
                 if state in _JOB_TERMINAL_STATES:
                     return self._resolve_job_result(job_id, jobs[0], state)
+            else:
+                missing_count += 1
+                if missing_count >= _JOB_MISSING_RETRY_LIMIT:
+                    raise TrueNASMalformedResponseError(
+                        f"job {job_id} did not appear in core.get_jobs after "
+                        f"{missing_count} attempts"
+                    )
             await asyncio.sleep(_JOB_POLL_INTERVAL)
 
     @staticmethod
     def _resolve_job_result(job_id: int, job: dict[str, Any], state: str) -> Any:
         if state == "SUCCESS":
-            return job.get("result")
-        message = job.get("error") or f"job {job_id} ended with state {state}"
+            return job.get(_KEY_RESULT)
+        message = job.get(_KEY_ERROR) or f"job {job_id} ended with state {state}"
         raise build_call_error({"message": message})
 
     async def __aenter__(self) -> Self:

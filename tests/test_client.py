@@ -2,12 +2,13 @@
 
 from __future__ import annotations
 
+import asyncio
 import socket
 import ssl
 
 import pytest
 import trustme
-from fake_server import NO_RESULT, FakeTrueNASServer
+from fake_server import NO_RESULT, FakeTrueNASServer, RawEnvelope
 
 from aiotruenas import (
     TrueNASAuthenticationError,
@@ -328,5 +329,105 @@ async def test_unknown_method_raises_call_error() -> None:
         try:
             with pytest.raises(TrueNASCallError):
                 await client.call("does.not.exist")
+        finally:
+            await client.close()
+
+
+# --- Regression tests for review findings ----------------------------------
+
+
+async def test_falsy_empty_error_is_treated_as_success() -> None:
+    """An empty ``"error": {}`` envelope field must not be treated as a real error."""
+    async with FakeTrueNASServer(
+        valid_api_key=API_KEY,
+        responses={
+            "system.info": RawEnvelope(
+                {"error": {}, "result": {"version": "should-not-raise"}}
+            )
+        },
+    ) as server:
+        client = make_client(server)
+        await client.connect()
+        try:
+            result = await client.call("system.info")
+        finally:
+            await client.close()
+    assert result == {"version": "should-not-raise"}
+
+
+async def test_explicit_small_call_timeout_is_not_replaced_by_default() -> None:
+    """A short explicit ``timeout=`` must be honored, not `or`-ed away.
+
+    Regression test: ``timeout or self._query_timeout`` would silently fall
+    back to the (here: much larger) default for any falsy explicit value.
+    Bounded by an outer 2s deadline so a regression fails fast instead of
+    hanging for the full 30s default.
+    """
+    async with FakeTrueNASServer(
+        valid_api_key=API_KEY, drop_response_for={"system.info"}
+    ) as server:
+        client = make_client(server, query_timeout=30.0)
+        await client.connect()
+        try:
+            with pytest.raises(TrueNASCallTimeoutError):
+                async with asyncio.timeout(2.0):
+                    await client.call("system.info", timeout=0.1)
+        finally:
+            await client.close()
+
+
+async def test_concurrent_connect_calls_do_not_race() -> None:
+    async with FakeTrueNASServer(valid_api_key=API_KEY) as server:
+        client = make_client(server)
+        try:
+            await asyncio.gather(client.connect(), client.connect())
+            assert client.connected
+        finally:
+            await client.close()
+
+
+async def test_close_while_call_in_flight_does_not_raise_attribute_error() -> None:
+    async with FakeTrueNASServer(
+        valid_api_key=API_KEY, drop_response_for={"system.info"}
+    ) as server:
+        client = make_client(server, query_timeout=0.2)
+        await client.connect()
+
+        call_task = asyncio.ensure_future(client.call("system.info"))
+        close_task = asyncio.ensure_future(client.close())
+
+        with pytest.raises(TrueNASCallTimeoutError):
+            await call_task
+        await close_task
+        assert not client.connected
+
+
+async def test_job_polling_rejects_bool_job_id() -> None:
+    async with FakeTrueNASServer(
+        valid_api_key=API_KEY, responses={"service.start": True}
+    ) as server:
+        client = make_client(server)
+        await client.connect()
+        try:
+            with pytest.raises(TrueNASMalformedResponseError):
+                await client.call("service.start", ["cifs"], job=True)
+        finally:
+            await client.close()
+
+
+async def test_job_polling_gives_up_on_job_that_never_appears(monkeypatch) -> None:
+    async def fake_sleep(_delay):
+        return
+
+    monkeypatch.setattr("aiotruenas.client.asyncio.sleep", fake_sleep)
+
+    async with FakeTrueNASServer(
+        valid_api_key=API_KEY, responses={"pool.scrub.scrub": 999}
+    ) as server:
+        client = make_client(server)
+        await client.connect()
+        try:
+            with pytest.raises(TrueNASMalformedResponseError):
+                await client.call("pool.scrub.scrub", ["tank", "START"], job=True)
         finally:
             await client.close()

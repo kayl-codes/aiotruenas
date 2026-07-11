@@ -13,6 +13,7 @@ from aiotruenas._errors import build_call_error, classify_connect_exception
 from aiotruenas.exceptions import (
     TrueNASCallError,
     TrueNASCertificateVerificationError,
+    TrueNASConnectionError,
     TrueNASConnectionRefusedError,
     TrueNASEndpointNotFoundError,
     TrueNASHandshakeTimeoutError,
@@ -69,6 +70,15 @@ class _FakeInvalidStatus(InvalidStatus):
 )
 def test_classify_connect_exception(exc: Exception, expected: type) -> None:
     assert isinstance(classify_connect_exception(exc), expected)
+
+
+def test_unknown_error_is_still_catchable_as_connection_error() -> None:
+    """Every classify_connect_exception() result must be a TrueNASConnectionError.
+
+    Callers are documented to catch `TrueNASConnectionError` around
+    `connect()` for all connection-setup failures, including unclassified ones.
+    """
+    assert issubclass(TrueNASUnknownError, TrueNASConnectionError)
 
 
 def test_build_call_error_extracts_reason_from_data() -> None:

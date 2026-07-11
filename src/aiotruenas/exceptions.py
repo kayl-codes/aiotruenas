@@ -134,5 +134,10 @@ class TrueNASCallError(TrueNASError):
         self.data = data
 
 
-class TrueNASUnknownError(TrueNASError):
-    """Fallback for connection failures that could not be classified."""
+class TrueNASUnknownError(TrueNASConnectionError):
+    """Fallback for connection failures that could not be classified.
+
+    Subclasses ``TrueNASConnectionError`` (not just ``TrueNASError``) so that
+    ``except TrueNASConnectionError`` around :meth:`TrueNASClient.connect`
+    still catches connection-setup failures the classifier couldn't name.
+    """
