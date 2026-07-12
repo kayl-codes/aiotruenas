@@ -64,7 +64,7 @@ async def _run(host: str, api_key: str, *, verify_ssl: bool) -> None:
             print(f"  {method}: OK -> {_summarize(result)}")
 
 
-def main(argv: list[str]) -> int:
+def main(argv: list[str]) -> None:
     args = _parse_args(argv)
 
     host = os.environ.get("TRUENAS_HOST")
@@ -75,7 +75,7 @@ def main(argv: list[str]) -> int:
             "verification (this is expected in CI and for developers without "
             "a real TrueNAS instance)."
         )
-        return 0
+        return
 
     verify_ssl = (
         _env_flag("TRUENAS_VERIFY_SSL", default=True)
@@ -89,8 +89,6 @@ def main(argv: list[str]) -> int:
         print(f"FAILED with {type(exc).__name__}: {exc}", file=sys.stderr)
         raise
 
-    return 0
-
 
 if __name__ == "__main__":
-    raise SystemExit(main(sys.argv[1:]))
+    main(sys.argv[1:])
