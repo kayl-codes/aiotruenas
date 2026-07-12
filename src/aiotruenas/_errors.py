@@ -14,6 +14,7 @@ from typing import Any
 from websockets.exceptions import InvalidStatus
 
 from .exceptions import (
+    TrueNASCallError,
     TrueNASCertificateVerificationError,
     TrueNASConnectionError,
     TrueNASConnectionRefusedError,
@@ -115,10 +116,8 @@ def classify_connect_exception(exc: Exception) -> TrueNASConnectionError:
     return TrueNASUnknownError(str(exc) or type(exc).__name__)
 
 
-def build_call_error(error: Any) -> Exception:
+def build_call_error(error: Any) -> TrueNASCallError:
     """Build a `TrueNASCallError` from a JSON-RPC ``error`` object."""
-    from .exceptions import TrueNASCallError
-
     if not isinstance(error, dict):
         return TrueNASCallError(str(error))
 

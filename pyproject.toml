@@ -27,7 +27,13 @@ Homepage = "https://github.com/kayl-codes/aiotruenas"
 Issues = "https://github.com/kayl-codes/aiotruenas/issues"
 
 [project.optional-dependencies]
-dev = ["pytest>=8", "pytest-asyncio>=0.24", "ruff>=0.6", "trustme>=1.1"]
+dev = [
+    "pytest>=8",
+    "pytest-asyncio>=0.24",
+    "pytest-cov>=6",
+    "ruff>=0.6",
+    "trustme>=1.1",
+]
 
 [tool.hatch.build.targets.wheel]
 packages = ["src/aiotruenas"]
