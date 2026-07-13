@@ -35,6 +35,7 @@ jobs:
   publish:
     name: Publish to PyPI
     needs: build
+    if: github.event.release.prerelease == false
     runs-on: ubuntu-latest
     environment:
       name: pypi
