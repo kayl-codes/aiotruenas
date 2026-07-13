@@ -36,7 +36,7 @@ jobs:
   publish:
     name: Publish to PyPI
     needs: build
-    if: github.event.release.prerelease == false
+    if: github.event.release.prerelease == false && startsWith(github.event.release.tag_name, 'v')
     runs-on: ubuntu-latest
     environment:
       name: pypi
