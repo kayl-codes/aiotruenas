@@ -7,6 +7,10 @@ on:
 permissions:
   contents: read
 
+concurrency:
+  group: pypi-publish-${{ github.event.release.tag_name }}
+  cancel-in-progress: false
+
 jobs:
   build:
     name: Build distribution
