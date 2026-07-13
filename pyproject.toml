@@ -35,6 +35,15 @@ dev = [
     "trustme>=1.1",
 ]
 
+[tool.hatch.build.targets.sdist]
+include = [
+    "/src",
+    "/tests",
+    "/README.md",
+    "/LICENSE",
+    "/PROMPT.md",
+]
+
 [tool.hatch.build.targets.wheel]
 packages = ["src/aiotruenas"]
 
