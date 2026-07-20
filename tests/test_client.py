@@ -396,7 +396,7 @@ async def test_close_while_call_in_flight_does_not_raise_attribute_error() -> No
         call_task = asyncio.ensure_future(client.call("system.info"))
         close_task = asyncio.ensure_future(client.close())
 
-        with pytest.raises(TrueNASCallTimeoutError):
+        with pytest.raises(TrueNASConnectionClosedError):
             await call_task
         await close_task
         assert not client.connected
@@ -431,3 +431,251 @@ async def test_job_polling_gives_up_on_job_that_never_appears(monkeypatch) -> No
                 await client.call("pool.scrub.scrub", ["tank", "START"], job=True)
         finally:
             await client.close()
+
+
+async def test_subscribe_returns_subscription_id_and_queue() -> None:
+    async with FakeTrueNASServer(valid_api_key=API_KEY) as server:
+        client = make_client(server)
+        await client.connect()
+        try:
+            sub_id, queue = await client.subscribe("app.stats")
+            assert isinstance(sub_id, str)
+            assert sub_id.startswith("sub-app.stats-")
+            assert isinstance(queue, asyncio.Queue)
+        finally:
+            await client.close()
+
+async def test_subscribe_raises_on_non_string_subscription_id(monkeypatch) -> None:
+    async with FakeTrueNASServer(valid_api_key=API_KEY) as server:
+        client = make_client(server)
+        await client.connect()
+        async def fake_call(method, params=None, *, job: bool = False):
+            return {"result": 123}
+        monkeypatch.setattr(client, "call", fake_call)
+        with pytest.raises(TrueNASMalformedResponseError) as excinfo:
+            await client.subscribe("app.stats")
+        assert "core.subscribe" in str(excinfo.value)
+        await client.close()
+
+async def test_subscribe_delivers_notifications() -> None:
+    async with FakeTrueNASServer(valid_api_key=API_KEY) as server:
+        client = make_client(server)
+        await client.connect()
+        try:
+            sub_id, queue = await client.subscribe("app.stats")
+            await server.send_subscription_event(
+                sub_id, {"fields": [{"app_name": "test-app", "stats": {}}]}
+            )
+            payload = await asyncio.wait_for(queue.get(), timeout=2.0)
+            assert payload.get("collection") == "app.stats"
+            assert payload.get("fields") == [{"app_name": "test-app", "stats": {}}]
+        finally:
+            await client.close()
+
+
+async def test_subscribe_routes_only_matching_subscription() -> None:
+    async with FakeTrueNASServer(valid_api_key=API_KEY) as server:
+        client = make_client(server)
+        await client.connect()
+        try:
+            sub_a, queue_a = await client.subscribe("app.stats")
+            sub_b, queue_b = await client.subscribe("pool.query")
+
+            await server.send_subscription_event(
+                sub_a, {"fields": [{"app_name": "app-1"}]}
+            )
+            payload_a = await asyncio.wait_for(queue_a.get(), timeout=2.0)
+            assert payload_a.get("collection") == "app.stats"
+
+            await server.send_subscription_event(
+                sub_b, {"fields": [{"pool": "pool-1"}]}
+            )
+            payload_b = await asyncio.wait_for(queue_b.get(), timeout=2.0)
+            assert payload_b.get("collection") == "pool.query"
+        finally:
+            await client.close()
+
+
+async def test_subscribe_routes_by_collection_prefix() -> None:
+    async with FakeTrueNASServer(valid_api_key=API_KEY) as server:
+        client = make_client(server)
+        await client.connect()
+        try:
+            sub_id, queue = await client.subscribe('app.stats:{"interval": 60}')
+
+            await server.send_subscription_event(
+                sub_id,
+                {"fields": [{"app_name": "app-1"}]},
+            )
+            payload = await asyncio.wait_for(queue.get(), timeout=2.0)
+            assert payload.get("collection") == 'app.stats:{"interval": 60}'
+        finally:
+            await client.close()
+
+
+async def test_subscribe_routes_jsonrpc_collection_update_notification() -> None:
+    async with FakeTrueNASServer(valid_api_key=API_KEY) as server:
+        client = make_client(server)
+        await client.connect()
+        try:
+            sub_id, queue = await client.subscribe('app.stats:{"interval": 60}')
+
+            await server.send_subscription_event(
+                sub_id,
+                {"fields": [{"app_name": "app-1"}]},
+                jsonrpc_notification=True,
+            )
+            payload = await asyncio.wait_for(queue.get(), timeout=2.0)
+            assert payload.get("method") == "collection_update"
+            params = payload.get("params", {})
+            assert params.get("collection") == 'app.stats:{"interval": 60}'
+            assert params.get("fields") == [{"app_name": "app-1"}]
+        finally:
+            await client.close()
+
+
+async def test_subscribe_routes_jsonrpc_notification_by_params_prefix() -> None:
+    async with FakeTrueNASServer(valid_api_key=API_KEY) as server:
+        client = make_client(server)
+        await client.connect()
+        try:
+            sub_id, queue = await client.subscribe("app.stats")
+
+            await server.send_subscription_event(
+                sub_id,
+                {"fields": [{"app_name": "app-1"}]},
+                jsonrpc_notification=True,
+                collection_override="app.stats:other",
+            )
+            payload = await asyncio.wait_for(queue.get(), timeout=2.0)
+            assert payload.get("method") == "collection_update"
+            params = payload.get("params", {})
+            assert params.get("collection") == "app.stats:other"
+        finally:
+            await client.close()
+
+
+async def test_subscribe_ignores_different_parameterized_event() -> None:
+    async with FakeTrueNASServer(valid_api_key=API_KEY) as server:
+        async with make_client(server) as client:
+            await client.connect()
+            sub_id, queue = await client.subscribe('app.stats:{"interval": 60}')
+
+            await server.send_subscription_event(
+                sub_id,
+                {"fields": [{"app_name": "app-1"}]},
+                collection_override='app.stats:{"interval": 30}',
+            )
+            with pytest.raises(asyncio.TimeoutError):
+                await asyncio.wait_for(queue.get(), timeout=0.2)
+
+
+
+async def test_subscribe_removed_on_unsubscribe() -> None:
+    async with FakeTrueNASServer(valid_api_key=API_KEY) as server:
+        client = make_client(server)
+        await client.connect()
+        try:
+            sub_id, queue = await client.subscribe("app.stats")
+            await client.unsubscribe(sub_id)
+
+            await server.send_subscription_event(
+                sub_id, {"fields": [{"app_name": "app-1"}]}
+            )
+            envelope = await asyncio.wait_for(queue.get(), timeout=0.5)
+            assert envelope is client._QUEUE_TERMINATOR
+
+
+async def test_unsubscribe_calls_api() -> None:
+    async with FakeTrueNASServer(valid_api_key=API_KEY) as server:
+        client = make_client(server)
+        await client.connect()
+        try:
+            sub_id, queue = await client.subscribe("app.stats")
+            await client.unsubscribe(sub_id)
+        finally:
+            await client.close()
+
+
+async def test_is_subscribed_tracks_active_subscriptions() -> None:
+    async with FakeTrueNASServer(valid_api_key=API_KEY) as server:
+        async with make_client(server) as client:
+            await client.connect()
+            assert not client.is_subscribed("sub-1")
+            sub_id, _ = await client.subscribe("app.stats")
+            assert client.is_subscribed(sub_id)
+            await client.unsubscribe(sub_id)
+            assert not client.is_subscribed(sub_id)
+
+
+async def test_get_subscription_events_reads_from_queue() -> None:
+    async with FakeTrueNASServer(valid_api_key=API_KEY) as server:
+        client = make_client(server)
+        await client.connect()
+        try:
+            sub_id, queue = await client.subscribe("app.stats")
+            await server.send_subscription_event(
+                sub_id,
+                {"fields": [{"app_name": "test"}]},
+            )
+            events = await client.get_subscription_events(sub_id, event_timeout=2.0)
+            assert len(events) == 1
+            assert events[0].get("fields") == [{"app_name": "test"}]
+        finally:
+            await client.close()
+
+
+async def test_get_subscription_events_timeout() -> None:
+    async with FakeTrueNASServer(valid_api_key=API_KEY) as server:
+        client = make_client(server)
+        await client.connect()
+        try:
+            sub_id, queue = await client.subscribe("app.stats")
+            events = await client.get_subscription_events(sub_id, event_timeout=0.1)
+            assert events == []
+        finally:
+            await client.close()
+
+
+async def test_get_subscription_events_unknown_subscription() -> None:
+    async with FakeTrueNASServer(valid_api_key=API_KEY) as server:
+        client = make_client(server)
+        await client.connect()
+        try:
+            events = await client.get_subscription_events("nonexistent")
+            assert events == []
+        finally:
+            await client.close()
+
+
+async def test_subscriptions_cleared_on_disconnect() -> None:
+    async with FakeTrueNASServer(valid_api_key=API_KEY) as server:
+        client = make_client(server)
+        await client.connect()
+        try:
+            sub_id, queue = await client.subscribe("app.stats")
+            assert sub_id in client._subscriptions
+            assert sub_id in client._subscription_events
+            await client.close()
+            assert sub_id not in client._subscriptions
+            assert sub_id not in client._subscription_events
+        finally:
+            await client.close()
+
+
+async def test_subscriptions_cleared_after_server_disconnect() -> None:
+    """Unhelpful server-side close should leave no stale subscription state."""
+    async with FakeTrueNASServer(valid_api_key=API_KEY) as server:
+        client = make_client(server)
+        await client.connect()
+        sub_id, _ = await client.subscribe("app.stats")
+        assert client.connected
+        assert sub_id in client._subscriptions
+
+        await server.close_connection()
+        await asyncio.sleep(0.1)
+
+        assert not client.connected
+        assert client._ws is None
+        assert sub_id not in client._subscriptions
+        assert sub_id not in client._subscription_events

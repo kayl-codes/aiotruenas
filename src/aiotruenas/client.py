@@ -59,6 +59,8 @@ def _normalize_params(params: list | dict | None) -> list | dict:
 class TrueNASClient:
     """A connection to a single TrueNAS instance's JSON-RPC 2.0 WebSocket API."""
 
+    _QUEUE_TERMINATOR = object()
+
     def __init__(
         self,
         host: str,
@@ -95,6 +97,10 @@ class TrueNASClient:
         self._ws: ClientConnection | None = None
         self._lock = asyncio.Lock()
         self._next_id_value = 1
+        self._pending_calls: dict[int, asyncio.Future[dict[str, Any]]] = {}
+        self._subscriptions: dict[str, asyncio.Queue[Any]] = {}
+        self._subscription_events: dict[str, str] = {}
+        self._reader_task: asyncio.Task[None] | None = None
 
     @property
     def connected(self) -> bool:
@@ -155,8 +161,6 @@ class TrueNASClient:
             except (OSError, WebSocketException) as exc:
                 raise classify_connect_exception(exc) from exc
 
-        raise AssertionError("unreachable")  # pragma: no cover
-
     async def _await_response(
         self, ws: ClientConnection, rpc_id: int
     ) -> dict[str, Any]:
@@ -202,6 +206,76 @@ class TrueNASClient:
         if response.get(_KEY_RESULT) is not True:
             raise TrueNASAuthenticationError("TrueNAS rejected the API key")
 
+    async def _read_loop(self) -> None:
+        """Background reader that routes messages to pending calls and subscriptions."""
+        assert self._ws is not None
+        try:
+            while True:
+                message = await self._ws.recv()
+                if not isinstance(message, str):
+                    continue
+                try:
+                    candidate = json.loads(message)
+                except json.JSONDecodeError:
+                    continue
+                if not isinstance(candidate, dict):
+                    continue
+
+                msg_id = candidate.get("id")
+                params = candidate.get("params")
+
+                if isinstance(msg_id, int):
+                    future = self._pending_calls.pop(msg_id, None)
+                    if future is not None and not future.done():
+                        future.set_result(candidate)
+                    continue
+
+                if isinstance(msg_id, str):
+                    queue = self._subscriptions.get(msg_id)
+                    if queue is not None:
+                        await queue.put(candidate)
+                        continue
+
+                await self._route_to_subscription(
+                    candidate.get("collection"), candidate
+                )
+
+                if (
+                    candidate.get("method") == "collection_update"
+                    and isinstance(params, dict)
+                ):
+                    await self._route_to_subscription(
+                        params.get("collection"), candidate
+                    )
+        except (ConnectionClosed, OSError, WebSocketException):
+            pass
+        finally:
+            self._ws = None
+            for future in self._pending_calls.values():
+                if not future.done():
+                    future.set_exception(
+                        TrueNASConnectionClosedError(
+                            "connection lost", phase="disconnect"
+                        )
+                    )
+            self._pending_calls.clear()
+            for queue in self._subscriptions.values():
+                queue.put_nowait(self._QUEUE_TERMINATOR)
+            self._subscriptions.clear()
+            self._subscription_events.clear()
+
+    async def _route_to_subscription(
+        self, collection: str | None, payload: dict[str, Any]
+    ) -> None:
+        """Route a notification payload to the matching subscription queue."""
+        if not isinstance(collection, str):
+            return
+        for sub_id, event_name in self._subscription_events.items():
+            if collection == event_name or collection.startswith(event_name + ":"):
+                queue = self._subscriptions.get(sub_id)
+                if queue is not None:
+                    await queue.put(payload)
+
     async def connect(self) -> None:
         """Open the WebSocket connection and log in.
 
@@ -223,6 +297,7 @@ class TrueNASClient:
                 raise
 
             self._ws = ws
+            self._reader_task = asyncio.create_task(self._read_loop())
 
     async def close(self) -> None:
         """Close the WebSocket connection, if any. Safe to call repeatedly."""
@@ -233,9 +308,30 @@ class TrueNASClient:
         """Close ``self._ws``. Caller must already hold ``self._lock``."""
         ws = self._ws
         self._ws = None
+        reader_task = self._reader_task
+        self._reader_task = None
+
+        if reader_task is not None:
+            reader_task.cancel()
+            with contextlib.suppress(asyncio.CancelledError):
+                await reader_task
+
         if ws is not None:
             with contextlib.suppress(WebSocketException, OSError):
                 await ws.close()
+
+        for future in self._pending_calls.values():
+            if not future.done():
+                future.set_exception(
+                    TrueNASConnectionClosedError(
+                        "connection closed", phase="disconnect"
+                    )
+                )
+        self._pending_calls.clear()
+        for queue in self._subscriptions.values():
+            queue.put_nowait(self._QUEUE_TERMINATOR)
+        self._subscriptions.clear()
+        self._subscription_events.clear()
 
     async def call(
         self,
@@ -262,24 +358,49 @@ class TrueNASClient:
                 raise TrueNASConnectionError("not connected; call connect() first")
 
             rpc_id = self._next_id()
+            future: asyncio.Future[dict[str, Any]] = (
+                asyncio.get_running_loop().create_future()
+            )
+            self._pending_calls[rpc_id] = future
+
             payload = {
                 "jsonrpc": _JSONRPC_VERSION,
                 "id": rpc_id,
                 "method": method,
                 "params": _normalize_params(params),
             }
+
+            send_error: Exception | None = None
             try:
                 await self._ws.send(json.dumps(payload))
-                async with asyncio.timeout(effective_timeout):
-                    response = await self._await_response(self._ws, rpc_id)
-            except TimeoutError as exc:
-                await self._disconnect_locked()
-                raise TrueNASCallTimeoutError(
-                    f"timed out while waiting for response to {method!r}"
-                ) from exc
             except (ConnectionClosed, OSError, WebSocketException) as exc:
+                send_error = exc
+                self._pending_calls.pop(rpc_id, None)
+
+            if send_error is not None:
                 await self._disconnect_locked()
-                raise TrueNASConnectionClosedError(str(exc), phase="call") from exc
+                raise TrueNASConnectionClosedError(
+                    str(send_error), phase="call"
+                ) from send_error
+
+        try:
+            async with asyncio.timeout(effective_timeout):
+                response = await future
+        except TimeoutError:
+            self._pending_calls.pop(rpc_id, None)
+            await self.close()
+            raise TrueNASCallTimeoutError(
+                f"timed out while waiting for response to {method!r}"
+            )
+        except (
+            ConnectionClosed,
+            OSError,
+            WebSocketException,
+            TrueNASConnectionClosedError,
+        ) as exc:
+            self._pending_calls.pop(rpc_id, None)
+            await self.close()
+            raise TrueNASConnectionClosedError(str(exc), phase="call") from exc
 
         if response.get(_KEY_ERROR):
             raise build_call_error(response[_KEY_ERROR])
@@ -322,6 +443,68 @@ class TrueNASClient:
             return job.get(_KEY_RESULT)
         message = job.get(_KEY_ERROR) or f"job {job_id} ended with state {state}"
         raise build_call_error({"message": message})
+
+    async def subscribe(self, event: str) -> tuple[str, asyncio.Queue[dict[str, Any]]]:
+        """Subscribe to a TrueNAS event and return ``(subscription_id, queue)``.
+
+        The queue receives raw notification payloads for the event. The
+        caller reads from the queue and should call :meth:`unsubscribe`
+        when done.
+        """
+        result = await self.call("core.subscribe", [event])
+        if not isinstance(result, str):
+            raise TrueNASMalformedResponseError(
+                f"core.subscribe returned non-string subscription id: {result!r}"
+            )
+        queue: asyncio.Queue[dict[str, Any]] = asyncio.Queue()
+        self._subscriptions[result] = queue
+        self._subscription_events[result] = event
+        return result, queue
+
+    async def unsubscribe(self, subscription_id: str) -> None:
+        """Unsubscribe from a TrueNAS event."""
+        await self.call("core.unsubscribe", [subscription_id])
+        queue = self._subscriptions.pop(subscription_id, None)
+        if queue is not None:
+            queue.put_nowait(self._QUEUE_TERMINATOR)
+        self._subscription_events.pop(subscription_id, None)
+
+    def is_subscribed(self, subscription_id: str) -> bool:
+        """Return True if the subscription_id is currently tracked."""
+        return subscription_id in self._subscriptions
+
+    async def get_subscription_events(
+        self, subscription_id: str, event_timeout: float | None = None
+    ) -> list[dict[str, Any]]:
+        """Read events from a subscription queue.
+
+        Returns the raw notification payloads from queued WebSocket messages.
+        """
+        queue = self._subscriptions.get(subscription_id)
+        if queue is None:
+            return []
+
+        events: list[dict[str, Any]] = []
+        if event_timeout is not None:
+            try:
+                envelope = await asyncio.wait_for(queue.get(), timeout=event_timeout)
+            except TimeoutError:
+                envelope = None
+
+            if envelope is self._QUEUE_TERMINATOR:
+                return events
+
+            if isinstance(envelope, dict):
+                events.append(envelope)
+
+        while not queue.empty():
+            envelope = queue.get_nowait()
+            if envelope is self._QUEUE_TERMINATOR:
+                break
+            if isinstance(envelope, dict):
+                events.append(envelope)
+
+        return events
 
     async def __aenter__(self) -> Self:
         await self.connect()

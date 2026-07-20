@@ -24,6 +24,13 @@ async def main() -> None:
         info = await client.call("system.info")
         print(info)
 
+        sub_id, queue = await client.subscribe("app.stats")
+        try:
+            events = await client.get_subscription_events(sub_id, event_timeout=5.0)
+            print(events)
+        finally:
+            await client.unsubscribe(sub_id)
+
 
 asyncio.run(main())
 ```

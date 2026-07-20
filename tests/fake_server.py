@@ -53,6 +53,59 @@ class FakeTrueNASServer:
     host: str = "127.0.0.1"
     port: int = field(default=0, init=False)
     _server: Server | None = field(default=None, init=False, repr=False)
+    _subscriptions: dict[str, dict[str, Any]] = field(
+        default_factory=dict, init=False, repr=False
+    )
+    _connection: ServerConnection | None = field(default=None, init=False, repr=False)
+
+    async def send_subscription_event(
+        self,
+        subscription_id: str,
+        fields: dict[str, Any] | None = None,
+        jsonrpc_notification: bool = False,
+        collection_override: str | None = None,
+    ) -> None:
+        """Send a subscription notification to the client."""
+        if self._connection is None:
+            raise RuntimeError("No active connection to send event to")
+
+        sub_info = self._subscriptions.get(subscription_id, {})
+        event_name = (
+            sub_info.get("event", "unknown")
+            if isinstance(sub_info, dict)
+            else "unknown"
+        )
+
+        if jsonrpc_notification:
+            params_fields = fields if fields is not None else []
+            if isinstance(params_fields, dict) and "fields" in params_fields:
+                params_fields = params_fields["fields"]
+            payload: dict[str, Any] = {
+                "jsonrpc": _JSONRPC_VERSION,
+                "method": "collection_update",
+                "params": {
+                    "msg": "added",
+                    "collection": collection_override or event_name,
+                    "id": subscription_id,
+                    "fields": params_fields,
+                },
+            }
+        else:
+            payload = {
+                "jsonrpc": _JSONRPC_VERSION,
+                "msg": "added",
+                "collection": event_name,
+            }
+            if fields is not None:
+                payload.update(fields)
+            if collection_override is not None:
+                payload["collection"] = collection_override
+        await self._connection.send(json.dumps(payload))
+
+    async def close_connection(self) -> None:
+        """Abruptly close the active client connection, simulating a server drop."""
+        if self._connection is not None:
+            await self._connection.close()
 
     async def __aenter__(self) -> FakeTrueNASServer:
         self._server = await serve(self._handle, self.host, 0, ssl=self.ssl_context)
@@ -65,14 +118,18 @@ class FakeTrueNASServer:
         await self._server.wait_closed()
 
     async def _handle(self, ws: ServerConnection) -> None:
-        async for raw in ws:
-            if not isinstance(raw, str):
-                continue
-            try:
-                message = json.loads(raw)
-            except json.JSONDecodeError:
-                continue
-            await self._dispatch(ws, message)
+        self._connection = ws
+        try:
+            async for raw in ws:
+                if not isinstance(raw, str):
+                    continue
+                try:
+                    message = json.loads(raw)
+                except json.JSONDecodeError:
+                    continue
+                await self._dispatch(ws, message)
+        finally:
+            self._connection = None
 
     async def _dispatch(self, ws: ServerConnection, message: dict[str, Any]) -> None:
         method = message.get("method")
@@ -81,6 +138,12 @@ class FakeTrueNASServer:
 
         if method == "auth.login_with_api_key":
             await self._handle_login(ws, rpc_id, params)
+            return
+        if method == "core.subscribe":
+            await self._handle_subscribe(ws, rpc_id, params)
+            return
+        if method == "core.unsubscribe":
+            await self._handle_unsubscribe(ws, rpc_id, params)
             return
         if method in self.close_on_method:
             await ws.close()
@@ -104,6 +167,21 @@ class FakeTrueNASServer:
         key = params[0] if params else None
         result = key == self.valid_api_key
         await ws.send(_envelope(rpc_id, **{_KEY_RESULT: result}))
+
+    async def _handle_subscribe(
+        self, ws: ServerConnection, rpc_id: Any, params: list
+    ) -> None:
+        event = params[0] if params else "unknown"
+        subscription_id = f"sub-{event}-{rpc_id}"
+        self._subscriptions[subscription_id] = {"event": event}
+        await ws.send(_envelope(rpc_id, **{_KEY_RESULT: subscription_id}))
+
+    async def _handle_unsubscribe(
+        self, ws: ServerConnection, rpc_id: Any, params: list
+    ) -> None:
+        subscription_id = params[0] if params else None
+        self._subscriptions.pop(subscription_id, None)
+        await ws.send(_envelope(rpc_id, **{_KEY_RESULT: True}))
 
     async def _handle_get_jobs(
         self, ws: ServerConnection, rpc_id: Any, params: list
