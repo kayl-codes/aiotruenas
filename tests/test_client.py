@@ -106,10 +106,10 @@ async def test_call_timeout_disconnects_client() -> None:
     async with FakeTrueNASServer(
         valid_api_key=API_KEY, drop_response_for={"system.info"}
     ) as server:
-        client = make_client(server, query_timeout=0.2)
-        await client.connect()
-        with pytest.raises(TrueNASCallTimeoutError):
-            await client.call("system.info")
+        async with make_client(server, query_timeout=0.2) as client:
+            await client.connect()
+            with pytest.raises(TrueNASCallTimeoutError):
+                await client.call("system.info")
         assert not client.connected
 
 
@@ -117,11 +117,11 @@ async def test_connection_lost_mid_query() -> None:
     async with FakeTrueNASServer(
         valid_api_key=API_KEY, close_on_method={"system.info"}
     ) as server:
-        client = make_client(server)
-        await client.connect()
-        with pytest.raises(TrueNASConnectionClosedError) as exc_info:
-            await client.call("system.info")
-        assert exc_info.value.phase == "call"
+        async with make_client(server) as client:
+            await client.connect()
+            with pytest.raises(TrueNASConnectionClosedError) as exc_info:
+                await client.call("system.info")
+            assert exc_info.value.phase == "call"
         assert not client.connected
 
 
@@ -139,28 +139,24 @@ async def test_reconnect_after_disconnect() -> None:
     async with FakeTrueNASServer(
         valid_api_key=API_KEY, close_on_method={"system.info"}
     ) as server:
-        client = make_client(server)
-        await client.connect()
-        with pytest.raises(TrueNASConnectionClosedError):
-            await client.call("system.info")
-        assert not client.connected
+        async with make_client(server) as client:
+            await client.connect()
+            with pytest.raises(TrueNASConnectionClosedError):
+                await client.call("system.info")
+            assert not client.connected
 
-        await client.connect()
-        assert client.connected
-        await client.close()
+            await client.connect()
+            assert client.connected
 
 
 async def test_malformed_response_raises() -> None:
     async with FakeTrueNASServer(
         valid_api_key=API_KEY, responses={"system.info": NO_RESULT}
     ) as server:
-        client = make_client(server)
-        await client.connect()
-        try:
+        async with make_client(server) as client:
+            await client.connect()
             with pytest.raises(TrueNASMalformedResponseError):
                 await client.call("system.info")
-        finally:
-            await client.close()
 
 
 async def test_call_error_from_server() -> None:
@@ -173,14 +169,11 @@ async def test_call_error_from_server() -> None:
         valid_api_key=API_KEY,
         responses={"pool.dataset.query": {"error": error}},
     ) as server:
-        client = make_client(server)
-        await client.connect()
-        try:
+        async with make_client(server) as client:
+            await client.connect()
             with pytest.raises(TrueNASCallError) as exc_info:
                 await client.call("pool.dataset.query")
             assert exc_info.value.reason == "Invalid dataset name"
-        finally:
-            await client.close()
 
 
 async def test_call_not_connected_raises() -> None:
@@ -198,12 +191,9 @@ async def test_call_params_normalization_dict_and_scalar() -> None:
             "pool.scrub.scrub": lambda params: seen_params.append(params) or True
         },
     ) as server:
-        client = make_client(server)
-        await client.connect()
-        try:
+        async with make_client(server) as client:
+            await client.connect()
             await client.call("pool.scrub.scrub", {"name": "tank", "action": "START"})
-        finally:
-            await client.close()
 
     assert seen_params == [[{"name": "tank", "action": "START"}]]
 
@@ -224,12 +214,9 @@ async def test_job_polling_waits_for_terminal_state(monkeypatch) -> None:
             ]
         },
     ) as server:
-        client = make_client(server)
-        await client.connect()
-        try:
+        async with make_client(server) as client:
+            await client.connect()
             result = await client.call("pool.scrub.scrub", ["tank", "START"], job=True)
-        finally:
-            await client.close()
 
     assert result == "scrub started"
 
@@ -245,13 +232,10 @@ async def test_job_polling_raises_on_failed_job(monkeypatch) -> None:
         responses={"replication.run": 7},
         job_states={7: [{"id": 7, "state": "FAILED", "error": "replication failed"}]},
     ) as server:
-        client = make_client(server)
-        await client.connect()
-        try:
+        async with make_client(server) as client:
+            await client.connect()
             with pytest.raises(TrueNASCallError, match="replication failed"):
                 await client.call("replication.run", [1], job=True)
-        finally:
-            await client.close()
 
 
 # --- Table-driven round-trip coverage for the RPC method catalog ----------
@@ -302,12 +286,10 @@ async def test_rpc_method_round_trip(method, params_and_result) -> None:
     async with FakeTrueNASServer(
         valid_api_key=API_KEY, responses={method: expected}
     ) as server:
-        client = make_client(server)
-        await client.connect()
-        try:
+        async with make_client(server) as client:
+            await client.connect()
             result = await client.call(method, params)
-        finally:
-            await client.close()
+            assert client.connected
     assert result == expected
 
 
@@ -324,13 +306,10 @@ async def test_async_context_manager() -> None:
 
 async def test_unknown_method_raises_call_error() -> None:
     async with FakeTrueNASServer(valid_api_key=API_KEY) as server:
-        client = make_client(server)
-        await client.connect()
-        try:
+        async with make_client(server) as client:
+            await client.connect()
             with pytest.raises(TrueNASCallError):
                 await client.call("does.not.exist")
-        finally:
-            await client.close()
 
 
 # --- Regression tests for review findings ----------------------------------
@@ -346,12 +325,9 @@ async def test_falsy_empty_error_is_treated_as_success() -> None:
             )
         },
     ) as server:
-        client = make_client(server)
-        await client.connect()
-        try:
+        async with make_client(server) as client:
+            await client.connect()
             result = await client.call("system.info")
-        finally:
-            await client.close()
     assert result == {"version": "should-not-raise"}
 
 
@@ -366,53 +342,44 @@ async def test_explicit_small_call_timeout_is_not_replaced_by_default() -> None:
     async with FakeTrueNASServer(
         valid_api_key=API_KEY, drop_response_for={"system.info"}
     ) as server:
-        client = make_client(server, query_timeout=30.0)
-        await client.connect()
-        try:
+        async with make_client(server, query_timeout=30.0) as client:
+            await client.connect()
             with pytest.raises(TrueNASCallTimeoutError):
                 async with asyncio.timeout(2.0):
                     await client.call("system.info", timeout=0.1)
-        finally:
-            await client.close()
 
 
 async def test_concurrent_connect_calls_do_not_race() -> None:
     async with FakeTrueNASServer(valid_api_key=API_KEY) as server:
-        client = make_client(server)
-        try:
+        async with make_client(server) as client:
             await asyncio.gather(client.connect(), client.connect())
             assert client.connected
-        finally:
-            await client.close()
 
 
 async def test_close_while_call_in_flight_does_not_raise_attribute_error() -> None:
     async with FakeTrueNASServer(
         valid_api_key=API_KEY, drop_response_for={"system.info"}
     ) as server:
-        client = make_client(server, query_timeout=0.2)
-        await client.connect()
+        async with make_client(server, query_timeout=0.2) as client:
+            await client.connect()
 
-        call_task = asyncio.ensure_future(client.call("system.info"))
-        close_task = asyncio.ensure_future(client.close())
+            call_task = asyncio.ensure_future(client.call("system.info"))
+            close_task = asyncio.ensure_future(client.close())
 
-        with pytest.raises(TrueNASConnectionClosedError):
-            await call_task
-        await close_task
-        assert not client.connected
+            with pytest.raises(TrueNASConnectionClosedError):
+                await call_task
+            await close_task
+            assert not client.connected
 
 
 async def test_job_polling_rejects_bool_job_id() -> None:
     async with FakeTrueNASServer(
         valid_api_key=API_KEY, responses={"service.start": True}
     ) as server:
-        client = make_client(server)
-        await client.connect()
-        try:
+        async with make_client(server) as client:
+            await client.connect()
             with pytest.raises(TrueNASMalformedResponseError):
                 await client.call("service.start", ["cifs"], job=True)
-        finally:
-            await client.close()
 
 
 async def test_job_polling_gives_up_on_job_that_never_appears(monkeypatch) -> None:
@@ -424,44 +391,40 @@ async def test_job_polling_gives_up_on_job_that_never_appears(monkeypatch) -> No
     async with FakeTrueNASServer(
         valid_api_key=API_KEY, responses={"pool.scrub.scrub": 999}
     ) as server:
-        client = make_client(server)
-        await client.connect()
-        try:
+        async with make_client(server) as client:
+            await client.connect()
             with pytest.raises(TrueNASMalformedResponseError):
                 await client.call("pool.scrub.scrub", ["tank", "START"], job=True)
-        finally:
-            await client.close()
 
 
 async def test_subscribe_returns_subscription_id_and_queue() -> None:
     async with FakeTrueNASServer(valid_api_key=API_KEY) as server:
-        client = make_client(server)
-        await client.connect()
-        try:
+        async with make_client(server) as client:
+            await client.connect()
             sub_id, queue = await client.subscribe("app.stats")
             assert isinstance(sub_id, str)
             assert sub_id.startswith("sub-app.stats-")
             assert isinstance(queue, asyncio.Queue)
-        finally:
-            await client.close()
+
 
 async def test_subscribe_raises_on_non_string_subscription_id(monkeypatch) -> None:
     async with FakeTrueNASServer(valid_api_key=API_KEY) as server:
-        client = make_client(server)
-        await client.connect()
-        async def fake_call(method, params=None, *, job: bool = False):
-            return {"result": 123}
-        monkeypatch.setattr(client, "call", fake_call)
-        with pytest.raises(TrueNASMalformedResponseError) as excinfo:
-            await client.subscribe("app.stats")
-        assert "core.subscribe" in str(excinfo.value)
-        await client.close()
+        async with make_client(server) as client:
+            await client.connect()
+
+            async def fake_call(method, params=None, *, job: bool = False):
+                return {"result": 123}
+
+            monkeypatch.setattr(client, "call", fake_call)
+            with pytest.raises(TrueNASMalformedResponseError) as excinfo:
+                await client.subscribe("app.stats")
+            assert "core.subscribe" in str(excinfo.value)
+
 
 async def test_subscribe_delivers_notifications() -> None:
     async with FakeTrueNASServer(valid_api_key=API_KEY) as server:
-        client = make_client(server)
-        await client.connect()
-        try:
+        async with make_client(server) as client:
+            await client.connect()
             sub_id, queue = await client.subscribe("app.stats")
             await server.send_subscription_event(
                 sub_id, {"fields": [{"app_name": "test-app", "stats": {}}]}
@@ -469,15 +432,12 @@ async def test_subscribe_delivers_notifications() -> None:
             payload = await asyncio.wait_for(queue.get(), timeout=2.0)
             assert payload.get("collection") == "app.stats"
             assert payload.get("fields") == [{"app_name": "test-app", "stats": {}}]
-        finally:
-            await client.close()
 
 
 async def test_subscribe_routes_only_matching_subscription() -> None:
     async with FakeTrueNASServer(valid_api_key=API_KEY) as server:
-        client = make_client(server)
-        await client.connect()
-        try:
+        async with make_client(server) as client:
+            await client.connect()
             sub_a, queue_a = await client.subscribe("app.stats")
             sub_b, queue_b = await client.subscribe("pool.query")
 
@@ -492,15 +452,12 @@ async def test_subscribe_routes_only_matching_subscription() -> None:
             )
             payload_b = await asyncio.wait_for(queue_b.get(), timeout=2.0)
             assert payload_b.get("collection") == "pool.query"
-        finally:
-            await client.close()
 
 
 async def test_subscribe_routes_by_collection_prefix() -> None:
     async with FakeTrueNASServer(valid_api_key=API_KEY) as server:
-        client = make_client(server)
-        await client.connect()
-        try:
+        async with make_client(server) as client:
+            await client.connect()
             sub_id, queue = await client.subscribe('app.stats:{"interval": 60}')
 
             await server.send_subscription_event(
@@ -509,15 +466,12 @@ async def test_subscribe_routes_by_collection_prefix() -> None:
             )
             payload = await asyncio.wait_for(queue.get(), timeout=2.0)
             assert payload.get("collection") == 'app.stats:{"interval": 60}'
-        finally:
-            await client.close()
 
 
 async def test_subscribe_routes_jsonrpc_collection_update_notification() -> None:
     async with FakeTrueNASServer(valid_api_key=API_KEY) as server:
-        client = make_client(server)
-        await client.connect()
-        try:
+        async with make_client(server) as client:
+            await client.connect()
             sub_id, queue = await client.subscribe('app.stats:{"interval": 60}')
 
             await server.send_subscription_event(
@@ -530,15 +484,12 @@ async def test_subscribe_routes_jsonrpc_collection_update_notification() -> None
             params = payload.get("params", {})
             assert params.get("collection") == 'app.stats:{"interval": 60}'
             assert params.get("fields") == [{"app_name": "app-1"}]
-        finally:
-            await client.close()
 
 
 async def test_subscribe_routes_jsonrpc_notification_by_params_prefix() -> None:
     async with FakeTrueNASServer(valid_api_key=API_KEY) as server:
-        client = make_client(server)
-        await client.connect()
-        try:
+        async with make_client(server) as client:
+            await client.connect()
             sub_id, queue = await client.subscribe("app.stats")
 
             await server.send_subscription_event(
@@ -551,8 +502,6 @@ async def test_subscribe_routes_jsonrpc_notification_by_params_prefix() -> None:
             assert payload.get("method") == "collection_update"
             params = payload.get("params", {})
             assert params.get("collection") == "app.stats:other"
-        finally:
-            await client.close()
 
 
 async def test_subscribe_ignores_different_parameterized_event() -> None:
@@ -573,9 +522,8 @@ async def test_subscribe_ignores_different_parameterized_event() -> None:
 
 async def test_subscribe_removed_on_unsubscribe() -> None:
     async with FakeTrueNASServer(valid_api_key=API_KEY) as server:
-        client = make_client(server)
-        await client.connect()
-        try:
+        async with make_client(server) as client:
+            await client.connect()
             sub_id, queue = await client.subscribe("app.stats")
             await client.unsubscribe(sub_id)
 
@@ -584,17 +532,16 @@ async def test_subscribe_removed_on_unsubscribe() -> None:
             )
             envelope = await asyncio.wait_for(queue.get(), timeout=0.5)
             assert envelope is client._QUEUE_TERMINATOR
+            with pytest.raises(asyncio.TimeoutError):
+                await asyncio.wait_for(queue.get(), timeout=0.5)
 
 
 async def test_unsubscribe_calls_api() -> None:
     async with FakeTrueNASServer(valid_api_key=API_KEY) as server:
-        client = make_client(server)
-        await client.connect()
-        try:
+        async with make_client(server) as client:
+            await client.connect()
             sub_id, queue = await client.subscribe("app.stats")
             await client.unsubscribe(sub_id)
-        finally:
-            await client.close()
 
 
 async def test_is_subscribed_tracks_active_subscriptions() -> None:
@@ -610,9 +557,8 @@ async def test_is_subscribed_tracks_active_subscriptions() -> None:
 
 async def test_get_subscription_events_reads_from_queue() -> None:
     async with FakeTrueNASServer(valid_api_key=API_KEY) as server:
-        client = make_client(server)
-        await client.connect()
-        try:
+        async with make_client(server) as client:
+            await client.connect()
             sub_id, queue = await client.subscribe("app.stats")
             await server.send_subscription_event(
                 sub_id,
@@ -621,46 +567,34 @@ async def test_get_subscription_events_reads_from_queue() -> None:
             events = await client.get_subscription_events(sub_id, event_timeout=2.0)
             assert len(events) == 1
             assert events[0].get("fields") == [{"app_name": "test"}]
-        finally:
-            await client.close()
 
 
 async def test_get_subscription_events_timeout() -> None:
     async with FakeTrueNASServer(valid_api_key=API_KEY) as server:
-        client = make_client(server)
-        await client.connect()
-        try:
+        async with make_client(server) as client:
+            await client.connect()
             sub_id, queue = await client.subscribe("app.stats")
             events = await client.get_subscription_events(sub_id, event_timeout=0.1)
             assert events == []
-        finally:
-            await client.close()
 
 
 async def test_get_subscription_events_unknown_subscription() -> None:
     async with FakeTrueNASServer(valid_api_key=API_KEY) as server:
-        client = make_client(server)
-        await client.connect()
-        try:
+        async with make_client(server) as client:
+            await client.connect()
             events = await client.get_subscription_events("nonexistent")
             assert events == []
-        finally:
-            await client.close()
 
 
 async def test_subscriptions_cleared_on_disconnect() -> None:
     async with FakeTrueNASServer(valid_api_key=API_KEY) as server:
-        client = make_client(server)
-        await client.connect()
-        try:
+        async with make_client(server) as client:
             sub_id, queue = await client.subscribe("app.stats")
             assert sub_id in client._subscriptions
             assert sub_id in client._subscription_events
-            await client.close()
-            assert sub_id not in client._subscriptions
-            assert sub_id not in client._subscription_events
-        finally:
-            await client.close()
+        assert not client.connected
+        assert sub_id not in client._subscriptions
+        assert sub_id not in client._subscription_events
 
 
 async def test_subscriptions_cleared_after_server_disconnect() -> None:
