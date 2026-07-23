@@ -97,7 +97,7 @@ class FakeTrueNASServer:
                 "collection": event_name,
             }
             if fields is not None:
-                payload.update(fields)
+                payload |= fields
             if collection_override is not None:
                 payload["collection"] = collection_override
         await self._connection.send(json.dumps(payload))

@@ -51,9 +51,7 @@ def _normalize_params(params: list | dict | None) -> list | dict:
     """Match the sync client's ``query()`` normalization: bare values wrap in a list."""
     if params is None:
         return []
-    if isinstance(params, list):
-        return params
-    return [params]
+    return params if isinstance(params, list) else [params]
 
 
 class TrueNASClient:
@@ -209,14 +207,39 @@ class TrueNASClient:
     async def _read_loop(self) -> None:
         """Background reader that routes messages to pending calls and subscriptions."""
         assert self._ws is not None
+        disconnect_cause: BaseException | None = None
         try:
             while True:
-                message = await self._ws.recv()
+                try:
+                    message = await self._ws.recv()
+                except (ConnectionError, OSError, WebSocketException) as exc:
+                    disconnect_cause = exc
+                    reason = getattr(
+                        getattr(exc, "code", None), "name", None
+                    ) or getattr(exc, "reason", None)
+                    _LOGGER.warning(
+                        "TrueNAS websocket connection closed (%s): %s",
+                        exc.__class__.__name__,
+                        reason or str(exc) or "no reason provided",
+                    )
+                    break
+                except Exception as exc:  # noqa: BLE001
+                    disconnect_cause = exc
+                    _LOGGER.exception(
+                        "Unexpected error receiving message from TrueNAS websocket"
+                    )
+                    break
+
                 if not isinstance(message, str):
                     continue
+
                 try:
                     candidate = json.loads(message)
                 except json.JSONDecodeError:
+                    _LOGGER.exception(
+                        "Failed to decode JSON message from TrueNAS websocket: %r",
+                        message,
+                    )
                     continue
                 if not isinstance(candidate, dict):
                     continue
@@ -225,56 +248,110 @@ class TrueNASClient:
                 params = candidate.get("params")
 
                 if isinstance(msg_id, int):
-                    future = self._pending_calls.pop(msg_id, None)
+                    # RPC responses carry the numeric id returned by _next_id().
+                    # Pop the matching pending call and complete its future.
+                    async with self._lock:
+                        future = self._pending_calls.pop(msg_id, None)
                     if future is not None and not future.done():
                         future.set_result(candidate)
                     continue
 
                 if isinstance(msg_id, str):
-                    queue = self._subscriptions.get(msg_id)
+                    # Server notifications addressed to a specific subscription
+                    # id are pushed straight to that subscription queue.
+                    async with self._lock:
+                        queue = self._subscriptions.get(msg_id)
                     if queue is not None:
                         await queue.put(candidate)
                         continue
 
+                # Remaining notifications are collection-based events. Route
+                # them by exact/parameterized collection match.
                 await self._route_to_subscription(
                     candidate.get("collection"), candidate
                 )
 
-                if (
-                    candidate.get("method") == "collection_update"
-                    and isinstance(params, dict)
+                if candidate.get("method") == "collection_update" and isinstance(
+                    params, dict
                 ):
                     await self._route_to_subscription(
                         params.get("collection"), candidate
                     )
         except (ConnectionClosed, OSError, WebSocketException):
             pass
+        except Exception as exc:
+            _LOGGER.exception("Unexpected error in websocket read loop")
+            disconnect_cause = exc
         finally:
+            await self._teardown_connection(cause=disconnect_cause)
+
+    async def _teardown_connection(self, cause: BaseException | None = None) -> None:
+        """Idempotently tear down connection state after a disconnect.
+
+        This is the single coordinator for connection cleanup. Both
+        :meth:`_read_loop` and :meth:`close` delegate here so cleanup is
+        centralized and reentrant-safe.
+        """
+        async with self._lock:
+            if self._ws is None and self._reader_task is None:
+                return
+
             self._ws = None
+
+            reader_task = self._reader_task
+            self._reader_task = None
+
+            if reader_task is not None and reader_task is not asyncio.current_task():
+                reader_task.cancel()
+
+            message = "connection lost"
+            if cause is not None and getattr(cause, "args", None):
+                message = str(cause.args[0])
+
             for future in self._pending_calls.values():
                 if not future.done():
                     future.set_exception(
                         TrueNASConnectionClosedError(
-                            "connection lost", phase="disconnect"
+                            message,
+                            phase="disconnect",
                         )
                     )
             self._pending_calls.clear()
+
             for queue in self._subscriptions.values():
                 queue.put_nowait(self._QUEUE_TERMINATOR)
             self._subscriptions.clear()
             self._subscription_events.clear()
 
+    @staticmethod
+    def _matches_subscription(collection: str, event_name: str) -> bool:
+        """Return True if a notification collection matches a subscription."""
+        if collection == event_name:
+            return True
+        return ":" in collection and collection.split(":", 1)[0] == event_name
+
     async def _route_to_subscription(
         self, collection: str | None, payload: dict[str, Any]
     ) -> None:
-        """Route a notification payload to the matching subscription queue."""
+        """Route a notification payload to the matching subscription queue.
+
+        Matching semantics:
+        * Exact match: ``collection == event_name``.
+        * Parameterized/base match: if ``collection`` contains a ``:``, the
+          portion before the first colon is compared to ``event_name``.
+        """
         if not isinstance(collection, str):
             return
-        for sub_id, event_name in self._subscription_events.items():
-            if collection == event_name or collection.startswith(event_name + ":"):
-                queue = self._subscriptions.get(sub_id)
-                if queue is not None:
-                    await queue.put(payload)
+
+        async with self._lock:
+            matching_queues = [
+                self._subscriptions[sub_id]
+                for sub_id, event_name in self._subscription_events.items()
+                if self._matches_subscription(collection, event_name)
+            ]
+
+        for queue in matching_queues:
+            await queue.put(payload)
 
     async def connect(self) -> None:
         """Open the WebSocket connection and log in.
@@ -300,38 +377,33 @@ class TrueNASClient:
             self._reader_task = asyncio.create_task(self._read_loop())
 
     async def close(self) -> None:
-        """Close the WebSocket connection, if any. Safe to call repeatedly."""
+        """Close the WebSocket connection, if any. Safe to call repeatedly.
+
+        The lifecycle is intentionally split into two lock acquisitions:
+        1. close the websocket and cancel the reader task
+        2. await the reader task outside the lock
+        3. run shared teardown under the lock again
+
+        This avoids deadlock while keeping connection state mutations serialized.
+        """
+        reader_task = None
         async with self._lock:
-            await self._disconnect_locked()
-
-    async def _disconnect_locked(self) -> None:
-        """Close ``self._ws``. Caller must already hold ``self._lock``."""
-        ws = self._ws
-        self._ws = None
-        reader_task = self._reader_task
-        self._reader_task = None
-
+            if self._ws is None:
+                return
+            reader_task = self._reader_task
+            self._reader_task = None
+            with contextlib.suppress(WebSocketException, OSError):
+                await self._ws.close()
         if reader_task is not None:
-            reader_task.cancel()
             with contextlib.suppress(asyncio.CancelledError):
                 await reader_task
+        await self._teardown_connection()
 
-        if ws is not None:
+    async def _close_websocket_locked(self) -> None:
+        """Close ``self._ws``. Caller must already hold ``self._lock``."""
+        if self._ws is not None:
             with contextlib.suppress(WebSocketException, OSError):
-                await ws.close()
-
-        for future in self._pending_calls.values():
-            if not future.done():
-                future.set_exception(
-                    TrueNASConnectionClosedError(
-                        "connection closed", phase="disconnect"
-                    )
-                )
-        self._pending_calls.clear()
-        for queue in self._subscriptions.values():
-            queue.put_nowait(self._QUEUE_TERMINATOR)
-        self._subscriptions.clear()
-        self._subscription_events.clear()
+                await self._ws.close()
 
     async def call(
         self,
@@ -375,10 +447,11 @@ class TrueNASClient:
                 await self._ws.send(json.dumps(payload))
             except (ConnectionClosed, OSError, WebSocketException) as exc:
                 send_error = exc
-                self._pending_calls.pop(rpc_id, None)
 
             if send_error is not None:
-                await self._disconnect_locked()
+                async with self._lock:
+                    self._pending_calls.pop(rpc_id, None)
+                    await self._close_websocket_locked()
                 raise TrueNASConnectionClosedError(
                     str(send_error), phase="call"
                 ) from send_error
@@ -386,20 +459,22 @@ class TrueNASClient:
         try:
             async with asyncio.timeout(effective_timeout):
                 response = await future
-        except TimeoutError:
-            self._pending_calls.pop(rpc_id, None)
-            await self.close()
+        except TimeoutError as e:
+            async with self._lock:
+                self._pending_calls.pop(rpc_id, None)
+                await self._close_websocket_locked()
             raise TrueNASCallTimeoutError(
                 f"timed out while waiting for response to {method!r}"
-            )
+            ) from e
         except (
             ConnectionClosed,
             OSError,
             WebSocketException,
             TrueNASConnectionClosedError,
         ) as exc:
-            self._pending_calls.pop(rpc_id, None)
-            await self.close()
+            async with self._lock:
+                self._pending_calls.pop(rpc_id, None)
+                await self._close_websocket_locked()
             raise TrueNASConnectionClosedError(str(exc), phase="call") from exc
 
         if response.get(_KEY_ERROR):
@@ -410,9 +485,7 @@ class TrueNASClient:
             )
 
         result = response[_KEY_RESULT]
-        if job:
-            return await self._wait_for_job(result)
-        return result
+        return await self._wait_for_job(result) if job else result
 
     async def _wait_for_job(self, job_id: Any) -> Any:
         if not isinstance(job_id, int) or isinstance(job_id, bool):
@@ -457,21 +530,31 @@ class TrueNASClient:
                 f"core.subscribe returned non-string subscription id: {result!r}"
             )
         queue: asyncio.Queue[dict[str, Any]] = asyncio.Queue()
-        self._subscriptions[result] = queue
-        self._subscription_events[result] = event
+        async with self._lock:
+            self._subscriptions[result] = queue
+            self._subscription_events[result] = event
         return result, queue
 
     async def unsubscribe(self, subscription_id: str) -> None:
         """Unsubscribe from a TrueNAS event."""
         await self.call("core.unsubscribe", [subscription_id])
-        queue = self._subscriptions.pop(subscription_id, None)
+        async with self._lock:
+            queue = self._subscriptions.pop(subscription_id, None)
+            self._subscription_events.pop(subscription_id, None)
         if queue is not None:
             queue.put_nowait(self._QUEUE_TERMINATOR)
-        self._subscription_events.pop(subscription_id, None)
 
-    def is_subscribed(self, subscription_id: str) -> bool:
+    async def _get_subscription_queue(
+        self, subscription_id: str
+    ) -> asyncio.Queue[Any] | None:
+        """Return the subscription queue, if it is currently tracked."""
+        async with self._lock:
+            return self._subscriptions.get(subscription_id)
+
+    async def is_subscribed(self, subscription_id: str) -> bool:
         """Return True if the subscription_id is currently tracked."""
-        return subscription_id in self._subscriptions
+        async with self._lock:
+            return subscription_id in self._subscriptions
 
     async def get_subscription_events(
         self, subscription_id: str, event_timeout: float | None = None
@@ -479,32 +562,52 @@ class TrueNASClient:
         """Read events from a subscription queue.
 
         Returns the raw notification payloads from queued WebSocket messages.
+
+        Raises:
+            KeyError: If the subscription_id is not currently tracked.
         """
-        queue = self._subscriptions.get(subscription_id)
-        if queue is None:
-            return []
+        try:
+            async with self._lock:
+                queue = self._subscriptions[subscription_id]
+        except KeyError as exc:
+            raise KeyError(
+                f"Unknown subscription_id {subscription_id!r}; "
+                "subscription may have been torn down or never created."
+            ) from exc
 
         events: list[dict[str, Any]] = []
-        if event_timeout is not None:
-            try:
-                envelope = await asyncio.wait_for(queue.get(), timeout=event_timeout)
-            except TimeoutError:
-                envelope = None
 
-            if envelope is self._QUEUE_TERMINATOR:
-                return events
+        # Raceguard/pubsub note:
+        # ``_QUEUE_TERMINATOR`` is a sentinel injected by teardown/unsubscribe.
+        # If seen, stop draining because the queue is no longer valid.
+        if event_timeout is None:
+            while True:
+                try:
+                    envelope = queue.get_nowait()
+                except asyncio.QueueEmpty:
+                    break
 
-            if isinstance(envelope, dict):
+                if self._is_queue_terminator(envelope):
+                    break
+
                 events.append(envelope)
+            return events
 
-        while not queue.empty():
-            envelope = queue.get_nowait()
-            if envelope is self._QUEUE_TERMINATOR:
-                break
-            if isinstance(envelope, dict):
-                events.append(envelope)
+        try:
+            async with asyncio.timeout(event_timeout):
+                envelope = await queue.get()
+        except TimeoutError:
+            return events
 
+        if self._is_queue_terminator(envelope):
+            return events
+
+        events.append(envelope)
         return events
+
+    def _is_queue_terminator(self, envelope: object) -> bool:
+        """Return True if ``envelope`` is the internal queue terminator sentinel."""
+        return envelope is self._QUEUE_TERMINATOR
 
     async def __aenter__(self) -> Self:
         await self.connect()

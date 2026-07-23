@@ -454,6 +454,21 @@ async def test_subscribe_routes_only_matching_subscription() -> None:
             assert payload_b.get("collection") == "pool.query"
 
 
+async def test_subscribe_ignores_similar_prefixed_event_names() -> None:
+    async with FakeTrueNASServer(valid_api_key=API_KEY) as server:
+        async with make_client(server) as client:
+            await client.connect()
+            sub_id, queue = await client.subscribe("app.stats")
+
+            await server.send_subscription_event(
+                sub_id,
+                {"fields": [{"app_name": "app-1"}]},
+                collection_override="app.stats_extra",
+            )
+            with pytest.raises(asyncio.TimeoutError):
+                await asyncio.wait_for(queue.get(), timeout=0.2)
+
+
 async def test_subscribe_routes_by_collection_prefix() -> None:
     async with FakeTrueNASServer(valid_api_key=API_KEY) as server:
         async with make_client(server) as client:
@@ -519,7 +534,6 @@ async def test_subscribe_ignores_different_parameterized_event() -> None:
                 await asyncio.wait_for(queue.get(), timeout=0.2)
 
 
-
 async def test_subscribe_removed_on_unsubscribe() -> None:
     async with FakeTrueNASServer(valid_api_key=API_KEY) as server:
         async with make_client(server) as client:
@@ -531,7 +545,7 @@ async def test_subscribe_removed_on_unsubscribe() -> None:
                 sub_id, {"fields": [{"app_name": "app-1"}]}
             )
             envelope = await asyncio.wait_for(queue.get(), timeout=0.5)
-            assert envelope is client._QUEUE_TERMINATOR
+            assert envelope is TrueNASClient._QUEUE_TERMINATOR
             with pytest.raises(asyncio.TimeoutError):
                 await asyncio.wait_for(queue.get(), timeout=0.5)
 
@@ -548,11 +562,11 @@ async def test_is_subscribed_tracks_active_subscriptions() -> None:
     async with FakeTrueNASServer(valid_api_key=API_KEY) as server:
         async with make_client(server) as client:
             await client.connect()
-            assert not client.is_subscribed("sub-1")
+            assert not await client.is_subscribed("sub-1")
             sub_id, _ = await client.subscribe("app.stats")
-            assert client.is_subscribed(sub_id)
+            assert await client.is_subscribed(sub_id)
             await client.unsubscribe(sub_id)
-            assert not client.is_subscribed(sub_id)
+            assert not await client.is_subscribed(sub_id)
 
 
 async def test_get_subscription_events_reads_from_queue() -> None:
@@ -582,19 +596,19 @@ async def test_get_subscription_events_unknown_subscription() -> None:
     async with FakeTrueNASServer(valid_api_key=API_KEY) as server:
         async with make_client(server) as client:
             await client.connect()
-            events = await client.get_subscription_events("nonexistent")
-            assert events == []
+            with pytest.raises(KeyError):
+                await client.get_subscription_events("nonexistent")
 
 
 async def test_subscriptions_cleared_on_disconnect() -> None:
     async with FakeTrueNASServer(valid_api_key=API_KEY) as server:
         async with make_client(server) as client:
             sub_id, queue = await client.subscribe("app.stats")
-            assert sub_id in client._subscriptions
-            assert sub_id in client._subscription_events
+            assert await client._get_subscription_queue(sub_id) is queue
+            assert await client.is_subscribed(sub_id)
         assert not client.connected
-        assert sub_id not in client._subscriptions
-        assert sub_id not in client._subscription_events
+        assert await client._get_subscription_queue(sub_id) is None
+        assert not await client.is_subscribed(sub_id)
 
 
 async def test_subscriptions_cleared_after_server_disconnect() -> None:
@@ -604,12 +618,12 @@ async def test_subscriptions_cleared_after_server_disconnect() -> None:
         await client.connect()
         sub_id, _ = await client.subscribe("app.stats")
         assert client.connected
-        assert sub_id in client._subscriptions
+        assert await client._get_subscription_queue(sub_id) is not None
 
         await server.close_connection()
         await asyncio.sleep(0.1)
 
         assert not client.connected
         assert client._ws is None
-        assert sub_id not in client._subscriptions
-        assert sub_id not in client._subscription_events
+        assert await client._get_subscription_queue(sub_id) is None
+        assert not await client.is_subscribed(sub_id)
