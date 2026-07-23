@@ -99,7 +99,7 @@ def _summarize(result: object) -> str:
 async def _check_subscriptions(client: TrueNASClient) -> None:
     """Subscribe to ``app.stats`` and drain any queued events."""
     try:
-        sub_id, queue = await client.subscribe("app.stats")
+        sub_id, _ = await client.subscribe("app.stats")
     except TrueNASError as exc:
         print(f"  subscribe(app.stats): FAILED ({type(exc).__name__}): {exc}")
         return

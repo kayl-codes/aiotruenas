@@ -57,6 +57,9 @@ class FakeTrueNASServer:
         default_factory=dict, init=False, repr=False
     )
     _connection: ServerConnection | None = field(default=None, init=False, repr=False)
+    _connection_for_subscription: dict[str, ServerConnection] = field(
+        default_factory=dict, init=False, repr=False
+    )
 
     async def send_subscription_event(
         self,
@@ -66,8 +69,11 @@ class FakeTrueNASServer:
         collection_override: str | None = None,
     ) -> None:
         """Send a subscription notification to the client."""
-        if self._connection is None:
-            raise RuntimeError("No active connection to send event to")
+        connection = self._connection_for_subscription.get(subscription_id)
+        if connection is None:
+            raise RuntimeError(
+                f"No active connection for subscription {subscription_id!r}"
+            )
 
         sub_info = self._subscriptions.get(subscription_id, {})
         event_name = (
@@ -97,10 +103,10 @@ class FakeTrueNASServer:
                 "collection": event_name,
             }
             if fields is not None:
-                payload.update(fields)
+                payload |= fields
             if collection_override is not None:
                 payload["collection"] = collection_override
-        await self._connection.send(json.dumps(payload))
+        await connection.send(json.dumps(payload))
 
     async def close_connection(self) -> None:
         """Abruptly close the active client connection, simulating a server drop."""
@@ -130,6 +136,10 @@ class FakeTrueNASServer:
                 await self._dispatch(ws, message)
         finally:
             self._connection = None
+            for sub_id in list(self._connection_for_subscription):
+                if self._connection_for_subscription[sub_id] is ws:
+                    self._connection_for_subscription.pop(sub_id, None)
+                    self._subscriptions.pop(sub_id, None)
 
     async def _dispatch(self, ws: ServerConnection, message: dict[str, Any]) -> None:
         method = message.get("method")
@@ -174,6 +184,7 @@ class FakeTrueNASServer:
         event = params[0] if params else "unknown"
         subscription_id = f"sub-{event}-{rpc_id}"
         self._subscriptions[subscription_id] = {"event": event}
+        self._connection_for_subscription[subscription_id] = ws
         await ws.send(_envelope(rpc_id, **{_KEY_RESULT: subscription_id}))
 
     async def _handle_unsubscribe(
