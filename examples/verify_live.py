@@ -96,6 +96,22 @@ def _summarize(result: object) -> str:
     return repr(result)
 
 
+async def _check_subscriptions(client: TrueNASClient) -> None:
+    """Subscribe to ``app.stats`` and drain any queued events."""
+    try:
+        sub_id, queue = await client.subscribe("app.stats")
+    except TrueNASError as exc:
+        print(f"  subscribe(app.stats): FAILED ({type(exc).__name__}): {exc}")
+        return
+    try:
+        events = await client.get_subscription_events(sub_id, event_timeout=2.0)
+        print(f"  subscribe(app.stats): OK -> {len(events)} event(s) received")
+    except TrueNASError as exc:
+        print(f"  get_subscription_events: FAILED ({type(exc).__name__}): {exc}")
+    finally:
+        await client.unsubscribe(sub_id)
+
+
 async def _check_job_polling(client: TrueNASClient) -> None:
     """Passively inspect recent jobs via `core.get_jobs`.
 
@@ -140,6 +156,7 @@ async def _run(host: str, api_key: str, *, verify_ssl: bool) -> None:
                 print(f"  {method}: OK -> {_summarize(result)}")
 
         await _check_job_polling(client)
+        await _check_subscriptions(client)
 
         if failed:
             print(

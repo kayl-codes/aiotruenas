@@ -34,9 +34,7 @@ _AUTH_REJECTED_STATUS_CODES = {401, 403}
 
 def _status_code(exc: BaseException) -> int | None:
     """Extract an HTTP status code from a ``websockets`` handshake failure."""
-    if isinstance(exc, InvalidStatus):
-        return exc.response.status_code
-    return None
+    return exc.response.status_code if isinstance(exc, InvalidStatus) else None
 
 
 def _classify_by_type(exc: Exception) -> TrueNASConnectionError | None:
@@ -78,9 +76,7 @@ def _classify_by_status_code(exc: Exception) -> TrueNASConnectionError | None:
         # reaches TrueNAS. TrueNAS itself upgrades the WebSocket regardless of
         # API key validity and only checks the key afterwards during login.
         return TrueNASProxyInterceptedError(str(exc))
-    if status_code == 404:
-        return TrueNASEndpointNotFoundError(str(exc))
-    return None
+    return TrueNASEndpointNotFoundError(str(exc)) if status_code == 404 else None
 
 
 # WARNING: deliberately bound to specific text fragments from the websockets/
@@ -101,10 +97,14 @@ _TEXT_FRAGMENT_RULES: tuple[tuple[str, type[TrueNASConnectionError]], ...] = (
 
 def _classify_by_text(exc: Exception) -> TrueNASConnectionError | None:
     normalized = str(exc).strip().lower()
-    for fragment, error_cls in _TEXT_FRAGMENT_RULES:
-        if fragment in normalized:
-            return error_cls(str(exc))
-    return None
+    return next(
+        (
+            error_cls(str(exc))
+            for fragment, error_cls in _TEXT_FRAGMENT_RULES
+            if fragment in normalized
+        ),
+        None,
+    )
 
 
 def classify_connect_exception(exc: Exception) -> TrueNASConnectionError:
