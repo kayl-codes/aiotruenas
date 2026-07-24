@@ -643,8 +643,13 @@ async def test_get_subscription_events_unknown_subscription() -> None:
     async with FakeTrueNASServer(valid_api_key=API_KEY) as server:
         async with make_client(server) as client:
             await client.connect()
-            with pytest.raises(KeyError):
+            with pytest.raises(KeyError) as exc_info:
                 await client.get_subscription_events("nonexistent")
+
+            # Assert that the error message preserves useful diagnostic detail
+            message = str(exc_info.value)
+            assert "nonexistent" in message
+            assert "subscription" in message
 
 
 async def test_subscriptions_cleared_on_disconnect() -> None:
