@@ -55,11 +55,21 @@ jobs:
       - name: pytest with coverage
         run: pytest --cov=aiotruenas --cov-report=xml
       - name: Write PR metadata
+        # Written via env: (not inlined into the script) so a crafted PR title/
+        # ref can't be spliced into the shell command. Uses `>` (not `>>`) so any
+        # pr.env a malicious test run may have planted earlier in this job is
+        # fully replaced, not appended to - sonar-pr.yml re-validates this file
+        # before trusting it regardless.
+        env:
+          PR_NUMBER: ${{ github.event.pull_request.number }}
+          PR_HEAD_REF: ${{ github.event.pull_request.head.ref }}
+          PR_BASE_REF: ${{ github.event.pull_request.base.ref }}
         run: |
-          echo "PR_NUMBER=${{ github.event.pull_request.number }}" >> pr.env
-          echo "PR_HEAD_SHA=${{ github.event.pull_request.head.sha }}" >> pr.env
-          echo "PR_HEAD_REF=${{ github.event.pull_request.head.ref }}" >> pr.env
-          echo "PR_BASE_REF=${{ github.event.pull_request.base.ref }}" >> pr.env
+          {
+            echo "PR_NUMBER=$PR_NUMBER"
+            echo "PR_HEAD_REF=$PR_HEAD_REF"
+            echo "PR_BASE_REF=$PR_BASE_REF"
+          } > pr.env
       - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         with:
           name: sonar-pr-data

@@ -37,8 +37,31 @@ jobs:
           github-token: ${{ secrets.GITHUB_TOKEN }}
           path: ${{ runner.temp }}/sonar-pr-data
 
-      - name: Load PR metadata
-        run: cat "${{ runner.temp }}/sonar-pr-data/pr.env" >> "$GITHUB_ENV"
+      - name: Load and validate PR metadata
+        # pr.env comes from prepare-pr-analysis, a job that runs the fork's own
+        # test suite - it must be treated as untrusted. Never `cat` it straight
+        # into $GITHUB_ENV: extract only the expected keys and reject anything
+        # that doesn't match a strict, injection-safe shape before this
+        # (secret-bearing) job's environment is allowed to see it.
+        run: |
+          set -euo pipefail
+          metadata="${{ runner.temp }}/sonar-pr-data/pr.env"
+
+          get_value() {
+            awk -F= -v key="$1" '$1 == key { print substr($0, length(key) + 2); exit }' "$metadata"
+          }
+
+          pr_number=$(get_value PR_NUMBER)
+          pr_head_ref=$(get_value PR_HEAD_REF)
+          pr_base_ref=$(get_value PR_BASE_REF)
+
+          [[ "$pr_number" =~ ^[0-9]+$ ]] || { echo "::error::invalid or missing PR_NUMBER in pr.env"; exit 1; }
+          [[ "$pr_head_ref" =~ ^[A-Za-z0-9._/-]+$ ]] || { echo "::error::invalid or missing PR_HEAD_REF in pr.env"; exit 1; }
+          [[ "$pr_base_ref" =~ ^[A-Za-z0-9._/-]+$ ]] || { echo "::error::invalid or missing PR_BASE_REF in pr.env"; exit 1; }
+
+          echo "PR_NUMBER=$pr_number" >> "$GITHUB_ENV"
+          echo "PR_HEAD_REF=$pr_head_ref" >> "$GITHUB_ENV"
+          echo "PR_BASE_REF=$pr_base_ref" >> "$GITHUB_ENV"
 
       - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
         with:
