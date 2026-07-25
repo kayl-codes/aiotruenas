@@ -67,6 +67,7 @@ jobs:
         with:
           fetch-depth: 0  # Shallow clones should be disabled for a better relevancy of analysis
           ref: refs/pull/${{ env.PR_NUMBER }}/head
+          persist-credentials: false
 
       - name: Restore coverage report
         run: cp "${{ runner.temp }}/sonar-pr-data/coverage.xml" coverage.xml
