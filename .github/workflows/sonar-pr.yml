@@ -1,0 +1,59 @@
+name: SonarQube (PR analysis)
+
+# Runs the SonarQube scan for pull requests, including ones from forks.
+#
+# PRs from forks never get repo secrets when triggered directly via
+# `pull_request` (see build.yml's `prepare-pr-analysis` job, which only
+# builds a coverage report + PR metadata artifact there, without SONAR_TOKEN).
+# This workflow is triggered by `workflow_run` instead, which always executes
+# using the workflow file from the base repo's default branch - a fork PR
+# cannot alter what this job does. It only ever downloads the artifact and
+# checks out the PR's already-tested source for static analysis; it never
+# installs dependencies from or executes code from the fork.
+on:
+  workflow_run:
+    workflows: ["Build"]
+    types: [completed]
+
+permissions:
+  contents: read
+
+jobs:
+  sonarqube:
+    name: SonarQube
+    if: >
+      github.event.workflow_run.event == 'pull_request' &&
+      github.event.workflow_run.conclusion == 'success'
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      actions: read
+    steps:
+      - name: Download PR analysis data
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          name: sonar-pr-data
+          run-id: ${{ github.event.workflow_run.id }}
+          github-token: ${{ secrets.GITHUB_TOKEN }}
+          path: ${{ runner.temp }}/sonar-pr-data
+
+      - name: Load PR metadata
+        run: cat "${{ runner.temp }}/sonar-pr-data/pr.env" >> "$GITHUB_ENV"
+
+      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+        with:
+          fetch-depth: 0  # Shallow clones should be disabled for a better relevancy of analysis
+          ref: refs/pull/${{ env.PR_NUMBER }}/head
+
+      - name: Restore coverage report
+        run: cp "${{ runner.temp }}/sonar-pr-data/coverage.xml" coverage.xml
+
+      - name: SonarQube Scan
+        uses: SonarSource/sonarqube-scan-action@713881670b6b3676cda39549040e2d88c70d582e # v8.2.0
+        env:
+          SONAR_TOKEN: ${{ secrets.SONAR_TOKEN }}
+        with:
+          args: >
+            -Dsonar.pullrequest.key=${{ env.PR_NUMBER }}
+            -Dsonar.pullrequest.branch=${{ env.PR_HEAD_REF }}
+            -Dsonar.pullrequest.base=${{ env.PR_BASE_REF }}
