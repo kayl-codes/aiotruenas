@@ -68,9 +68,39 @@ jobs:
           fetch-depth: 0  # Shallow clones should be disabled for a better relevancy of analysis
           ref: refs/pull/${{ env.PR_NUMBER }}/head
           persist-credentials: false
+          # checkout refuses fork-PR refs in a workflow_run job by default (the
+          # "pwn request" guard - see https://gh.io/securely-using-pull_request_target),
+          # since a fork's sonar-project.properties is PR-author-controlled and
+          # could otherwise redirect this job's SONAR_TOKEN-bearing traffic
+          # (e.g. via sonar.host.url) to an attacker's server. We neutralize
+          # that below by pinning the properties file to the trusted base ref
+          # and hard-forcing sonar.host.url via -D (which always outranks the
+          # properties file), so allow-unsafe-pr-checkout only ever exposes
+          # the PR's source *text* to the (non-executing) scanner, never its
+          # config.
+          #
+          # WARNING for future editors: this safety argument holds only as
+          # long as no step in this job installs dependencies from, builds,
+          # or otherwise executes the checked-out PR code (the classic pwn
+          # request pattern). If you add such a step, re-litigate whether
+          # allow-unsafe-pr-checkout is still safe here first.
+          allow-unsafe-pr-checkout: true
 
       - name: Restore coverage report
         run: cp "${{ runner.temp }}/sonar-pr-data/coverage.xml" coverage.xml
+
+      - name: Pin sonar-project.properties to the trusted base ref
+        # The fork's copy of this file is attacker-controlled and must never
+        # configure a job that holds SONAR_TOKEN (e.g. via sonar.host.url,
+        # proxy settings, exclusions). Overwrite it with the base branch's
+        # version before scanning; only the PR's source/test files (the
+        # intended scan target) come from the fork checkout. PR_BASE_REF is
+        # passed via env: (not spliced into the script) even though it was
+        # already regex-validated earlier - never template context values
+        # directly into run: text.
+        env:
+          PR_BASE_REF: ${{ env.PR_BASE_REF }}
+        run: git show "origin/$PR_BASE_REF:sonar-project.properties" > sonar-project.properties
 
       - name: SonarQube Scan
         uses: SonarSource/sonarqube-scan-action@713881670b6b3676cda39549040e2d88c70d582e # v8.2.0
@@ -78,6 +108,7 @@ jobs:
           SONAR_TOKEN: ${{ secrets.SONAR_TOKEN }}
         with:
           args: >
+            -Dsonar.host.url=https://sonarcloud.io
             -Dsonar.pullrequest.key=${{ env.PR_NUMBER }}
             -Dsonar.pullrequest.branch=${{ env.PR_HEAD_REF }}
             -Dsonar.pullrequest.base=${{ env.PR_BASE_REF }}
