@@ -68,6 +68,13 @@ jobs:
           fetch-depth: 0  # Shallow clones should be disabled for a better relevancy of analysis
           ref: refs/pull/${{ env.PR_NUMBER }}/head
           persist-credentials: false
+          # checkout refuses fork-PR refs in a workflow_run job by default (the
+          # "pwn request" guard) because that pattern is usually followed by
+          # building/executing the fork's code with this job's secrets. We
+          # never do that here: no dependency install, no test run - only the
+          # SonarQube scanner, which statically parses source text and never
+          # executes it. Safe to opt in for that reason.
+          allow-unsafe-pr-checkout: true
 
       - name: Restore coverage report
         run: cp "${{ runner.temp }}/sonar-pr-data/coverage.xml" coverage.xml
