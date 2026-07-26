@@ -101,7 +101,9 @@ class TrueNASAuthenticationError(TrueNASError):
 class TrueNASConnectionClosedError(TrueNASConnectionError):
     """The WebSocket connection was closed while a login or call was in flight."""
 
-    def __init__(self, message: str, *, phase: Literal["login", "call"]) -> None:
+    def __init__(
+        self, message: str, *, phase: Literal["login", "call", "disconnect"]
+    ) -> None:
         super().__init__(message)
         self.phase = phase
 
