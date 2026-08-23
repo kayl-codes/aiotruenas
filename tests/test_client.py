@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+import logging
 import socket
 import ssl
 
@@ -78,6 +79,58 @@ async def test_tls_certificate_verification_failure() -> None:
         client = TrueNASClient(server.host, API_KEY, use_tls=True, port=server.port)
         with pytest.raises(TrueNASCertificateVerificationError):
             await client.connect()
+
+
+async def test_verify_ssl_false_logs_warning_by_default(caplog) -> None:
+    ca = trustme.CA()
+    server_cert = ca.issue_cert("127.0.0.1")
+    ssl_context = ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER)
+    server_cert.configure_cert(ssl_context)
+
+    async with FakeTrueNASServer(
+        valid_api_key=API_KEY, ssl_context=ssl_context
+    ) as server:
+        client = TrueNASClient(
+            server.host, API_KEY, use_tls=True, verify_ssl=False, port=server.port
+        )
+        with caplog.at_level(logging.DEBUG):
+            await client.connect()
+        await client.close()
+
+    warnings = [
+        record
+        for record in caplog.records
+        if record.name == "aiotruenas.client"
+        and "verify_ssl=False" in record.getMessage()
+    ]
+    assert len(warnings) == 1
+    assert warnings[0].levelno == logging.WARNING
+
+
+async def test_verify_ssl_false_quiet_connect_logs_debug(caplog) -> None:
+    ca = trustme.CA()
+    server_cert = ca.issue_cert("127.0.0.1")
+    ssl_context = ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER)
+    server_cert.configure_cert(ssl_context)
+
+    async with FakeTrueNASServer(
+        valid_api_key=API_KEY, ssl_context=ssl_context
+    ) as server:
+        client = TrueNASClient(
+            server.host, API_KEY, use_tls=True, verify_ssl=False, port=server.port
+        )
+        with caplog.at_level(logging.DEBUG):
+            await client.connect(quiet=True)
+        await client.close()
+
+    matching = [
+        record
+        for record in caplog.records
+        if record.name == "aiotruenas.client"
+        and "verify_ssl=False" in record.getMessage()
+    ]
+    assert len(matching) == 1
+    assert matching[0].levelno == logging.DEBUG
 
 
 async def test_handshake_timeout_retries_once_then_raises(monkeypatch) -> None:

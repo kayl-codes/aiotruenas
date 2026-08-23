@@ -127,13 +127,14 @@ class TrueNASClient:
         self._next_id_value += 1
         return rpc_id
 
-    def _build_ssl_context(self) -> ssl.SSLContext:
+    def _build_ssl_context(self, *, quiet: bool = False) -> ssl.SSLContext:
         context = ssl.create_default_context()  # noqa: S4423
         if not self._verify_ssl:
             # Insecure configuration, opt-in only: disables certificate and
             # hostname verification. Only safe on trusted (e.g. local) networks
             # -- vulnerable to MITM otherwise.
-            _LOGGER.warning(
+            log = _LOGGER.debug if quiet else _LOGGER.warning
+            log(
                 "TrueNASClient configured with verify_ssl=False for '%s'. "
                 "This disables TLS certificate verification and hostname "
                 "checking and should only be used in trusted environments.",
@@ -143,13 +144,15 @@ class TrueNASClient:
             context.verify_mode = ssl.CERT_NONE
         return context
 
-    async def _get_ssl_context(self) -> ssl.SSLContext:
+    async def _get_ssl_context(self, *, quiet: bool = False) -> ssl.SSLContext:
         if self._ssl_context is None:
             # ssl.create_default_context() loads system certs (blocking).
-            self._ssl_context = await asyncio.to_thread(self._build_ssl_context)
+            self._ssl_context = await asyncio.to_thread(
+                self._build_ssl_context, quiet=quiet
+            )
         return self._ssl_context
 
-    async def _open_websocket(self) -> ClientConnection:
+    async def _open_websocket(self, *, quiet: bool = False) -> ClientConnection:
         """Open the WebSocket, retrying once after a delay on handshake timeout."""
         kwargs: dict[str, Any] = {
             "max_size": _MAX_MESSAGE_SIZE,
@@ -157,7 +160,7 @@ class TrueNASClient:
             "open_timeout": _OPEN_TIMEOUT,
         }
         if self._use_tls:
-            kwargs["ssl"] = await self._get_ssl_context()
+            kwargs["ssl"] = await self._get_ssl_context(quiet=quiet)
 
         for attempt in range(2):
             try:
@@ -389,19 +392,23 @@ class TrueNASClient:
                 if self._matches_subscription(collection, event_name)
             ]
 
-    async def connect(self) -> None:
+    async def connect(self, *, quiet: bool = False) -> None:
         """Open the WebSocket connection and log in.
 
         Raises a subclass of :class:`~aiotruenas.exceptions.TrueNASError` on
         any failure. Idempotent: does nothing if already connected. Serialized
         against :meth:`call` and :meth:`close` via the same lock, so
         concurrent ``connect()`` calls cannot race and clobber ``self._ws``.
+
+        ``quiet=True`` downgrades the ``verify_ssl=False`` warning to DEBUG,
+        for callers (e.g. discovery probing) that intentionally attempt many
+        expected-to-fail insecure connections.
         """
         async with self._lock:
             if self._ws is not None:
                 return
 
-            ws = await self._open_websocket()
+            ws = await self._open_websocket(quiet=quiet)
             try:
                 await self._login(ws)
             except Exception:
