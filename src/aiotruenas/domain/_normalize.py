@@ -359,6 +359,8 @@ def generate_keymap(
 # ---------------------------
 def matches_only(entry: dict[str, Any], only: list[dict[str, Any]]) -> bool:
     """Return True if all variables are matched."""
+    if not isinstance(entry, dict):
+        return False
     return all(entry.get(val["key"]) == val["value"] for val in only)
 
 
@@ -367,6 +369,8 @@ def matches_only(entry: dict[str, Any], only: list[dict[str, Any]]) -> bool:
 # ---------------------------
 def can_skip(entry: dict[str, Any], skip: list[dict[str, Any]]) -> bool:
     """Return True if at least one variable matches."""
+    if not isinstance(entry, dict):
+        return False
     ret = False
     for val in skip:
         if val["name"] in entry and entry[val["name"]] == val["value"]:
@@ -418,7 +422,10 @@ def _convert_timestamp(target: dict[str, Any], name: str) -> None:
 
     if value > MILLIS_TIMESTAMP_THRESHOLD:
         value = value / 1000
-    target[name] = utc_from_timestamp(value)
+    try:
+        target[name] = utc_from_timestamp(value)
+    except (OverflowError, OSError, ValueError):
+        target[name] = None
 
 
 # ---------------------------
@@ -486,7 +493,7 @@ def fill_ensure_vals(
     for val in ensure_vals:
         name = val["name"]
         if name not in target:
-            target[name] = val.get("default", "")
+            target[name] = _spec_default(val)
 
     return data
 

@@ -201,6 +201,16 @@ def test_matches_only_empty_list_returns_true(ap: ModuleType) -> None:
     assert ap.matches_only({"type": "DISK"}, []) is True
 
 
+def test_matches_only_non_dict_entry_returns_false(ap: ModuleType) -> None:
+    only = [{"key": "type", "value": "DISK"}]
+    assert ap.matches_only("not-a-dict", only) is False
+
+
+def test_can_skip_non_dict_entry_returns_false(ap: ModuleType) -> None:
+    skip = [{"name": "enabled", "value": False}]
+    assert ap.can_skip("not-a-dict", skip) is False
+
+
 def test_can_skip_matches_value(ap: ModuleType) -> None:
     skip = [{"name": "enabled", "value": False}]
     assert ap.can_skip({"enabled": False}, skip) is True
@@ -303,6 +313,18 @@ def test_parse_api_multiple_entries_by_key(ap: ModuleType) -> None:
 
 def test_parse_api_only_filter_skips_non_matching(ap: ModuleType) -> None:
     source = [{"id": "1", "type": "DISK"}, {"id": "2", "type": "SSD"}]
+    result = ap.parse_api(
+        source=source,
+        key="id",
+        vals=[{"name": "type"}],
+        only=[{"key": "type", "value": "DISK"}],
+    )
+    assert result == {"1": {"type": "DISK"}}
+
+
+def test_parse_api_only_filter_skips_non_dict_entry(ap: ModuleType) -> None:
+    """A malformed (non-dict) list element must not crash ``only`` filtering."""
+    source = [None, {"id": "1", "type": "DISK"}]
     result = ap.parse_api(
         source=source,
         key="id",
@@ -445,6 +467,18 @@ def test_parse_api_convert_timestamp_negative_normalized_to_none(
     assert result["1"]["started"] is None
 
 
+def test_parse_api_convert_timestamp_overflow_normalized_to_none(
+    ap: ModuleType,
+) -> None:
+    """An out-of-range integer must not raise; it normalizes to None."""
+    result = ap.parse_api(
+        source=[{"id": "1", "started": 10**20}],
+        key="id",
+        vals=[{"name": "started", "convert": "utc_from_timestamp"}],
+    )
+    assert result["1"]["started"] is None
+
+
 def test_parse_api_convert_timestamp_bool_normalized_to_none(ap: ModuleType) -> None:
     """bool is an int subclass but never a valid timestamp."""
     result = ap.parse_api(
@@ -564,6 +598,19 @@ def test_fill_ensure_vals_creates_missing_uid(ap: ModuleType) -> None:
         {}, "uid-1", [{"name": "extra", "default": "fallback"}]
     )
     assert result == {"uid-1": {"extra": "fallback"}}
+
+
+def test_fill_ensure_vals_bool_reverse_uses_spec_default(ap: ModuleType) -> None:
+    """A missing bool field must use the coerced/reversed spec default.
+
+    Not the raw, unreversed ``default`` value (matches ``fill_defaults``).
+    """
+    result = ap.fill_ensure_vals(
+        {},
+        "uid-1",
+        [{"name": "running", "type": "bool", "default": False, "reverse": True}],
+    )
+    assert result == {"uid-1": {"running": True}}
 
 
 # ---------------------------
