@@ -368,7 +368,12 @@ def get_uid(
         elif key_secondary is not None:
             uid = entry.get(key_secondary)
     elif keymap and key_search is not None and key_search in entry:
-        uid = keymap.get(entry[key_search])
+        search_value = entry[key_search]
+        # An unhashable search value (e.g. a list) would raise TypeError from
+        # keymap.get() below rather than being reported as "no uid" like
+        # every other malformed-entry case here.
+        if isinstance(search_value, Hashable):
+            uid = keymap.get(search_value)
 
     return uid if isinstance(uid, Hashable) else None
 

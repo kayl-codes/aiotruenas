@@ -159,6 +159,14 @@ def test_get_uid_via_key_search(ap: ModuleType) -> None:
     assert ap.get_uid({"guid": "guid-1"}, None, None, "guid", keymap) == "uid-1"
 
 
+def test_get_uid_key_search_unhashable_value_returns_none(ap: ModuleType) -> None:
+    """An unhashable key_search value (e.g. a list) must not crash
+    keymap.get() -- it should be treated like any other unresolvable uid."""
+    keymap = {"guid-1": "uid-1"}
+    entry = {"guid": ["not", "hashable"]}
+    assert ap.get_uid(entry, None, None, "guid", keymap) is None
+
+
 def test_generate_keymap_none_when_no_key_search(ap: ModuleType) -> None:
     assert ap.generate_keymap({"uid-1": {"guid": "guid-1"}}, None) is None
 
@@ -477,6 +485,22 @@ def test_parse_api_ensure_vals_adds_missing_keys(ap: ModuleType) -> None:
 def test_parse_api_key_search_maps_to_existing_uid(ap: ModuleType) -> None:
     data = {"uid-1": {"guid": "guid-1", "name": "old"}}
     source = [{"guid": "guid-1", "name": "new"}]
+    result = ap.parse_api(
+        data=data, source=source, key_search="guid", vals=[{"name": "name"}]
+    )
+    assert result == {"uid-1": {"guid": "guid-1", "name": "new"}}
+
+
+def test_parse_api_key_search_with_unhashable_entry_does_not_crash(
+    ap: ModuleType,
+) -> None:
+    """A malformed entry with an unhashable key_search value must not abort
+    the refresh with a TypeError while computing seen_uids."""
+    data = {"uid-1": {"guid": "guid-1", "name": "old"}}
+    source = [
+        {"guid": ["not", "hashable"], "name": "bogus"},
+        {"guid": "guid-1", "name": "new"},
+    ]
     result = ap.parse_api(
         data=data, source=source, key_search="guid", vals=[{"name": "name"}]
     )

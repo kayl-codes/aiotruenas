@@ -341,6 +341,64 @@ async def test_get_pool_without_matching_dataset_falls_back_to_own_free_size() -
     assert other["allocated"] == 400
 
 
+async def test_get_pool_falls_back_to_zero_for_non_numeric_dataset_capacity() -> None:
+    """A malformed (non-numeric) root-dataset available/used value must not
+    crash capacity arithmetic with a TypeError, nor silently concatenate
+    strings instead of adding numbers."""
+    bad_dataset = {
+        **_ROOT_DATASET,
+        "used": {"parsed": "not-a-number"},
+        "available": {"parsed": ["not", "a", "number"]},
+    }
+    async with FakeTrueNASServer(
+        valid_api_key=API_KEY,
+        responses={
+            "pool.dataset.query": [bad_dataset],
+            "pool.query": [_POOL_TANK],
+            "boot.get_state": {},
+        },
+    ) as server:
+        async with make_client(server) as client:
+            await client.connect()
+            state = TrueNASState(client)
+            result = await state.get_pool()
+
+    tank = result["111"]
+    assert tank["available"] == 0
+    assert tank["allocated"] == 0
+    assert tank["total"] == 0
+    assert tank["usage"] == 0
+
+
+async def test_get_pool_falls_back_to_zero_for_non_numeric_pool_capacity() -> None:
+    """A malformed (non-numeric) pool free/size/allocated value must not
+    crash the no-matching-dataset capacity fallback."""
+    bad_pool = {
+        **_POOL_TANK,
+        "path": "/mnt/other",
+        "name": "other",
+        "free": "not-a-number",
+        "size": None,
+        "allocated": ["not", "a", "number"],
+    }
+    async with FakeTrueNASServer(
+        valid_api_key=API_KEY,
+        responses={
+            "pool.dataset.query": [_ROOT_DATASET],
+            "pool.query": [bad_pool],
+            "boot.get_state": {},
+        },
+    ) as server:
+        async with make_client(server) as client:
+            await client.connect()
+            state = TrueNASState(client)
+            result = await state.get_pool()
+
+    other = result["111"]
+    assert other["available"] == 0
+    assert other["total"] == 0
+
+
 async def test_get_cloudsync_normalizes_job_status_and_progress() -> None:
     raw_cloudsync = {
         "id": 1,

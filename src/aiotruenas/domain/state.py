@@ -201,17 +201,20 @@ class TrueNASState:
         (raidz) instead of the raw pool.query capacity that counts parity
         disks.
         """
+        # _to_int() also doubles as safety here: a malformed non-numeric
+        # value (str, list, dict, ...) would otherwise either raise from the
+        # arithmetic below or, worse, silently produce nonsense via string
+        # concatenation instead of addition.
         if root_dataset:
-            # Use "or 0" so a null value (not just a missing key) is handled.
-            available = root_dataset.get("available") or 0
-            used = root_dataset.get("used") or 0
+            available = _to_int(root_dataset.get("available"))
+            used = _to_int(root_dataset.get("used"))
             total = available + used
             pools[uid]["size"] = total
             pools[uid]["allocated"] = used
         else:
-            available = vals.get("free") or 0
-            total = vals.get("size") or (
-                (vals.get("allocated") or 0) + (vals.get("free") or 0)
+            available = _to_int(vals.get("free"))
+            total = _to_int(vals.get("size")) or (
+                _to_int(vals.get("allocated")) + available
             )
 
         pools[uid]["available"] = available
