@@ -149,6 +149,12 @@ def test_netdata_mean_value_returns_none_for_malformed_item() -> None:
     assert _netdata_mean_value([{"aggregations": {"mean": {}}}]) is None
 
 
+def test_netdata_mean_value_returns_none_for_non_dict_aggregations() -> None:
+    """A non-dict `aggregations` value (e.g. None) must not raise AttributeError."""
+    assert _netdata_mean_value([{"aggregations": None}]) is None
+    assert _netdata_mean_value([{}]) is None
+
+
 def test_arc_value_delegates_to_netdata_mean_value() -> None:
     graph_data = [{"aggregations": {"mean": {"a": 10.0}}}]
     assert _arc_value(graph_data) == pytest.approx(10.0)

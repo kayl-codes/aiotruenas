@@ -103,7 +103,11 @@ def _netdata_mean_value(graph_data: Any) -> float | None:
     if not isinstance(item, dict):
         return None
 
-    mean = item.get("aggregations", {}).get("mean", {})
+    aggregations = item.get("aggregations")
+    if not isinstance(aggregations, dict):
+        return None
+
+    mean = aggregations.get("mean", {})
     if not isinstance(mean, dict):
         return None
 
