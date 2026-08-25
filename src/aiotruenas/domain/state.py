@@ -18,7 +18,7 @@ import asyncio
 import copy
 from collections.abc import Hashable
 from datetime import UTC, datetime
-from typing import Any
+from typing import Any, TypedDict
 
 from ..client import TrueNASClient
 from ..exceptions import TrueNASError
@@ -40,7 +40,23 @@ _EndpointMap = dict[Hashable, dict[str, Any]]
 #: Shape used by the netdata-graph-backed endpoints (``arc``, ``ups``), which
 #: have no natural object id and instead hold a flat dict of scalar readings.
 _ScalarMap = dict[str, float | None]
-_StateMap = dict[str, _EndpointMap | _ScalarMap]
+
+
+class _StateMap(TypedDict):
+    """Per-key shape of ``self._ds``: id-keyed maps, except the flat scalar
+    readings of ``arc``/``ups``, which have no natural object id.
+    """
+
+    pool: _EndpointMap
+    dataset: _EndpointMap
+    cloudsync: _EndpointMap
+    replication: _EndpointMap
+    rsynctask: _EndpointMap
+    snapshottask: _EndpointMap
+    cronjob: _EndpointMap
+    arc: _ScalarMap
+    ups: _ScalarMap
+
 
 # Maps a netdata graph name (``reporting.netdata_graphs``) to its ds["arc"] field.
 _ARC_GRAPHS: dict[str, str] = {
