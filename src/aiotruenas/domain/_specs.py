@@ -243,3 +243,99 @@ _CRONJOB_VALS: list[ApiValueSpec] = [
 _CRONJOB_ENSURE_VALS: list[ApiValueSpec] = [
     {"name": "display_name", "default": ""},
 ]
+
+# service.query.
+_SERVICE_VALS: list[ApiValueSpec] = [
+    {"name": "id", "default": 0},
+    {"name": "service", "default": "unknown"},
+    {"name": "name", "default": ""},
+    {"name": "enable", "type": "bool", "default": False},
+    {"name": "state", "default": "unknown"},
+]
+_SERVICE_ENSURE_VALS: list[ApiValueSpec] = [
+    {"name": "running", "type": "bool", "default": False},
+    {"name": "display_name", "default": "unknown"},
+]
+
+# vm.query.
+_VM_VALS: list[ApiValueSpec] = [
+    {"name": "id", "default": 0},
+    {"name": "name", "default": "unknown"},
+    {"name": "type", "default": "unknown"},
+    {"name": "cpu", "source": "vcpus", "default": 0},
+    {"name": "memory", "default": 0},
+    {"name": "autostart", "type": "bool", "default": False},
+    {"name": "image", "source": "description", "default": "unknown"},
+    {"name": "status", "source": "status/state", "default": "unknown"},
+]
+_VM_ENSURE_VALS: list[ApiValueSpec] = [
+    {"name": "running", "type": "bool", "default": False},
+]
+
+# virt.instance.query, filtered to type == "CONTAINER" (legacy Incus
+# containers, pre-TrueNAS-26.0; VM-type instances are covered by _VM_VALS).
+_CONTAINER_VALS: list[ApiValueSpec] = [
+    {"name": "id", "default": "unknown"},
+    {"name": "name", "default": "unknown"},
+    {"name": "type", "default": "unknown"},
+    {"name": "cpu", "default": 0},
+    {"name": "memory", "default": 0},
+    {"name": "autostart", "type": "bool", "default": False},
+    {"name": "image", "source": "image/description", "default": "unknown"},
+    {"name": "status", "default": "unknown"},
+    {"name": "aliases", "default": []},
+]
+_CONTAINER_ENSURE_VALS: list[ApiValueSpec] = [
+    {"name": "running", "type": "bool", "default": False},
+    {"name": "ip_address", "default": "unknown"},
+]
+
+# container.query (LXC containers, TrueNAS 26.0+, libvirt-based): the entry
+# carries no memory, image or IP information and its status is nested
+# (status/state); ensure_vals fills in the same keys as the legacy Incus
+# path so the resulting record shape is unchanged either way.
+_CONTAINER_V26_VALS: list[ApiValueSpec] = [
+    {"name": "id", "default": "unknown"},
+    {"name": "name", "default": "unknown"},
+    {"name": "cpuset", "default": None},
+    {"name": "autostart", "type": "bool", "default": False},
+    {"name": "image", "source": "description", "default": "unknown"},
+    {"name": "status", "source": "status/state", "default": "unknown"},
+]
+_CONTAINER_V26_ENSURE_VALS: list[ApiValueSpec] = [
+    {"name": "type", "default": "CONTAINER"},
+    {"name": "cpu", "default": 0},
+    {"name": "memory", "default": 0},
+    {"name": "aliases", "default": []},
+    {"name": "running", "type": "bool", "default": False},
+    {"name": "ip_address", "default": "unknown"},
+]
+
+# app.query.
+_APP_VALS: list[ApiValueSpec] = [
+    {"name": "id", "default": 0},
+    {"name": "name", "default": "unknown"},
+    {"name": "human_version", "default": "unknown"},
+    {"name": "version", "default": "unknown"},
+    {"name": "latest_version", "default": "unknown"},
+    {"name": "custom_app", "type": "bool", "default": False},
+    {
+        "name": "update_available",
+        "source": "upgrade_available",
+        "type": "bool",
+        "default": False,
+    },
+    {"name": "image_updates_available", "type": "bool", "default": False},
+    {"name": "portal", "source": "portals/Web UI", "default": "unknown"},
+    {"name": "state", "default": "unknown"},
+]
+# Update-job tracking fields (update_jobid/update_progress/update_state/
+# update_description) are only defaulted here; polling the upgrade job itself
+# stays with the consumer's own HA update-entity handling, not TrueNASState.
+_APP_ENSURE_VALS: list[ApiValueSpec] = [
+    {"name": "running", "type": "bool", "default": False},
+    {"name": "update_jobid", "default": 0},
+    {"name": "update_progress", "default": 0},
+    {"name": "update_state", "default": "unknown"},
+    {"name": "update_description", "default": ""},
+]

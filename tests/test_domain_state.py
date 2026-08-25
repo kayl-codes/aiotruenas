@@ -448,6 +448,10 @@ async def test_ds_property_starts_empty_for_all_endpoints() -> None:
         "rsynctask": {},
         "snapshottask": {},
         "cronjob": {},
+        "service": {},
+        "vm": {},
+        "container": {},
+        "app": {},
         "arc": {},
         "ups": {},
     }
@@ -713,6 +717,260 @@ async def test_get_ups_keeps_previous_reading_on_failed_discovery() -> None:
 
     assert result is previous_ups
     assert state.ds["ups"] is previous_ups
+
+
+async def test_get_service_derives_running_and_known_display_name() -> None:
+    raw_services = [
+        {
+            "id": 1,
+            "service": "cifs",
+            "name": "unknown",
+            "enable": True,
+            "state": "RUNNING",
+        },
+        {
+            "id": 2,
+            "service": "ssh",
+            "name": "Secure Shell",
+            "enable": False,
+            "state": "STOPPED",
+        },
+    ]
+    async with FakeTrueNASServer(
+        valid_api_key=API_KEY,
+        responses={"service.query": raw_services},
+    ) as server:
+        async with make_client(server) as client:
+            await client.connect()
+            state = TrueNASState(client)
+            result = await state.get_service()
+
+    assert result[1]["running"] is True
+    assert result[1]["display_name"] == "SMB"
+    assert result[2]["running"] is False
+    assert result[2]["display_name"] == "Secure Shell"
+
+
+async def test_get_service_falls_back_to_service_id_for_unknown_service() -> None:
+    raw_services = [
+        {
+            "id": 1,
+            "service": "some_new_service",
+            "name": "",
+            "enable": True,
+            "state": "RUNNING",
+        }
+    ]
+    async with FakeTrueNASServer(
+        valid_api_key=API_KEY,
+        responses={"service.query": raw_services},
+    ) as server:
+        async with make_client(server) as client:
+            await client.connect()
+            state = TrueNASState(client)
+            result = await state.get_service()
+
+    assert result[1]["display_name"] == "some_new_service"
+
+
+async def test_get_vm_converts_memory_and_derives_running() -> None:
+    raw_vms = [
+        {
+            "id": 1,
+            "name": "vm1",
+            "type": "KVM",
+            "vcpus": 2,
+            "memory": 2097152,
+            "autostart": True,
+            "description": "Debian",
+            "status": {"state": "RUNNING"},
+        }
+    ]
+    async with FakeTrueNASServer(
+        valid_api_key=API_KEY,
+        responses={"vm.query": raw_vms},
+    ) as server:
+        async with make_client(server) as client:
+            await client.connect()
+            state = TrueNASState(client)
+            result = await state.get_vm()
+
+    assert result[1]["cpu"] == 2
+    assert result[1]["memory"] == round(2097152 / 1024)
+    assert result[1]["running"] is True
+
+
+async def test_get_vm_treats_null_memory_as_zero() -> None:
+    raw_vms = [{"id": 1, "name": "vm1", "memory": None, "status": {"state": "STOPPED"}}]
+    async with FakeTrueNASServer(
+        valid_api_key=API_KEY,
+        responses={"vm.query": raw_vms},
+    ) as server:
+        async with make_client(server) as client:
+            await client.connect()
+            state = TrueNASState(client)
+            result = await state.get_vm()
+
+    assert result[1]["memory"] == 0
+    assert result[1]["running"] is False
+
+
+async def test_get_container_uses_virt_instance_query_below_truenas_26() -> None:
+    raw_instances = [
+        {
+            "id": "ct1",
+            "name": "container1",
+            "type": "CONTAINER",
+            "cpu": "2",
+            "memory": 1048576,
+            "autostart": True,
+            "image": {"description": "Alpine"},
+            "status": "RUNNING",
+            "aliases": [{"type": "INET", "address": "10.0.0.5"}],
+        },
+        {"id": "vm1", "name": "not-a-container", "type": "VM"},
+    ]
+    async with FakeTrueNASServer(
+        valid_api_key=API_KEY,
+        responses={
+            "system.info": {"version": "TrueNAS-25.10.0"},
+            "virt.instance.query": raw_instances,
+        },
+    ) as server:
+        async with make_client(server) as client:
+            await client.connect()
+            state = TrueNASState(client)
+            result = await state.get_container()
+
+    assert list(result) == ["ct1"]
+    assert result["ct1"]["cpu"] == 2
+    assert result["ct1"]["memory"] == 1
+    assert result["ct1"]["running"] is True
+    assert result["ct1"]["ip_address"] == "10.0.0.5"
+
+
+async def test_get_container_v26_uses_container_query_and_caches_version() -> None:
+    system_info_calls: list[list] = []
+
+    def system_info(params: list) -> Any:
+        system_info_calls.append(params)
+        return {"version": "TrueNAS-26.0.0"}
+
+    raw_containers = [
+        {
+            "id": "lxc1",
+            "name": "container1",
+            "cpuset": "0-1,4",
+            "autostart": True,
+            "description": "Debian",
+            "status": {"state": "RUNNING"},
+        }
+    ]
+    async with FakeTrueNASServer(
+        valid_api_key=API_KEY,
+        responses={
+            "system.info": system_info,
+            "container.query": raw_containers,
+        },
+    ) as server:
+        async with make_client(server) as client:
+            await client.connect()
+            state = TrueNASState(client)
+            await state.get_container()
+            result = await state.get_container()
+
+    assert len(system_info_calls) == 1
+    assert result["lxc1"]["type"] == "CONTAINER"
+    assert result["lxc1"]["cpu"] == 3
+    assert result["lxc1"]["memory"] == 0
+    assert result["lxc1"]["ip_address"] == "unknown"
+    assert result["lxc1"]["running"] is True
+
+
+async def test_get_container_defaults_to_legacy_api_when_version_undetectable() -> None:
+    async with FakeTrueNASServer(
+        valid_api_key=API_KEY,
+        responses={
+            "system.info": None,
+            "virt.instance.query": [],
+        },
+    ) as server:
+        async with make_client(server) as client:
+            await client.connect()
+            state = TrueNASState(client)
+            result = await state.get_container()
+
+    assert result == {}
+
+
+async def test_get_app_derives_running_and_catalog_update_available() -> None:
+    raw_apps = [
+        {
+            "id": "syncthing",
+            "name": "syncthing",
+            "version": "1.0.0",
+            "custom_app": False,
+            "upgrade_available": True,
+            "image_updates_available": False,
+            "state": "RUNNING",
+        }
+    ]
+    async with FakeTrueNASServer(
+        valid_api_key=API_KEY,
+        responses={"app.query": raw_apps},
+    ) as server:
+        async with make_client(server) as client:
+            await client.connect()
+            state = TrueNASState(client)
+            result = await state.get_app()
+
+    assert result["syncthing"]["running"] is True
+    assert result["syncthing"]["update_available"] is True
+
+
+async def test_get_app_ignores_image_updates_for_non_custom_apps() -> None:
+    raw_apps = [
+        {
+            "id": "syncthing",
+            "custom_app": False,
+            "upgrade_available": False,
+            "image_updates_available": True,
+            "state": "STOPPED",
+        }
+    ]
+    async with FakeTrueNASServer(
+        valid_api_key=API_KEY,
+        responses={"app.query": raw_apps},
+    ) as server:
+        async with make_client(server) as client:
+            await client.connect()
+            state = TrueNASState(client)
+            result = await state.get_app()
+
+    assert result["syncthing"]["running"] is False
+    assert result["syncthing"]["update_available"] is False
+
+
+async def test_get_app_honors_image_updates_for_custom_apps() -> None:
+    raw_apps = [
+        {
+            "id": "custom1",
+            "custom_app": True,
+            "upgrade_available": False,
+            "image_updates_available": True,
+            "state": "RUNNING",
+        }
+    ]
+    async with FakeTrueNASServer(
+        valid_api_key=API_KEY,
+        responses={"app.query": raw_apps},
+    ) as server:
+        async with make_client(server) as client:
+            await client.connect()
+            state = TrueNASState(client)
+            result = await state.get_app()
+
+    assert result["custom1"]["update_available"] is True
 
 
 async def test_get_ups_keeps_previous_reading_when_discovery_raises() -> None:

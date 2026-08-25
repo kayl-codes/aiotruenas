@@ -11,6 +11,7 @@ declarative ``parse_api`` mapping engine.
 
 from __future__ import annotations
 
+import re
 from typing import Any
 
 
@@ -136,3 +137,54 @@ def _arc_value(graph_data: Any) -> float | None:
 def _ups_value(graph_data: Any) -> float | None:
     """Return the mean value of a single-metric UPS netdata graph, if present."""
     return _netdata_mean_value(graph_data)
+
+
+def _cpuset_size(cpuset: Any) -> int:
+    """Return the number of CPUs in a cpuset string such as ``"0-3,6"``.
+
+    Malformed segments are skipped so a partially valid cpuset still yields
+    the count of its valid CPUs.
+    """
+    if not isinstance(cpuset, str) or not cpuset.strip():
+        return 0
+    count = 0
+    for part in cpuset.split(","):
+        part = part.strip()
+        if not part:
+            continue
+        try:
+            if "-" in part:
+                start, end = (int(p) for p in part.split("-", 1))
+                count += max(0, end - start + 1)
+            else:
+                int(part)
+                count += 1
+        except ValueError:
+            continue
+    return count
+
+
+def _first_ipv4(aliases: Any) -> str:
+    """Return the first IPv4 address from a virt instance alias list, else 'unknown'."""
+    if isinstance(aliases, list):
+        for alias in aliases:
+            if isinstance(alias, dict) and alias.get("type") == "INET":
+                addr = alias.get("address")
+                if isinstance(addr, str) and addr:
+                    return addr
+    return "unknown"
+
+
+def _parse_version_tuple(version_str: Any) -> tuple[int, int]:
+    """Parse (major, minor) from a TrueNAS version string, e.g. "TrueNAS-25.10.0".
+
+    Returns (0, 0) on missing/unparsable input. Bounded quantifiers
+    ({1,9}) avoid unbounded backtracking (Sonar S5852); version components
+    never have that many digits.
+    """
+    if not isinstance(version_str, str):
+        return (0, 0)
+    clean_version = version_str.replace("TrueNAS-", "").replace("SCALE-", "")
+    if match := re.search(r"(\d{1,9})\.(\d{1,9})", clean_version):
+        return int(match[1]), int(match[2])
+    return (0, 0)
