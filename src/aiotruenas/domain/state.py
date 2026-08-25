@@ -7,7 +7,9 @@ Each method queries the endpoint, normalizes the response via
 ``domain._normalize.parse_api`` and the field specs in ``domain._specs``, and
 caches the result in ``self.ds[<endpoint>]`` -- the same dict-keyed-by-id
 shape historically produced by consumer integrations' own
-``apiparser.py``/``coordinator.py``.
+``apiparser.py``/``coordinator.py``. Exceptions are the netdata-graph-backed
+endpoints (``arc``, ``ups``), which have no natural object id and instead
+cache a flat dict of scalar readings.
 """
 
 from __future__ import annotations
@@ -15,10 +17,12 @@ from __future__ import annotations
 import asyncio
 import copy
 from collections.abc import Hashable
-from typing import Any
+from datetime import UTC, datetime
+from typing import Any, TypedDict, cast
 
 from ..client import TrueNASClient
-from ._helpers import _aggregate_topology_errors, _to_int
+from ..exceptions import TrueNASError
+from ._helpers import _aggregate_topology_errors, _arc_value, _to_int, _ups_value
 from ._normalize import get_uid, parse_api
 from ._specs import (
     _CLOUDSYNC_VALS,
@@ -33,6 +37,50 @@ from ._specs import (
 )
 
 _EndpointMap = dict[Hashable, dict[str, Any]]
+#: get_arc() shape: one entry per known metric, None where currently unavailable.
+_ArcMap = dict[str, float | None]
+#: get_ups() shape: only metrics currently reporting a value (never None --
+#: missing/no-UPS metrics are omitted rather than included as None).
+_UpsMap = dict[str, float]
+#: Public shape of the ``ds`` property: a plain mapping (rather than the
+#: TypedDict used internally) so consumers can index it with a runtime
+#: string, e.g. when iterating over endpoint names.
+_PublicStateMap = dict[str, _EndpointMap | _ArcMap | _UpsMap]
+
+
+class _StateMap(TypedDict):
+    """Per-key shape of ``self._ds``: id-keyed maps, except the flat scalar
+    readings of ``arc``/``ups``, which have no natural object id.
+    """
+
+    pool: _EndpointMap
+    dataset: _EndpointMap
+    cloudsync: _EndpointMap
+    replication: _EndpointMap
+    rsynctask: _EndpointMap
+    snapshottask: _EndpointMap
+    cronjob: _EndpointMap
+    arc: _ArcMap
+    ups: _UpsMap
+
+
+# Maps a netdata graph name (``reporting.netdata_graphs``) to its ds["arc"] field.
+_ARC_GRAPHS: dict[str, str] = {
+    "demanddatahitpercentage": "data_hit_percent",
+    "demandmetadatahitpercentage": "metadata_hit_percent",
+    "l2architpercentage": "l2_hit_percent",
+}
+
+# Maps a netdata graph name (``reporting.netdata_graphs``) to its ds["ups"] field.
+_UPS_GRAPHS: dict[str, str] = {
+    "upscharge": "battery_charge",
+    "upsruntime": "runtime_seconds",
+    "upsload": "load",
+    "upsvoltage": "voltage",
+    "upscurrent": "current",
+    "upsfrequency": "frequency",
+    "upstemperature": "temperature",
+}
 
 
 def _is_valid_pool_entry(entry: Any) -> bool:
@@ -52,7 +100,7 @@ class TrueNASState:
     def __init__(self, client: TrueNASClient) -> None:
         self._client = client
         self._lock = asyncio.Lock()
-        self._ds: dict[str, _EndpointMap] = {
+        self._ds: _StateMap = {
             "pool": {},
             "dataset": {},
             "cloudsync": {},
@@ -60,12 +108,22 @@ class TrueNASState:
             "rsynctask": {},
             "snapshottask": {},
             "cronjob": {},
+            "arc": {},
+            "ups": {},
         }
 
     @property
-    def ds(self) -> dict[str, _EndpointMap]:
-        """Normalized state, keyed by endpoint name then by object id/guid."""
-        return self._ds
+    def ds(self) -> _PublicStateMap:
+        """Normalized state, keyed by endpoint name then by object id/guid.
+
+        The ``arc`` and ``ups`` endpoints have no natural object id and are
+        keyed by endpoint name only, holding a flat dict of scalar readings.
+
+        Typed as a plain mapping rather than the ``TypedDict`` used
+        internally, so it can be indexed with a runtime string (e.g. when
+        iterating over endpoint names) under static type checking.
+        """
+        return cast(_PublicStateMap, self._ds)
 
     async def get_dataset(self) -> _EndpointMap:
         """Refresh and return normalized ZFS datasets (``pool.dataset.query``)."""
@@ -345,3 +403,70 @@ class TrueNASState:
                 command = command.strip() if isinstance(command, str) else ""
                 vals["display_name"] = description or command or f"Cronjob {uid}"
             return self._ds["cronjob"]
+
+    async def get_arc(self) -> dict[str, float | None]:
+        """Refresh and return ZFS ARC hit-ratio percentages from netdata graphs.
+
+        Unlike the other endpoints, this is a flat set of scalar readings
+        (``reporting.netdata_graph``) rather than a collection keyed by id.
+        """
+        async with self._lock:
+            report_epoch = int(datetime.now(UTC).replace(microsecond=0).timestamp())
+            graph_query = {
+                "start": report_epoch - 300,
+                "end": report_epoch,
+                "aggregate": True,
+            }
+            arc: dict[str, float | None] = {}
+            for graph_name, field_name in _ARC_GRAPHS.items():
+                graph_data = await self._client.call(
+                    "reporting.netdata_graph", [graph_name, graph_query]
+                )
+                arc[field_name] = _arc_value(graph_data)
+            self._ds["arc"] = arc
+            return arc
+
+    async def get_ups(self) -> dict[str, float]:
+        """Refresh and return UPS readings from netdata graphs, if a UPS is present.
+
+        Discovers which UPS graphs TrueNAS currently exposes
+        (``reporting.netdata_graphs``) on every call rather than caching the
+        result, so a UPS attached or removed at runtime is picked up without
+        needing a restart. Returns an empty dict when no UPS graphs exist; on
+        a failed discovery call, the previous reading is preserved instead
+        (retried on the next call).
+        """
+        async with self._lock:
+            try:
+                graphs = await self._client.call("reporting.netdata_graphs")
+            except TrueNASError:
+                return self._ds["ups"]
+            if not isinstance(graphs, list):
+                return self._ds["ups"]
+
+            available = {
+                name
+                for graph in graphs
+                if isinstance(graph, dict)
+                and (name := str(graph.get("name", ""))) in _UPS_GRAPHS
+            }
+            if not available:
+                self._ds["ups"] = {}
+                return self._ds["ups"]
+
+            report_epoch = int(datetime.now(UTC).replace(microsecond=0).timestamp())
+            graph_query = {
+                "start": report_epoch - 90,
+                "end": report_epoch - 30,
+                "aggregate": True,
+            }
+            ups: dict[str, float] = {}
+            for graph_name in available:
+                graph_data = await self._client.call(
+                    "reporting.netdata_graph", [graph_name, graph_query]
+                )
+                value = _ups_value(graph_data)
+                if value is not None:
+                    ups[_UPS_GRAPHS[graph_name]] = value
+            self._ds["ups"] = ups
+            return ups

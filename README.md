@@ -64,9 +64,13 @@ async with TrueNASClient("truenas.local", "1-abcdef...") as client:
 ```
 
 Supported endpoints so far: `get_pool()`, `get_dataset()`, `get_cloudsync()`, `get_replication()`,
-`get_rsync()`, `get_snapshottask()`, `get_cronjob()`. More endpoints are being migrated
-incrementally from consumer integrations' own normalization code — see
+`get_rsync()`, `get_snapshottask()`, `get_cronjob()`, `get_arc()`, `get_ups()`. More endpoints are
+being migrated incrementally from consumer integrations' own normalization code — see
 [MIGRATION_PLAN.md](MIGRATION_PLAN.md) for the full list and status.
+
+`get_arc()`/`get_ups()` are the exception to the dict-keyed-by-id shape above: they have no natural
+object id and instead return a flat dict of scalar readings keyed by metric name (e.g.
+`{"battery_charge": 80.0, ...}`).
 
 ## Status
 
