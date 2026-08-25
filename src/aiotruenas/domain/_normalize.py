@@ -432,10 +432,7 @@ def _convert_timestamp(target: dict[str, Any], name: str) -> None:
 # ---------------------------
 def _convert_human_date(target: dict[str, Any], name: str) -> None:
     """Convert human-readable date string to UTC datetime or None if unparsable."""
-    value = target.get(name)
-    if isinstance(value, str):
-        converted = human_date_to_utc(value)
-        target[name] = converted
+    target[name] = human_date_to_utc(target.get(name))
 
 
 # ---------------------------
