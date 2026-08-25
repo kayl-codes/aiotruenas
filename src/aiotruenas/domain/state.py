@@ -37,6 +37,10 @@ from ._specs import (
 )
 
 _EndpointMap = dict[Hashable, dict[str, Any]]
+#: Shape used by the netdata-graph-backed endpoints (``arc``, ``ups``), which
+#: have no natural object id and instead hold a flat dict of scalar readings.
+_ScalarMap = dict[str, float | None]
+_StateMap = dict[str, _EndpointMap | _ScalarMap]
 
 # Maps a netdata graph name (``reporting.netdata_graphs``) to its ds["arc"] field.
 _ARC_GRAPHS: dict[str, str] = {
@@ -74,7 +78,7 @@ class TrueNASState:
     def __init__(self, client: TrueNASClient) -> None:
         self._client = client
         self._lock = asyncio.Lock()
-        self._ds: dict[str, _EndpointMap] = {
+        self._ds: _StateMap = {
             "pool": {},
             "dataset": {},
             "cloudsync": {},
@@ -87,7 +91,7 @@ class TrueNASState:
         }
 
     @property
-    def ds(self) -> dict[str, _EndpointMap]:
+    def ds(self) -> _StateMap:
         """Normalized state, keyed by endpoint name then by object id/guid.
 
         The ``arc`` and ``ups`` endpoints have no natural object id and are
