@@ -276,8 +276,7 @@ def _resolve_entry_uid(
     if uid is None:
         return None, False
 
-    if uid not in data:
-        data[uid] = {}
+    _resolve_target(data, uid)
     return uid, True
 
 
@@ -325,7 +324,7 @@ def get_uid(
     elif keymap and key_search is not None and key_search in entry:
         uid = keymap.get(entry[key_search])
 
-    return uid
+    return uid if isinstance(uid, Hashable) else None
 
 
 # ---------------------------
@@ -420,9 +419,9 @@ def _convert_timestamp(target: dict[str, Any], name: str) -> None:
         target[name] = None
         return
 
-    if value > MILLIS_TIMESTAMP_THRESHOLD:
-        value = value / 1000
     try:
+        if value > MILLIS_TIMESTAMP_THRESHOLD:
+            value = value / 1000
         target[name] = utc_from_timestamp(value)
     except (OverflowError, OSError, ValueError):
         target[name] = None
@@ -463,6 +462,25 @@ def _set_val(
 
 
 # ---------------------------
+#   _resolve_target
+# ---------------------------
+def _resolve_target(data: dict[str, Any], uid: str | None) -> dict[str, Any]:
+    """Return the dict at data[uid], (re-)creating it if missing or malformed.
+
+    A caller-supplied ``data`` snapshot could hold a non-dict value for
+    ``uid`` (e.g. from a corrupted prior snapshot); ``generate_keymap``
+    already tolerates that for its own read path, so the write path taken by
+    ``fill_vals``/``fill_ensure_vals``/``fill_vals_proc`` must match instead
+    of raising ``TypeError`` on the dict assignment.
+    """
+    if uid is None:
+        return data
+    if not isinstance(data.get(uid), dict):
+        data[uid] = {}
+    return data[uid]
+
+
+# ---------------------------
 #   fill_vals
 # ---------------------------
 def fill_vals(
@@ -472,7 +490,7 @@ def fill_vals(
     vals: list[ApiValueSpec],
 ) -> dict[str, Any]:
     """Fill all data."""
-    target: dict[str, Any] = data[uid] if uid is not None else data
+    target = _resolve_target(data, uid)
     for val in vals:
         _set_val(target, entry, val)
 
@@ -486,10 +504,7 @@ def fill_ensure_vals(
     data: dict[str, Any], uid: str | None, ensure_vals: list[ApiValueSpec]
 ) -> dict[str, Any]:
     """Add required keys which are not available in data."""
-    if uid is not None and uid not in data:
-        data[uid] = {}
-
-    target: dict[str, Any] = data[uid] if uid is not None else data
+    target = _resolve_target(data, uid)
     for val in ensure_vals:
         name = val["name"]
         if name not in target:
@@ -556,7 +571,7 @@ def fill_vals_proc(
     data: dict[str, Any], uid: str | None, vals_proc: list[list[dict[str, Any]]]
 ) -> dict[str, Any]:
     """Add custom keys."""
-    target: dict[str, Any] = data[uid] if uid is not None else data
+    target = _resolve_target(data, uid)
 
     for val_sub in vals_proc:
         name, value = _process_val_sub(target, val_sub)

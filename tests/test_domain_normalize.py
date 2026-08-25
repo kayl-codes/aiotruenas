@@ -148,6 +148,11 @@ def test_get_uid_non_dict_entry_returns_none(ap: ModuleType) -> None:
     assert ap.get_uid("not-a-dict", "id", None, None, None) is None
 
 
+def test_get_uid_unhashable_key_value_returns_none(ap: ModuleType) -> None:
+    """An unhashable id (e.g. a list) must not be usable as a dict key."""
+    assert ap.get_uid({"id": []}, "id", None, None, None) is None
+
+
 def test_get_uid_via_key_search(ap: ModuleType) -> None:
     keymap = {"guid-1": "uid-1"}
     assert ap.get_uid({"guid": "guid-1"}, None, None, "guid", keymap) == "uid-1"
@@ -419,6 +424,13 @@ def test_parse_api_entry_without_matching_uid_is_skipped(ap: ModuleType) -> None
     assert result == {"1": {"name": "pool0"}}
 
 
+def test_parse_api_entry_with_unhashable_key_value_is_skipped(ap: ModuleType) -> None:
+    """An entry whose id resolves to an unhashable value must not crash lookup."""
+    source = [{"id": [], "name": "orphan"}, {"id": "1", "name": "pool0"}]
+    result = ap.parse_api(source=source, key="id", vals=[{"name": "name"}])
+    assert result == {"1": {"name": "pool0"}}
+
+
 def test_parse_api_all_entries_without_matching_uid_returns_empty(
     ap: ModuleType,
 ) -> None:
@@ -426,6 +438,17 @@ def test_parse_api_all_entries_without_matching_uid_returns_empty(
     source = [{"name": "orphan1"}, {"name": "orphan2"}]
     result = ap.parse_api(source=source, key="id", vals=[{"name": "name"}])
     assert result == {}
+
+
+def test_parse_api_replaces_non_dict_existing_uid_value(ap: ModuleType) -> None:
+    """A corrupted (non-dict) prior snapshot entry must be reset, not crash."""
+    result = ap.parse_api(
+        data={"1": "corrupted"},
+        source=[{"id": "1", "name": "pool0"}],
+        key="id",
+        vals=[{"name": "name"}],
+    )
+    assert result == {"1": {"name": "pool0"}}
 
 
 def test_parse_api_key_secondary_used_when_key_missing(ap: ModuleType) -> None:
@@ -473,6 +496,18 @@ def test_parse_api_convert_timestamp_overflow_normalized_to_none(
     """An out-of-range integer must not raise; it normalizes to None."""
     result = ap.parse_api(
         source=[{"id": "1", "started": 10**20}],
+        key="id",
+        vals=[{"name": "started", "convert": "utc_from_timestamp"}],
+    )
+    assert result["1"]["started"] is None
+
+
+def test_parse_api_convert_timestamp_millis_division_overflow_normalized_to_none(
+    ap: ModuleType,
+) -> None:
+    """An int so large that ``value / 1000`` itself overflows must not raise."""
+    result = ap.parse_api(
+        source=[{"id": "1", "started": 10**1000}],
         key="id",
         vals=[{"name": "started", "convert": "utc_from_timestamp"}],
     )
@@ -596,6 +631,14 @@ def test_parse_api_val_proc_runs_alongside_vals(ap: ModuleType) -> None:
 def test_fill_ensure_vals_creates_missing_uid(ap: ModuleType) -> None:
     result = ap.fill_ensure_vals(
         {}, "uid-1", [{"name": "extra", "default": "fallback"}]
+    )
+    assert result == {"uid-1": {"extra": "fallback"}}
+
+
+def test_fill_ensure_vals_replaces_non_dict_existing_uid(ap: ModuleType) -> None:
+    """A corrupted (non-dict) existing snapshot entry must be reset, not crash."""
+    result = ap.fill_ensure_vals(
+        {"uid-1": "corrupted"}, "uid-1", [{"name": "extra", "default": "fallback"}]
     )
     assert result == {"uid-1": {"extra": "fallback"}}
 
