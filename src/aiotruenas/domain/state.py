@@ -134,9 +134,17 @@ class TrueNASState:
             }
 
             for uid, vals in pools.items():
-                root_dataset = dataset_by_mountpoint.get(vals.get("path"))
+                # A malformed "path"/"name" (e.g. a list, from a corrupted
+                # API response) is unhashable and would raise TypeError from
+                # dict.get() below.
+                path = vals.get("path")
+                root_dataset = (
+                    dataset_by_mountpoint.get(path) if isinstance(path, str) else None
+                )
                 if root_dataset is None:
-                    root_dataset = datasets.get(vals.get("name"))
+                    name = vals.get("name")
+                    if isinstance(name, Hashable):
+                        root_dataset = datasets.get(name)
 
                 self._apply_pool_capacity(pools, uid, vals, root_dataset)
 

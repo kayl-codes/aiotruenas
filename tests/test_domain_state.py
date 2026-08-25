@@ -287,6 +287,37 @@ async def test_get_pool_ignores_error_aggregation_for_unhashable_guid() -> None:
     assert result["111"]["errors"] == 1
 
 
+async def test_get_pool_falls_back_to_own_free_size_for_unhashable_path_and_name() -> (
+    None
+):
+    """A pool entry with a valid guid but a malformed (unhashable) path/name
+    must not crash capacity derivation with a TypeError from dict.get()."""
+    bad_capacity_pool = {
+        **_POOL_TANK,
+        "guid": "222",
+        "path": ["not", "hashable"],
+        "name": ["also", "not", "hashable"],
+    }
+    async with FakeTrueNASServer(
+        valid_api_key=API_KEY,
+        responses={
+            "pool.dataset.query": [_ROOT_DATASET],
+            "pool.query": [bad_capacity_pool],
+            "boot.get_state": {},
+        },
+    ) as server:
+        async with make_client(server) as client:
+            await client.connect()
+            state = TrueNASState(client)
+            result = await state.get_pool()
+
+    pool = result["222"]
+    # An unhashable path/name can't even be looked up against the dataset
+    # maps: falls back to the pool's own free/size instead of crashing.
+    assert pool["available"] == 600
+    assert pool["total"] == 999999
+
+
 async def test_get_pool_without_matching_dataset_falls_back_to_own_free_size() -> None:
     pool_no_match = {**_POOL_TANK, "path": "/mnt/other", "name": "other"}
     async with FakeTrueNASServer(
