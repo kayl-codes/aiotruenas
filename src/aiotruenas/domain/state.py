@@ -329,7 +329,15 @@ class TrueNASState:
                 ensure_vals=_CRONJOB_ENSURE_VALS,
             )
             for uid, vals in self._ds["cronjob"].items():
-                description = (vals.get("description") or "").strip()
-                command = (vals.get("command") or "").strip()
+                # A malformed API response can leave a non-string value in
+                # "description"/"command" (from_entry() only coerces bool-typed
+                # specs, not str-typed ones), which would raise AttributeError
+                # from .strip() below.
+                description = vals.get("description")
+                description = (
+                    description.strip() if isinstance(description, str) else ""
+                )
+                command = vals.get("command")
+                command = command.strip() if isinstance(command, str) else ""
                 vals["display_name"] = description or command or f"Cronjob {uid}"
             return self._ds["cronjob"]

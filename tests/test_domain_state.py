@@ -555,7 +555,7 @@ async def test_get_cronjob_derives_display_name_with_fallback_chain() -> None:
     raw_cronjobs = [
         {"id": 1, "description": "Nightly backup", "command": "backup.sh"},
         {"id": 2, "description": "", "command": "cleanup.sh"},
-        {"id": 3, "description": "", "command": ""},
+        {"id": 3, "description": ""},
     ]
     async with FakeTrueNASServer(
         valid_api_key=API_KEY,
@@ -569,3 +569,17 @@ async def test_get_cronjob_derives_display_name_with_fallback_chain() -> None:
     assert result[1]["display_name"] == "Nightly backup"
     assert result[2]["display_name"] == "cleanup.sh"
     assert result[3]["display_name"] == "Cronjob 3"
+
+
+async def test_get_cronjob_display_name_survives_non_string_fields() -> None:
+    raw_cronjobs = [{"id": 1, "description": ["not", "a", "string"], "command": 123}]
+    async with FakeTrueNASServer(
+        valid_api_key=API_KEY,
+        responses={"cronjob.query": raw_cronjobs},
+    ) as server:
+        async with make_client(server) as client:
+            await client.connect()
+            state = TrueNASState(client)
+            result = await state.get_cronjob()
+
+    assert result[1]["display_name"] == "Cronjob 1"

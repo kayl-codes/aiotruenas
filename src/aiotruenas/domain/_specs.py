@@ -233,7 +233,7 @@ _SNAPSHOTTASK_VALS: list[ApiValueSpec] = [
 _CRONJOB_VALS: list[ApiValueSpec] = [
     {"name": "id", "default": 0},
     {"name": "enabled", "type": "bool", "default": False},
-    {"name": "command", "default": "unknown"},
+    {"name": "command", "default": ""},
     {"name": "description", "default": ""},
     {"name": "user", "default": "unknown"},
     {"name": "schedule", "default": {}},
