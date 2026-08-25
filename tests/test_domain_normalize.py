@@ -9,6 +9,7 @@ from __future__ import annotations
 
 from datetime import UTC, datetime
 from types import ModuleType
+from typing import Any
 
 import pytest
 
@@ -432,6 +433,18 @@ def test_parse_api_only_filter_does_not_prune_still_present_entries(
         vals=[{"name": "type"}],
         only=[{"key": "type", "value": "DISK"}],
     )
+    assert result == {"1": {"type": "DISK"}, "2": {"type": "SSD"}}
+
+
+@pytest.mark.parametrize("source", [[None], [{}]])
+def test_parse_api_malformed_nonempty_source_does_not_wipe_cache(
+    ap: ModuleType, source: list[Any]
+) -> None:
+    """A non-empty but entirely malformed/keyless response (e.g. a server
+    glitch returning `[None]` or `[{}]`) must preserve the previous
+    snapshot rather than being mistaken for "everything was removed"."""
+    data = {"1": {"type": "DISK"}, "2": {"type": "SSD"}}
+    result = ap.parse_api(data=data, source=source, key="id", vals=[{"name": "type"}])
     assert result == {"1": {"type": "DISK"}, "2": {"type": "SSD"}}
 
 

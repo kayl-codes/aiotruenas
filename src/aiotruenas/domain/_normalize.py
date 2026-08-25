@@ -240,7 +240,12 @@ def parse_api(
 
         data = _apply_entry(data, entry, uid, vals, ensure_vals, val_proc)
 
-    if prune:
+    # A non-empty source consisting entirely of malformed/keyless entries
+    # (e.g. [None] or [{}]) yields an empty seen_uids without ever having
+    # been recognized as a failed response by the `not source` check above;
+    # pruning on that empty set would wipe out every previously cached
+    # entry. Only prune when at least one entry actually resolved to a uid.
+    if prune and (not (key or key_search) or seen_uids):
         _prune_stale_uids(data, key, key_search, seen_uids)
 
     return data
