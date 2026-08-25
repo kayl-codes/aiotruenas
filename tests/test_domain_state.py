@@ -440,4 +440,132 @@ async def test_ds_property_starts_empty_for_all_endpoints() -> None:
             await client.connect()
             state = TrueNASState(client)
 
-    assert state.ds == {"pool": {}, "dataset": {}, "cloudsync": {}}
+    assert state.ds == {
+        "pool": {},
+        "dataset": {},
+        "cloudsync": {},
+        "replication": {},
+        "rsynctask": {},
+        "snapshottask": {},
+        "cronjob": {},
+    }
+
+
+async def test_get_replication_prefers_persistent_state_over_job_state() -> None:
+    raw_replication = {
+        "id": 1,
+        "name": "tank-backup",
+        "source_datasets": ["tank"],
+        "target_dataset": "backup/tank",
+        "recursive": True,
+        "enabled": True,
+        "direction": "PUSH",
+        "transport": "SSH",
+        "auto": True,
+        "retention_policy": "SOURCE",
+        "state": {"state": "FINISHED"},
+        "job": {"state": "RUNNING"},
+    }
+    async with FakeTrueNASServer(
+        valid_api_key=API_KEY,
+        responses={"replication.query": [raw_replication]},
+    ) as server:
+        async with make_client(server) as client:
+            await client.connect()
+            state = TrueNASState(client)
+            result = await state.get_replication()
+
+    task = result[1]
+    assert task["name"] == "tank-backup"
+    assert task["state"] == "FINISHED"
+    assert "job_state" not in task
+
+
+async def test_get_replication_falls_back_to_job_state_when_state_missing() -> None:
+    raw_replication = {"id": 1, "name": "tank-backup", "job": {"state": "RUNNING"}}
+    async with FakeTrueNASServer(
+        valid_api_key=API_KEY,
+        responses={"replication.query": [raw_replication]},
+    ) as server:
+        async with make_client(server) as client:
+            await client.connect()
+            state = TrueNASState(client)
+            result = await state.get_replication()
+
+    assert result[1]["state"] == "RUNNING"
+
+
+async def test_get_rsync_normalizes_job_status() -> None:
+    raw_rsync = {
+        "id": 1,
+        "path": "/mnt/tank/share",
+        "desc": "Nightly sync",
+        "remotehost": "backup.example.com",
+        "remotemodule": "share",
+        "direction": "PUSH",
+        "mode": "MODULE",
+        "enabled": True,
+        "job": {"state": "SUCCESS"},
+    }
+    async with FakeTrueNASServer(
+        valid_api_key=API_KEY,
+        responses={"rsynctask.query": [raw_rsync]},
+    ) as server:
+        async with make_client(server) as client:
+            await client.connect()
+            state = TrueNASState(client)
+            result = await state.get_rsync()
+
+    task = result[1]
+    assert task["desc"] == "Nightly sync"
+    assert task["state"] == "SUCCESS"
+    assert state.ds["rsynctask"] == result
+
+
+async def test_get_snapshottask_normalizes_schedule_and_state() -> None:
+    raw_snapshottask = {
+        "id": 1,
+        "dataset": "tank/data",
+        "recursive": True,
+        "lifetime_value": 2,
+        "lifetime_unit": "WEEK",
+        "enabled": True,
+        "naming_schema": "auto-%Y%m%d",
+        "state": {
+            "state": "FINISHED",
+            "datetime": {"$date": 1700000000000},
+        },
+    }
+    async with FakeTrueNASServer(
+        valid_api_key=API_KEY,
+        responses={"pool.snapshottask.query": [raw_snapshottask]},
+    ) as server:
+        async with make_client(server) as client:
+            await client.connect()
+            state = TrueNASState(client)
+            result = await state.get_snapshottask()
+
+    task = result[1]
+    assert task["dataset"] == "tank/data"
+    assert task["state"] == "FINISHED"
+    assert task["datetime"] == datetime.fromtimestamp(1700000000, tz=UTC)
+
+
+async def test_get_cronjob_derives_display_name_with_fallback_chain() -> None:
+    raw_cronjobs = [
+        {"id": 1, "description": "Nightly backup", "command": "backup.sh"},
+        {"id": 2, "description": "", "command": "cleanup.sh"},
+        {"id": 3, "description": "", "command": ""},
+    ]
+    async with FakeTrueNASServer(
+        valid_api_key=API_KEY,
+        responses={"cronjob.query": raw_cronjobs},
+    ) as server:
+        async with make_client(server) as client:
+            await client.connect()
+            state = TrueNASState(client)
+            result = await state.get_cronjob()
+
+    assert result[1]["display_name"] == "Nightly backup"
+    assert result[2]["display_name"] == "cleanup.sh"
+    assert result[3]["display_name"] == "Cronjob 3"

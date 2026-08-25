@@ -20,7 +20,17 @@ from typing import Any
 from ..client import TrueNASClient
 from ._helpers import _aggregate_topology_errors, _to_int
 from ._normalize import get_uid, parse_api
-from ._specs import _CLOUDSYNC_VALS, _DATASET_VALS, _POOL_ENSURE_VALS, _POOL_VALS
+from ._specs import (
+    _CLOUDSYNC_VALS,
+    _CRONJOB_ENSURE_VALS,
+    _CRONJOB_VALS,
+    _DATASET_VALS,
+    _POOL_ENSURE_VALS,
+    _POOL_VALS,
+    _REPLICATION_VALS,
+    _RSYNC_VALS,
+    _SNAPSHOTTASK_VALS,
+)
 
 _EndpointMap = dict[Hashable, dict[str, Any]]
 
@@ -46,6 +56,10 @@ class TrueNASState:
             "pool": {},
             "dataset": {},
             "cloudsync": {},
+            "replication": {},
+            "rsynctask": {},
+            "snapshottask": {},
+            "cronjob": {},
         }
 
     @property
@@ -254,3 +268,68 @@ class TrueNASState:
                 vals=_CLOUDSYNC_VALS,
             )
             return self._ds["cloudsync"]
+
+    async def get_replication(self) -> _EndpointMap:
+        """Refresh and return normalized replication tasks (``replication.query``).
+
+        Prefers the persistent task state (``state/state``, what the TrueNAS
+        WebUI shows) over the last job's state, falling back to the job state
+        only when the task state is missing/unknown; the fallback-only
+        ``job_state`` field is dropped afterwards so it doesn't leak out as a
+        stray attribute.
+        """
+        async with self._lock:
+            self._ds["replication"] = parse_api(
+                data=self._ds["replication"],
+                source=await self._client.call("replication.query"),
+                key="id",
+                vals=_REPLICATION_VALS,
+            )
+            for vals in self._ds["replication"].values():
+                if vals.get("state", "unknown") == "unknown":
+                    vals["state"] = vals.get("job_state", "unknown")
+                vals.pop("job_state", None)
+            return self._ds["replication"]
+
+    async def get_rsync(self) -> _EndpointMap:
+        """Refresh and return normalized rsync tasks (``rsynctask.query``)."""
+        async with self._lock:
+            self._ds["rsynctask"] = parse_api(
+                data=self._ds["rsynctask"],
+                source=await self._client.call("rsynctask.query"),
+                key="id",
+                vals=_RSYNC_VALS,
+            )
+            return self._ds["rsynctask"]
+
+    async def get_snapshottask(self) -> _EndpointMap:
+        """Refresh and return snapshot tasks (``pool.snapshottask.query``)."""
+        async with self._lock:
+            self._ds["snapshottask"] = parse_api(
+                data=self._ds["snapshottask"],
+                source=await self._client.call("pool.snapshottask.query"),
+                key="id",
+                vals=_SNAPSHOTTASK_VALS,
+            )
+            return self._ds["snapshottask"]
+
+    async def get_cronjob(self) -> _EndpointMap:
+        """Refresh and return normalized cron jobs (``cronjob.query``).
+
+        Derives a human-friendly ``display_name``: the description, falling
+        back to the command, falling back to a generic "Cronjob <id>" label
+        for jobs with neither -- matching the TrueNAS WebUI's own fallback.
+        """
+        async with self._lock:
+            self._ds["cronjob"] = parse_api(
+                data=self._ds["cronjob"],
+                source=await self._client.call("cronjob.query"),
+                key="id",
+                vals=_CRONJOB_VALS,
+                ensure_vals=_CRONJOB_ENSURE_VALS,
+            )
+            for uid, vals in self._ds["cronjob"].items():
+                description = (vals.get("description") or "").strip()
+                command = (vals.get("command") or "").strip()
+                vals["display_name"] = description or command or f"Cronjob {uid}"
+            return self._ds["cronjob"]
