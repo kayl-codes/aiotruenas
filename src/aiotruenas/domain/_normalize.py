@@ -209,8 +209,10 @@ def parse_api(
         data = {}
     if isinstance(source, dict):
         source = [source]
-    elif isinstance(source, str):
-        # A bare string is a malformed API payload; treat it like no source.
+    elif not isinstance(source, list):
+        # Any non-list, non-dict payload (a string, int, bool, float, ...) is
+        # malformed or absent and cannot be iterated below; treat it like a
+        # failed query (same as an explicit None) instead of crashing.
         source = None
 
     if not source:

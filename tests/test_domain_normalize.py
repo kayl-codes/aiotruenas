@@ -307,6 +307,18 @@ def test_parse_api_empty_list_source_with_key_prunes_data(ap: ModuleType) -> Non
     assert ap.parse_api(data={"existing": {}}, source=[], key="id") == {}
 
 
+@pytest.mark.parametrize("source", [42, 3.14, True])
+def test_parse_api_scalar_source_preserves_previous_snapshot(
+    ap: ModuleType, source: Any
+) -> None:
+    """A malformed scalar payload (e.g. a bare int, as a corrupted API
+    response could return) must not crash by being iterated -- it is treated
+    like a failed/None query, preserving the previous snapshot."""
+    assert ap.parse_api(data={"existing": {}}, source=source, key="id") == {
+        "existing": {}
+    }
+
+
 def test_parse_api_prunes_uid_missing_from_nonempty_source(ap: ModuleType) -> None:
     """A previously-seen object (e.g. a physically removed disk) absent from an
     otherwise successful, non-empty response must be dropped, not left behind
