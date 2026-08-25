@@ -18,7 +18,7 @@ import asyncio
 import copy
 from collections.abc import Hashable
 from datetime import UTC, datetime
-from typing import Any, TypedDict
+from typing import Any, TypedDict, cast
 
 from ..client import TrueNASClient
 from ..exceptions import TrueNASError
@@ -37,9 +37,15 @@ from ._specs import (
 )
 
 _EndpointMap = dict[Hashable, dict[str, Any]]
-#: Shape used by the netdata-graph-backed endpoints (``arc``, ``ups``), which
-#: have no natural object id and instead hold a flat dict of scalar readings.
-_ScalarMap = dict[str, float | None]
+#: get_arc() shape: one entry per known metric, None where currently unavailable.
+_ArcMap = dict[str, float | None]
+#: get_ups() shape: only metrics currently reporting a value (never None --
+#: missing/no-UPS metrics are omitted rather than included as None).
+_UpsMap = dict[str, float]
+#: Public shape of the ``ds`` property: a plain mapping (rather than the
+#: TypedDict used internally) so consumers can index it with a runtime
+#: string, e.g. when iterating over endpoint names.
+_PublicStateMap = dict[str, _EndpointMap | _ArcMap | _UpsMap]
 
 
 class _StateMap(TypedDict):
@@ -54,8 +60,8 @@ class _StateMap(TypedDict):
     rsynctask: _EndpointMap
     snapshottask: _EndpointMap
     cronjob: _EndpointMap
-    arc: _ScalarMap
-    ups: _ScalarMap
+    arc: _ArcMap
+    ups: _UpsMap
 
 
 # Maps a netdata graph name (``reporting.netdata_graphs``) to its ds["arc"] field.
@@ -107,13 +113,17 @@ class TrueNASState:
         }
 
     @property
-    def ds(self) -> _StateMap:
+    def ds(self) -> _PublicStateMap:
         """Normalized state, keyed by endpoint name then by object id/guid.
 
         The ``arc`` and ``ups`` endpoints have no natural object id and are
         keyed by endpoint name only, holding a flat dict of scalar readings.
+
+        Typed as a plain mapping rather than the ``TypedDict`` used
+        internally, so it can be indexed with a runtime string (e.g. when
+        iterating over endpoint names) under static type checking.
         """
-        return self._ds
+        return cast(_PublicStateMap, self._ds)
 
     async def get_dataset(self) -> _EndpointMap:
         """Refresh and return normalized ZFS datasets (``pool.dataset.query``)."""
