@@ -113,9 +113,21 @@ Datasets). Ein einzelner Umbau wäre schwer reviewbar und schwer rückrollbar.
    Release-Rhythmus erfolgen, da die Library ab Schritt 1 bereits den vollen (identischen)
    Endpoint-Bedarf beider Repos abdeckt.
 
-Jeder Schritt: normaler Feature-Branch-PR-Workflow in aiotruenas (fix→extend→package), Version
-per Precedent (1.1.0/1.2.0-Muster: `pyproject.toml` + `__init__.py` `__version__` synchron,
-Minor-Bump da rein additiv, kein Breaking Change). Kein Commit/Push/PR ohne explizite Freigabe.
+Jeder Schritt: normaler Feature-Branch-PR-Workflow in aiotruenas (fix→extend→package), synchron
+in `pyproject.toml` + `__init__.py` `__version__`. **Versionierung (Nutzer-Entscheidung
+2026-08-25):** Schritte 2–4 laufen unter Patch-Bumps (1.3.1, 1.3.2, …); erst mit Abschluss von
+Schritt 4 (alle Endpoints migriert) erfolgt ein gemeinsamer Minor-Bump auf 1.4.0. Kein
+Commit/Push/PR ohne explizite Freigabe.
+
+### Status (2026-08-25)
+
+- ✅ Schritt 1 — Engine-Port: PR #15, gemerged, v1.3.0.
+- ✅ Schritt 2 — Shared Helpers: PR #16, gemerged, v1.3.1.
+- 🔧 Schritt 3 — Pilot-Endpoints (`get_pool()`/`get_dataset()`/`get_cloudsync()` auf
+  `TrueNASState`) in Arbeit, v1.3.2. Dabei nachgezogen: `prune`/`_prune_stale_uids` in
+  `_normalize.py` — im Prod-`apiparser.py` seit Commit `e06b7ff` (2026-08-25, Copilot-Review auf
+  PR #179103) vorhanden, fehlte im Schritt-1-Port; jetzt 1:1 nachportiert (siehe Kritische
+  Dateien). Bronze-Fork-Validierung gegen echte TrueNAS-Instanz noch offen.
 
 ## Zu klärende/entscheidende Punkte (Antworten auf die 3 Nutzerfragen)
 

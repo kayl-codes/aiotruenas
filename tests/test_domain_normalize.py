@@ -9,6 +9,7 @@ from __future__ import annotations
 
 from datetime import UTC, datetime
 from types import ModuleType
+from typing import Any
 
 import pytest
 
@@ -158,6 +159,14 @@ def test_get_uid_via_key_search(ap: ModuleType) -> None:
     assert ap.get_uid({"guid": "guid-1"}, None, None, "guid", keymap) == "uid-1"
 
 
+def test_get_uid_key_search_unhashable_value_returns_none(ap: ModuleType) -> None:
+    """An unhashable key_search value (e.g. a list) must not crash
+    keymap.get() -- it should be treated like any other unresolvable uid."""
+    keymap = {"guid-1": "uid-1"}
+    entry = {"guid": ["not", "hashable"]}
+    assert ap.get_uid(entry, None, None, "guid", keymap) is None
+
+
 def test_generate_keymap_none_when_no_key_search(ap: ModuleType) -> None:
     assert ap.generate_keymap({"uid-1": {"guid": "guid-1"}}, None) is None
 
@@ -298,6 +307,65 @@ def test_parse_api_empty_list_source_with_key_prunes_data(ap: ModuleType) -> Non
     assert ap.parse_api(data={"existing": {}}, source=[], key="id") == {}
 
 
+@pytest.mark.parametrize("source", [42, 3.14, True])
+def test_parse_api_scalar_source_preserves_previous_snapshot(
+    ap: ModuleType, source: Any
+) -> None:
+    """A malformed scalar payload (e.g. a bare int, as a corrupted API
+    response could return) must not crash by being iterated -- it is treated
+    like a failed/None query, preserving the previous snapshot."""
+    assert ap.parse_api(data={"existing": {}}, source=source, key="id") == {
+        "existing": {}
+    }
+
+
+def test_parse_api_prunes_uid_missing_from_nonempty_source(ap: ModuleType) -> None:
+    """A previously-seen object (e.g. a physically removed disk) absent from an
+    otherwise successful, non-empty response must be dropped, not left behind
+    forever alongside the objects that are still present."""
+    data = {"1": {"name": "pool0"}, "2": {"name": "pool1"}}
+    source = [{"id": "2", "name": "pool1"}]
+    result = ap.parse_api(data=data, source=source, key="id", vals=[{"name": "name"}])
+    assert result == {"2": {"name": "pool1"}}
+
+
+def test_parse_api_prunes_uid_missing_from_key_search_source(ap: ModuleType) -> None:
+    data = {"uid-1": {"guid": "guid-1", "name": "old"}, "uid-2": {"guid": "guid-2"}}
+    source = [{"guid": "guid-1", "name": "new"}]
+    result = ap.parse_api(
+        data=data, source=source, key_search="guid", vals=[{"name": "name"}]
+    )
+    assert result == {"uid-1": {"guid": "guid-1", "name": "new"}}
+
+
+def test_parse_api_prune_false_keeps_uids_absent_from_partial_source(
+    ap: ModuleType,
+) -> None:
+    """A caller merging one extra record into an already-populated map (e.g.
+    adding the boot-pool to the regular pools) must not have that unrelated
+    subset misread as "everything else was removed"."""
+    data = {"1": {"name": "pool0"}, "2": {"name": "pool1"}}
+    source = [{"id": "boot-pool", "name": "boot-pool"}]
+    result = ap.parse_api(
+        data=data, source=source, key="id", vals=[{"name": "name"}], prune=False
+    )
+    assert result == {
+        "1": {"name": "pool0"},
+        "2": {"name": "pool1"},
+        "boot-pool": {"name": "boot-pool"},
+    }
+
+
+def test_parse_api_keyless_source_does_not_prune(ap: ModuleType) -> None:
+    """Keyless (single-object) data has no per-uid identity to prune by."""
+    result = ap.parse_api(
+        data={"total": 42, "stale": "kept"},
+        source=[{"total": 43}],
+        vals=[{"name": "total"}],
+    )
+    assert result == {"total": 43, "stale": "kept"}
+
+
 def test_parse_api_single_dict_source_is_wrapped(ap: ModuleType) -> None:
     result = ap.parse_api(
         source={"id": "1", "name": "pool0"},
@@ -370,6 +438,53 @@ def test_parse_api_only_and_skip_combined_skip_wins_on_overlap(ap: ModuleType) -
     assert result == {"2": {"type": "DISK"}}
 
 
+def test_parse_api_only_filter_does_not_prune_still_present_entries(
+    ap: ModuleType,
+) -> None:
+    """A uid excluded by `only` but still present in the raw source must
+    survive pruning: filtering is not the same as the entity being removed
+    from the backend."""
+    data = {"1": {"type": "DISK"}, "2": {"type": "SSD"}}
+    source = [{"id": "1", "type": "DISK"}, {"id": "2", "type": "SSD"}]
+    result = ap.parse_api(
+        data=data,
+        source=source,
+        key="id",
+        vals=[{"name": "type"}],
+        only=[{"key": "type", "value": "DISK"}],
+    )
+    assert result == {"1": {"type": "DISK"}, "2": {"type": "SSD"}}
+
+
+@pytest.mark.parametrize("source", [[None], [{}]])
+def test_parse_api_malformed_nonempty_source_does_not_wipe_cache(
+    ap: ModuleType, source: list[Any]
+) -> None:
+    """A non-empty but entirely malformed/keyless response (e.g. a server
+    glitch returning `[None]` or `[{}]`) must preserve the previous
+    snapshot rather than being mistaken for "everything was removed"."""
+    data = {"1": {"type": "DISK"}, "2": {"type": "SSD"}}
+    result = ap.parse_api(data=data, source=source, key="id", vals=[{"name": "type"}])
+    assert result == {"1": {"type": "DISK"}, "2": {"type": "SSD"}}
+
+
+def test_parse_api_only_filter_still_prunes_truly_removed_entries(
+    ap: ModuleType,
+) -> None:
+    """A uid absent from a later, non-empty source is pruned even while an
+    `only` filter is also in play."""
+    data = {"1": {"type": "DISK"}, "2": {"type": "SSD"}}
+    source = [{"id": "1", "type": "DISK"}]
+    result = ap.parse_api(
+        data=data,
+        source=source,
+        key="id",
+        vals=[{"name": "type"}],
+        only=[{"key": "type", "value": "DISK"}],
+    )
+    assert result == {"1": {"type": "DISK"}}
+
+
 def test_parse_api_ensure_vals_adds_missing_keys(ap: ModuleType) -> None:
     result = ap.parse_api(
         source=[{"id": "1"}],
@@ -386,6 +501,46 @@ def test_parse_api_key_search_maps_to_existing_uid(ap: ModuleType) -> None:
         data=data, source=source, key_search="guid", vals=[{"name": "name"}]
     )
     assert result == {"uid-1": {"guid": "guid-1", "name": "new"}}
+
+
+def test_parse_api_key_search_with_unhashable_entry_does_not_crash(
+    ap: ModuleType,
+) -> None:
+    """A malformed entry with an unhashable key_search value must not abort
+    the refresh with a TypeError while computing seen_uids."""
+    data = {"uid-1": {"guid": "guid-1", "name": "old"}}
+    source = [
+        {"guid": ["not", "hashable"], "name": "bogus"},
+        {"guid": "guid-1", "name": "new"},
+    ]
+    result = ap.parse_api(
+        data=data, source=source, key_search="guid", vals=[{"name": "name"}]
+    )
+    assert result == {"uid-1": {"guid": "guid-1", "name": "new"}}
+
+
+def test_parse_api_keyless_nondict_entry_does_not_overwrite_with_defaults(
+    ap: ModuleType,
+) -> None:
+    """A non-dict entry (e.g. None) in a keyless, non-empty source must be
+    skipped instead of resetting the previously-parsed fields to their spec
+    defaults -- a keyless parse has no uid to gate matching on, so this
+    would otherwise silently wipe out real data with defaults."""
+    data = {"label": "real-value"}
+    result = ap.parse_api(
+        data=data, source=[None], vals=[{"name": "label", "default": "n/a"}]
+    )
+    assert result == {"label": "real-value"}
+
+
+def test_parse_api_keyless_empty_dict_entry_fills_defaults(ap: ModuleType) -> None:
+    """A genuinely empty dict entry ([{}]) is a normal, supported input
+    (equivalent to a bare dict source) and legitimately fills defaults for
+    its missing fields -- unlike a non-dict entry, it is not malformed."""
+    result = ap.parse_api(
+        data={"label": "stale"}, source=[{}], vals=[{"name": "label", "default": "n/a"}]
+    )
+    assert result == {"label": "n/a"}
 
 
 def test_parse_api_convert_timestamp(ap: ModuleType) -> None:

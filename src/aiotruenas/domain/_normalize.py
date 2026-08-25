@@ -189,21 +189,48 @@ def parse_api(
     ensure_vals: list[ApiValueSpec] | None = None,
     only: list[dict[str, Any]] | None = None,
     skip: list[dict[str, Any]] | None = None,
+    prune: bool = True,
 ) -> dict[str, Any]:
-    """Get data from API."""
+    """Get data from API.
+
+    For keyed/key_search'd data, a uid present in ``data`` from a previous
+    call but absent from this (non-empty) ``source`` is dropped: it means
+    the underlying object (disk, pool, task, app, interface, ...) no longer
+    exists, so keeping it would leave a stale entity behind indefinitely.
+    See ``_empty_source_result`` for the None-source (query failed) and
+    empty-list-source (nothing left at all) cases.
+
+    ``prune=False`` opts out of that dropping for callers that intentionally
+    pass a partial ``source`` covering only a subset of ``data`` (e.g. adding
+    a single extra record to an already-populated map) -- otherwise every
+    uid outside that subset would be misread as removed and deleted.
+    """
     if data is None:
         data = {}
     if isinstance(source, dict):
         source = [source]
-    elif isinstance(source, str):
-        # A bare string is a malformed API payload; treat it like no source.
+    elif not isinstance(source, list):
+        # Any non-list, non-dict payload (a string, int, bool, float, ...) is
+        # malformed or absent and cannot be iterated below; treat it like a
+        # failed query (same as an explicit None) instead of crashing.
         source = None
 
     if not source:
         return _empty_source_result(data, key, key_search, vals, source is None)
 
     keymap = generate_keymap(data, key_search)
+    seen_uids: set[str] = set()
     for entry in source:
+        # Mark the uid as seen (present in the current source) before applying
+        # only/skip, so an entry that is still there but filtered out this
+        # round is not mistaken for one that was removed from the backend and
+        # pruned. get_uid() is a pure lookup (unlike _resolve_entry_uid, which
+        # side-effects `data` by pre-creating data[uid]) so this is safe to
+        # call even for entries that end up filtered out below.
+        seen_uid = get_uid(entry, key, key_secondary, key_search, keymap)
+        if seen_uid is not None:
+            seen_uids.add(seen_uid)
+
         if _should_skip_entry(entry, only, skip):
             continue
 
@@ -215,7 +242,28 @@ def parse_api(
 
         data = _apply_entry(data, entry, uid, vals, ensure_vals, val_proc)
 
+    # A non-empty source consisting entirely of malformed/keyless entries
+    # (e.g. [None] or [{}]) yields an empty seen_uids without ever having
+    # been recognized as a failed response by the `not source` check above;
+    # pruning on that empty set would wipe out every previously cached
+    # entry. Only prune when at least one entry actually resolved to a uid.
+    if prune and (not (key or key_search) or seen_uids):
+        _prune_stale_uids(data, key, key_search, seen_uids)
+
     return data
+
+
+# ---------------------------
+#   _prune_stale_uids
+# ---------------------------
+def _prune_stale_uids(
+    data: dict[str, Any], key: str | None, key_search: str | None, seen_uids: set[str]
+) -> None:
+    """Drop keyed/key_search'd entries no longer present in the current source."""
+    if not (key or key_search):
+        return
+    for stale_uid in set(data) - seen_uids:
+        del data[stale_uid]
 
 
 # ---------------------------
@@ -270,7 +318,13 @@ def _resolve_entry_uid(
     key requirement that could not be satisfied and should be skipped.
     """
     if not (key or key_search):
-        return None, True
+        # Keyless data has no uid to resolve, but a non-dict entry (e.g. None
+        # from a malformed non-empty source) must still be rejected here --
+        # otherwise _apply_entry() would reset every field to its spec
+        # default. A dict entry, even an empty one, is a normal, supported
+        # input (equivalent to passing it directly as a dict `source`) and
+        # is left to fill_defaults()'s own non-destructive default-filling.
+        return None, isinstance(entry, dict)
 
     uid = get_uid(entry, key, key_secondary, key_search, keymap)
     if uid is None:
@@ -322,7 +376,12 @@ def get_uid(
         elif key_secondary is not None:
             uid = entry.get(key_secondary)
     elif keymap and key_search is not None and key_search in entry:
-        uid = keymap.get(entry[key_search])
+        search_value = entry[key_search]
+        # An unhashable search value (e.g. a list) would raise TypeError from
+        # keymap.get() below rather than being reported as "no uid" like
+        # every other malformed-entry case here.
+        if isinstance(search_value, Hashable):
+            uid = keymap.get(search_value)
 
     return uid if isinstance(uid, Hashable) else None
 

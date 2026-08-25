@@ -1,6 +1,7 @@
 """aiotruenas: asyncio-native Python client for the TrueNAS JSON-RPC WebSocket API."""
 
 from .client import DEFAULT_QUERY_TIMEOUT, TrueNASClient
+from .domain.state import TrueNASState
 from .exceptions import (
     TrueNASAuthenticationError,
     TrueNASCallError,
@@ -22,11 +23,12 @@ from .exceptions import (
     TrueNASWebSocketUnsupportedError,
 )
 
-__version__ = "1.3.1"
+__version__ = "1.3.2"
 
 __all__ = [
     "DEFAULT_QUERY_TIMEOUT",
     "TrueNASClient",
+    "TrueNASState",
     "TrueNASError",
     "TrueNASConnectionError",
     "TrueNASCertificateVerificationError",
