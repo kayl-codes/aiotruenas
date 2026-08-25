@@ -151,19 +151,33 @@ Commit/Push/PR ohne explizite Freigabe.
   erkannt wird. `systemstats` und die Disk-Temperatur-Ermittlung sind auf spätere Batches
   verschoben (siehe Korrektur bei Schritt 4 oben) — sie sind keine eigenständigen Endpoints,
   sondern Anreicherungen von `system_info`/`interface`/`disk`, die selbst noch nicht migriert sind.
-- 🔧 Schritt 4c — Services/VM/Container/App (`get_service()`/`get_vm()`/`get_container()`/
-  `get_app()` auf `TrueNASState`, v1.3.5) implementiert, noch nicht committed/gepusht. Wie bei 4a
-  bleibt die HA-spezifische `_is_group_monitored(...)`-Gatingprüfung (VMs/Container) in
-  `coordinator.py`; `TrueNASState` fragt/normalisiert unbedingt. `get_app()` liefert nur
-  Query+Normalisierung (`running`/`update_available`); die Update-Job-Poll-Logik
-  (`update_jobid`/`update_progress`/...) bleibt in `coordinator.py`, da sie an HA-Update-Entities
-  hängt (siehe "Was in coordinator.py bleibt" oben). `get_app_stats()` wandert nicht — es ist
-  vollständig auf der Websocket-Push-Subscription-Schicht aufgebaut, die laut Zielarchitektur in
-  coordinator.py verbleibt. Neu: `get_container()` muss selbst zwischen `container.query`
-  (TrueNAS 26.0+, LXC) und `virt.instance.query` (Legacy Incus) unterscheiden; dafür ermittelt
+- ✅ Schritt 4c — Services/VM/Container/App (`get_service()`/`get_vm()`/`get_container()`/
+  `get_app()` auf `TrueNASState`): PR #20, gemerged, v1.3.5. Wie bei 4a bleibt die HA-spezifische
+  `_is_group_monitored(...)`-Gatingprüfung (VMs/Container) in `coordinator.py`; `TrueNASState`
+  fragt/normalisiert unbedingt. `get_app()` liefert nur Query+Normalisierung
+  (`running`/`update_available`); die Update-Job-Poll-Logik (`update_jobid`/`update_progress`/...)
+  bleibt in `coordinator.py`, da sie an HA-Update-Entities hängt (siehe "Was in coordinator.py
+  bleibt" oben). `get_app_stats()` wandert nicht — es ist vollständig auf der
+  Websocket-Push-Subscription-Schicht aufgebaut, die laut Zielarchitektur in coordinator.py
+  verbleibt. Neu: `get_container()` muss selbst zwischen `container.query` (TrueNAS 26.0+, LXC)
+  und `virt.instance.query` (Legacy Incus) unterscheiden; dafür ermittelt
   `TrueNASState._detect_version()` die TrueNAS-Version per eigenem `system.info`-Aufruf (nicht
   über `ds["system_info"]`, das noch nicht migriert ist) und cacht sie für die Lebensdauer der
   Instanz, da sie sich ohne einen Neustart des Geräts (und damit Verbindungsabbruch) nicht ändert.
+- ✅ Schritt 4d — Alerts/Certificates/Directoryservices (`get_alerts()`/`get_certificates()`/
+  `get_directoryservices()` auf `TrueNASState`, v1.4.0) — letzter Batch aus Schritt 4, daher direkt
+  der gemeinsame Minor-Bump statt eines weiteren Patch-Release. `get_certificates()` schlüsselt
+  bewusst nach `name` statt `id` (wie im Coordinator-Original): ein manuelles
+  Zertifikats-Renewal/-Reissue legt in der TrueNAS-DB eine neue Zeile mit frischer `id`, aber
+  gleichem (DB-eindeutigem) `name` an. `get_alerts()` hat wie `get_arc()`/`get_ups()` keinen
+  natürlichen id-Key und läuft nicht über `parse_api()` — dismissed Alerts werden ausgefiltert,
+  Zähler nach `level` aggregiert, und `disk_issues` ist ein Substring-Heuristik-Match auf
+  `klass`/`title` (disk/pool/smart). `get_directoryservices()` merged `directoryservices.config`
+  und `directoryservices.status` zu einer Quellzeile vor `parse_api()` (nur eine Zeile,
+  `id`-Default 1); die HA-spezifische `_is_group_monitored(MONITOR_GROUP_DIRECTORY_SERVICES)`-Gate
+  aus dem Coordinator-Original bleibt dort — die Library fragt/normalisiert unbedingt, sobald
+  ein Directory-Service konfiguriert+aktiviert ist. Damit ist Schritt 4 (a–d) vollständig
+  abgeschlossen.
 
 ## Zu klärende/entscheidende Punkte (Antworten auf die 3 Nutzerfragen)
 

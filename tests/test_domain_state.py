@@ -452,8 +452,19 @@ async def test_ds_property_starts_empty_for_all_endpoints() -> None:
         "vm": {},
         "container": {},
         "app": {},
+        "certificate": {},
+        "directoryservices": {},
         "arc": {},
         "ups": {},
+        "alerts": {
+            "count": 0,
+            "messages": [],
+            "critical": 0,
+            "warning": 0,
+            "info": 0,
+            "disk_issues": False,
+            "uuids": [],
+        },
     }
 
 
@@ -971,6 +982,206 @@ async def test_get_app_honors_image_updates_for_custom_apps() -> None:
             result = await state.get_app()
 
     assert result["custom1"]["update_available"] is True
+
+
+async def test_get_certificates_keys_by_name_and_derives_days_until_expiry() -> None:
+    raw_certificates = [
+        {
+            "id": 1,
+            "name": "truenas_default",
+            "cert_type": "CERTIFICATE",
+            "common": "truenas.local",
+            "until": "Fri Mar 26 00:59:59 2100",
+            "expired": False,
+            "renew_days": 10,
+        }
+    ]
+    async with FakeTrueNASServer(
+        valid_api_key=API_KEY,
+        responses={"certificate.query": raw_certificates},
+    ) as server:
+        async with make_client(server) as client:
+            await client.connect()
+            state = TrueNASState(client)
+            result = await state.get_certificates()
+
+    assert set(result.keys()) == {"truenas_default"}
+    cert = result["truenas_default"]
+    assert cert["id"] == 1
+    assert cert["expired"] is False
+    assert isinstance(cert["days_until_expiry"], int)
+    assert cert["days_until_expiry"] > 0
+
+
+async def test_get_certificates_sets_days_until_expiry_none_for_unparsable_until() -> (
+    None
+):
+    raw_certificates = [{"id": 1, "name": "broken", "until": "not-a-date"}]
+    async with FakeTrueNASServer(
+        valid_api_key=API_KEY,
+        responses={"certificate.query": raw_certificates},
+    ) as server:
+        async with make_client(server) as client:
+            await client.connect()
+            state = TrueNASState(client)
+            result = await state.get_certificates()
+
+    assert result["broken"]["days_until_expiry"] is None
+
+
+async def test_get_directoryservices_returns_empty_when_not_configured() -> None:
+    async with FakeTrueNASServer(
+        valid_api_key=API_KEY,
+        responses={
+            "directoryservices.config": {"service_type": None, "enable": False},
+        },
+    ) as server:
+        async with make_client(server) as client:
+            await client.connect()
+            state = TrueNASState(client)
+            result = await state.get_directoryservices()
+
+    assert result == {}
+
+
+async def test_get_directoryservices_merges_config_and_status_and_derives_healthy() -> (
+    None
+):
+    async with FakeTrueNASServer(
+        valid_api_key=API_KEY,
+        responses={
+            "directoryservices.config": {
+                "id": 1,
+                "service_type": "ACTIVEDIRECTORY",
+                "enable": True,
+                "enable_account_cache": True,
+                "enable_dns_updates": True,
+                "kerberos_realm": "EXAMPLE.COM",
+                "configuration": {"domain": "example.com", "site": "Default-First"},
+            },
+            "directoryservices.status": {
+                "status": "HEALTHY",
+                "status_msg": None,
+            },
+        },
+    ) as server:
+        async with make_client(server) as client:
+            await client.connect()
+            state = TrueNASState(client)
+            result = await state.get_directoryservices()
+
+    entry = result[1]
+    assert entry["type"] == "ACTIVEDIRECTORY"
+    assert entry["domain"] == "example.com"
+    assert entry["site"] == "Default-First"
+    assert entry["status"] == "HEALTHY"
+    assert entry["healthy"] is True
+
+
+async def test_get_directoryservices_derives_unhealthy_from_faulted_status() -> None:
+    async with FakeTrueNASServer(
+        valid_api_key=API_KEY,
+        responses={
+            "directoryservices.config": {
+                "id": 1,
+                "service_type": "LDAP",
+                "enable": True,
+            },
+            "directoryservices.status": {"status": "FAULTED"},
+        },
+    ) as server:
+        async with make_client(server) as client:
+            await client.connect()
+            state = TrueNASState(client)
+            result = await state.get_directoryservices()
+
+    assert result[1]["healthy"] is False
+
+
+async def test_get_alerts_excludes_dismissed_and_aggregates_by_level() -> None:
+    raw_alerts = [
+        {
+            "uuid": "a1",
+            "level": "CRITICAL",
+            "klass": "PoolStatus",
+            "title": "Pool degraded",
+            "formatted": "Pool tank is degraded",
+            "dismissed": False,
+        },
+        {
+            "uuid": "a2",
+            "level": "WARNING",
+            "klass": "CertificateExpiry",
+            "title": "Certificate expiring",
+            "formatted": "Certificate expiring soon",
+            "dismissed": False,
+        },
+        {
+            "uuid": "a3",
+            "level": "INFO",
+            "klass": "Update",
+            "title": "Update available",
+            "formatted": "An update is available",
+            "dismissed": True,
+        },
+    ]
+    async with FakeTrueNASServer(
+        valid_api_key=API_KEY,
+        responses={"alert.list": raw_alerts},
+    ) as server:
+        async with make_client(server) as client:
+            await client.connect()
+            state = TrueNASState(client)
+            result = await state.get_alerts()
+
+    assert result["count"] == 2
+    assert result["critical"] == 1
+    assert result["warning"] == 1
+    assert result["info"] == 0
+    assert result["uuids"] == ["a1", "a2"]
+    assert result["messages"] == ["Pool tank is degraded", "Certificate expiring soon"]
+    assert result["disk_issues"] is True
+
+
+async def test_get_alerts_disk_issues_false_without_disk_pool_or_smart_match() -> None:
+    raw_alerts = [
+        {
+            "uuid": "a1",
+            "level": "INFO",
+            "klass": "Update",
+            "title": "Update available",
+            "formatted": "An update is available",
+            "dismissed": False,
+        }
+    ]
+    async with FakeTrueNASServer(
+        valid_api_key=API_KEY,
+        responses={"alert.list": raw_alerts},
+    ) as server:
+        async with make_client(server) as client:
+            await client.connect()
+            state = TrueNASState(client)
+            result = await state.get_alerts()
+
+    assert result["disk_issues"] is False
+
+
+async def test_get_alerts_keeps_previous_state_on_malformed_response() -> None:
+    async with FakeTrueNASServer(
+        valid_api_key=API_KEY,
+        responses={"alert.list": [{"uuid": "a1", "level": "CRITICAL"}]},
+    ) as server:
+        async with make_client(server) as client:
+            await client.connect()
+            state = TrueNASState(client)
+            await state.get_alerts()
+            previous_alerts = state.ds["alerts"]
+
+            server.responses["alert.list"] = None
+            result = await state.get_alerts()
+
+    assert result is previous_alerts
+    assert state.ds["alerts"] is previous_alerts
 
 
 async def test_get_ups_keeps_previous_reading_when_discovery_raises() -> None:

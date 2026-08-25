@@ -35,6 +35,7 @@ from ._normalize import get_uid, parse_api
 from ._specs import (
     _APP_ENSURE_VALS,
     _APP_VALS,
+    _CERTIFICATE_VALS,
     _CLOUDSYNC_VALS,
     _CONTAINER_ENSURE_VALS,
     _CONTAINER_V26_ENSURE_VALS,
@@ -43,6 +44,8 @@ from ._specs import (
     _CRONJOB_ENSURE_VALS,
     _CRONJOB_VALS,
     _DATASET_VALS,
+    _DIRECTORYSERVICES_ENSURE_VALS,
+    _DIRECTORYSERVICES_VALS,
     _POOL_ENSURE_VALS,
     _POOL_VALS,
     _REPLICATION_VALS,
@@ -60,10 +63,12 @@ _ArcMap = dict[str, float | None]
 #: get_ups() shape: only metrics currently reporting a value (never None --
 #: missing/no-UPS metrics are omitted rather than included as None).
 _UpsMap = dict[str, float]
+#: get_alerts() shape: aggregated counters/messages, no natural object id.
+_AlertsMap = dict[str, Any]
 #: Public shape of the ``ds`` property: a plain mapping (rather than the
 #: TypedDict used internally) so consumers can index it with a runtime
 #: string, e.g. when iterating over endpoint names.
-_PublicStateMap = dict[str, _EndpointMap | _ArcMap | _UpsMap]
+_PublicStateMap = dict[str, _EndpointMap | _ArcMap | _UpsMap | _AlertsMap]
 
 
 class _StateMap(TypedDict):
@@ -82,8 +87,11 @@ class _StateMap(TypedDict):
     vm: _EndpointMap
     container: _EndpointMap
     app: _EndpointMap
+    certificate: _EndpointMap
+    directoryservices: _EndpointMap
     arc: _ArcMap
     ups: _UpsMap
+    alerts: _AlertsMap
 
 
 # Maps a netdata graph name (``reporting.netdata_graphs``) to its ds["arc"] field.
@@ -155,8 +163,19 @@ class TrueNASState:
             "vm": {},
             "container": {},
             "app": {},
+            "certificate": {},
+            "directoryservices": {},
             "arc": {},
             "ups": {},
+            "alerts": {
+                "count": 0,
+                "messages": [],
+                "critical": 0,
+                "warning": 0,
+                "info": 0,
+                "disk_issues": False,
+                "uuids": [],
+            },
         }
         # Cached (major, minor) TrueNAS version, used by get_container() to
         # pick the right query API; detected lazily on first use (see
@@ -695,3 +714,113 @@ class TrueNASState:
                     and bool(vals.get("image_updates_available"))
                 )
             return self._ds["app"]
+
+    async def get_certificates(self) -> _EndpointMap:
+        """Refresh and return normalized certificates (``certificate.query``).
+
+        Keyed by "name" rather than "id": a manual certificate renewal/
+        reissue deletes the old database row and creates a new one with a
+        fresh id but the same (database-unique) name, so "name" is the
+        stable identity across a renewal.
+
+        Derives ``days_until_expiry`` from the parsed ``until`` timestamp.
+        """
+        async with self._lock:
+            self._ds["certificate"] = parse_api(
+                data={},
+                source=await self._client.call("certificate.query"),
+                key="name",
+                vals=_CERTIFICATE_VALS,
+            )
+            now = datetime.now(UTC)
+            for vals in self._ds["certificate"].values():
+                until = vals.get("until")
+                vals["days_until_expiry"] = (
+                    max(0, (until - now).days) if isinstance(until, datetime) else None
+                )
+            return self._ds["certificate"]
+
+    async def get_directoryservices(self) -> _EndpointMap:
+        """Refresh and return directory-service status (AD/LDAP/IPA).
+
+        Uses the unified ``directoryservices`` API (TrueNAS 25.04+):
+        ``directoryservices.config`` carries the service type/domain/options,
+        ``directoryservices.status`` carries the live state (HEALTHY/FAULTED/
+        ...). Both are merged into a single source row before normalizing,
+        since there is only ever one row (a real object id is not provided by
+        the API). Returns an empty map when no directory service is
+        configured/enabled -- querying "status" would be meaningless then.
+
+        Unlike the coordinator method this replaces, gating on whether the
+        feature is "monitored" is an HA options-flow concern for the caller,
+        not TrueNAS normalization -- this always queries and normalizes.
+        """
+        async with self._lock:
+            config = await self._client.call("directoryservices.config")
+            if (
+                not isinstance(config, dict)
+                or not config.get("service_type")
+                or not config.get("enable")
+            ):
+                self._ds["directoryservices"] = {}
+                return self._ds["directoryservices"]
+
+            raw_status = await self._client.call("directoryservices.status")
+            status = raw_status if isinstance(raw_status, dict) else {}
+
+            merged = dict(config)
+            merged["status"] = status.get("status", "unknown")
+            merged["status_msg"] = status.get("status_msg")
+
+            self._ds["directoryservices"] = parse_api(
+                data={},
+                source=[merged],
+                key="id",
+                vals=_DIRECTORYSERVICES_VALS,
+                ensure_vals=_DIRECTORYSERVICES_ENSURE_VALS,
+            )
+            for vals in self._ds["directoryservices"].values():
+                vals["healthy"] = vals.get("status") == "HEALTHY"
+            return self._ds["directoryservices"]
+
+    async def get_alerts(self) -> _AlertsMap:
+        """Refresh and return aggregated alert counters (``alert.list``).
+
+        Unlike the other endpoints, this has no natural object id and is not
+        run through ``parse_api()`` -- the entire result is derived by hand:
+        dismissed alerts are excluded, counts are aggregated by ``level``,
+        and ``disk_issues`` is a heuristic match on ``klass``/``title``
+        substrings (disk/pool/smart) flagging disk-related alerts
+        specifically.
+        """
+        async with self._lock:
+            raw = await self._client.call("alert.list")
+            if not isinstance(raw, list):
+                return self._ds["alerts"]
+
+            active = [
+                alert
+                for alert in raw
+                if isinstance(alert, dict) and not alert.get("dismissed", False)
+            ]
+
+            disk_issues = False
+            for alert in active:
+                klass = str(alert.get("klass", "")).lower()
+                title = str(alert.get("title", "")).lower()
+                if "disk" in klass or "pool" in klass or "smart" in title:
+                    disk_issues = True
+                    break
+
+            self._ds["alerts"] = {
+                "count": len(active),
+                "messages": [
+                    alert.get("formatted", "Unknown alert") for alert in active
+                ],
+                "critical": sum(alert.get("level") == "CRITICAL" for alert in active),
+                "warning": sum(alert.get("level") == "WARNING" for alert in active),
+                "info": sum(alert.get("level") == "INFO" for alert in active),
+                "disk_issues": disk_issues,
+                "uuids": [alert.get("uuid") for alert in active if alert.get("uuid")],
+            }
+            return self._ds["alerts"]

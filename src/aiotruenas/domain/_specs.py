@@ -339,3 +339,47 @@ _APP_ENSURE_VALS: list[ApiValueSpec] = [
     {"name": "update_state", "default": "unknown"},
     {"name": "update_description", "default": ""},
 ]
+
+# certificate.query. Keyed by "name" rather than "id" (see
+# TrueNASState.get_certificates()): a manual renewal/reissue deletes the old
+# database row and creates a new one with a fresh id but the same
+# (database-unique) name.
+_CERTIFICATE_VALS: list[ApiValueSpec] = [
+    {"name": "id", "default": 0},
+    {"name": "name", "default": "unknown"},
+    {"name": "cert_type", "default": "unknown"},
+    {"name": "common", "default": ""},
+    {"name": "until", "default": None, "convert": "human_date_to_utc"},
+    {"name": "expired", "type": "bool", "default": False},
+    {"name": "renew_days", "default": 0},
+]
+
+# directoryservices.config + directoryservices.status, merged into a single
+# source row before parse_api (config carries the service type/domain/
+# options, status carries the live HEALTHY/FAULTED state). There is only
+# ever one row -- "id" is a synthetic constant, not a real API field.
+_DIRECTORYSERVICES_VALS: list[ApiValueSpec] = [
+    {"name": "id", "default": 1},
+    {"name": "type", "source": "service_type", "default": "unknown"},
+    {"name": "enable", "type": "bool", "default": False},
+    {
+        "name": "account_cache",
+        "source": "enable_account_cache",
+        "type": "bool",
+        "default": False,
+    },
+    {
+        "name": "dns_updates",
+        "source": "enable_dns_updates",
+        "type": "bool",
+        "default": False,
+    },
+    {"name": "kerberos_realm", "default": "unknown"},
+    {"name": "domain", "source": "configuration/domain", "default": "unknown"},
+    {"name": "site", "source": "configuration/site", "default": "unknown"},
+    {"name": "status", "default": "unknown"},
+    {"name": "status_msg", "default": None},
+]
+_DIRECTORYSERVICES_ENSURE_VALS: list[ApiValueSpec] = [
+    {"name": "healthy", "type": "bool", "default": False},
+]
