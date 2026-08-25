@@ -42,12 +42,21 @@ def _median(values: list[float]) -> float:
 
 
 def _as_int(value: Any) -> int:
-    """Return value as an int, or 0 if it is not an integer."""
-    return value if isinstance(value, int) else 0
+    """Return value as an int, or 0 if it is not an integer.
+
+    ``bool`` is a subclass of ``int`` in Python but is explicitly rejected here:
+    a JSON ``true``/``false`` is not a valid error-count value.
+    """
+    return value if isinstance(value, int) and not isinstance(value, bool) else 0
 
 
 def _to_int(value: Any, default: int = 0) -> int:
-    """Parse value into an int (also from strings like "48"), else default."""
+    """Parse value into an int (also from strings like "48"), else default.
+
+    Booleans are rejected (see ``_as_int``) rather than parsed to 0/1.
+    """
+    if isinstance(value, bool):
+        return default
     try:
         return int(value)
     except (TypeError, ValueError):
@@ -111,7 +120,11 @@ def _netdata_mean_value(graph_data: Any) -> float | None:
     if not isinstance(mean, dict):
         return None
 
-    values = [v for v in mean.values() if isinstance(v, (int, float))]
+    values = [
+        v
+        for v in mean.values()
+        if isinstance(v, (int, float)) and not isinstance(v, bool)
+    ]
     return round(sum(values) / len(values), 2) if values else None
 
 

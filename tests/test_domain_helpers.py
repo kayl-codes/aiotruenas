@@ -76,6 +76,12 @@ def test_as_int_returns_zero_for_non_int() -> None:
     assert _as_int(1.5) == 0
 
 
+def test_as_int_rejects_bool() -> None:
+    """bool is a subclass of int in Python; True/False are not valid counts."""
+    assert _as_int(True) == 0
+    assert _as_int(False) == 0
+
+
 def test_to_int_parses_numeric_string() -> None:
     assert _to_int("48") == 48
 
@@ -83,6 +89,11 @@ def test_to_int_parses_numeric_string() -> None:
 def test_to_int_falls_back_to_default_on_invalid() -> None:
     assert _to_int("not-a-number", default=7) == 7
     assert _to_int(None, default=7) == 7
+
+
+def test_to_int_rejects_bool() -> None:
+    assert _to_int(True, default=7) == 7
+    assert _to_int(False, default=7) == 7
 
 
 # ---------------------------
@@ -153,6 +164,15 @@ def test_netdata_mean_value_returns_none_for_non_dict_aggregations() -> None:
     """A non-dict `aggregations` value (e.g. None) must not raise AttributeError."""
     assert _netdata_mean_value([{"aggregations": None}]) is None
     assert _netdata_mean_value([{}]) is None
+
+
+def test_netdata_mean_value_excludes_bool_values() -> None:
+    """bool is a subclass of int; True/False must not be averaged in as 1/0."""
+    graph_data = [{"aggregations": {"mean": {"a": True, "b": 4.0}}}]
+    assert _netdata_mean_value(graph_data) == pytest.approx(4.0)
+
+    graph_data_only_bool = [{"aggregations": {"mean": {"a": True, "b": False}}}]
+    assert _netdata_mean_value(graph_data_only_bool) is None
 
 
 def test_arc_value_delegates_to_netdata_mean_value() -> None:
