@@ -123,11 +123,20 @@ Commit/Push/PR ohne explizite Freigabe.
 
 - ✅ Schritt 1 — Engine-Port: PR #15, gemerged, v1.3.0.
 - ✅ Schritt 2 — Shared Helpers: PR #16, gemerged, v1.3.1.
-- 🔧 Schritt 3 — Pilot-Endpoints (`get_pool()`/`get_dataset()`/`get_cloudsync()` auf
-  `TrueNASState`) in Arbeit, v1.3.2. Dabei nachgezogen: `prune`/`_prune_stale_uids` in
+- ✅ Schritt 3 — Pilot-Endpoints (`get_pool()`/`get_dataset()`/`get_cloudsync()` auf
+  `TrueNASState`): PR #17, gemerged, v1.3.2. Dabei nachgezogen: `prune`/`_prune_stale_uids` in
   `_normalize.py` — im Prod-`apiparser.py` seit Commit `e06b7ff` (2026-08-25, Copilot-Review auf
   PR #179103) vorhanden, fehlte im Schritt-1-Port; jetzt 1:1 nachportiert (siehe Kritische
-  Dateien). Bronze-Fork-Validierung gegen echte TrueNAS-Instanz noch offen.
+  Dateien). PR #17 wurde über mehrere Sourcery-Runden zusätzlich gegen nebenläufige
+  `get_*()`-Aufrufe (internes `asyncio.Lock`) und malformte API-Antworten gehärtet
+  (Snapshot-Publizierung erst nach vollständigem Refresh, `Hashable`-Checks für
+  guid/path/name, `_to_int()` statt roher Arithmetik). Bronze-Fork-Validierung gegen echte
+  TrueNAS-Instanz noch offen.
+- 🔧 Schritt 4a — Jobs (replication/rsync/snapshottask/cronjob) implementiert
+  (`get_replication()`/`get_rsync()`/`get_snapshottask()`/`get_cronjob()` auf `TrueNASState`,
+  v1.3.3), noch nicht committed/gepusht. Die `cronjob_skip_disabled`-Filterung bleibt bewusst in
+  `coordinator.py` (config-entry-abhängig, keine reine Normalisierung); die
+  `display_name`-Herleitung selbst ist reine Derived-State-Logik und wandert mit.
 
 ## Zu klärende/entscheidende Punkte (Antworten auf die 3 Nutzerfragen)
 

@@ -47,10 +47,32 @@ Connection and protocol failures are raised as typed exceptions (see `aiotruenas
 rather than returned as an error code/string, so callers can `except TrueNASAuthenticationError`,
 `except TrueNASConnectionError`, etc.
 
+### Normalized domain state
+
+`TrueNASState` wraps a `TrueNASClient` and exposes one `async def get_<endpoint>()` method per
+supported TrueNAS RPC endpoint. Each method queries the endpoint, normalizes the raw payload into
+a stable dict-keyed-by-id shape, and caches the result on `state.ds[<endpoint>]`:
+
+```python
+from aiotruenas import TrueNASClient, TrueNASState
+
+async with TrueNASClient("truenas.local", "1-abcdef...") as client:
+    state = TrueNASState(client)
+    pools = await state.get_pool()
+    print(pools)
+    print(state.ds["pool"])  # same data, cached
+```
+
+Supported endpoints so far: `get_pool()`, `get_dataset()`, `get_cloudsync()`, `get_replication()`,
+`get_rsync()`, `get_snapshottask()`, `get_cronjob()`. More endpoints are being migrated
+incrementally from consumer integrations' own normalization code — see
+[MIGRATION_PLAN.md](MIGRATION_PLAN.md) for the full list and status.
+
 ## Status
 
-Early development (v1: generic call surface only, no typed per-domain convenience methods yet).
-See [PROMPT.md](PROMPT.md) for the full design brief and [CLAUDE.md](CLAUDE.md) for repo guidance.
+Early development. Generic `call()` RPC surface plus a growing set of normalized `TrueNASState`
+endpoints (no typed per-domain convenience methods elsewhere yet). See [PROMPT.md](PROMPT.md) for
+the full design brief and [CLAUDE.md](CLAUDE.md) for repo guidance.
 
 ## License
 

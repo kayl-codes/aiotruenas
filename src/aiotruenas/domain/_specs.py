@@ -174,3 +174,72 @@ _CLOUDSYNC_VALS: list[ApiValueSpec] = [
     {"name": "snapshot", "type": "bool", "default": False},
     *_JOB_STATUS_VALS,
 ]
+
+# replication.query. Unlike cloudsync/rsync, replication has its own
+# persistent "state" object (state/state, what the WebUI shows) rather than
+# relying solely on the last job; job_state is kept only as a fallback source
+# and dropped again after TrueNASState.get_replication() resolves it.
+_REPLICATION_VALS: list[ApiValueSpec] = [
+    {"name": "id", "default": 0},
+    {"name": "name", "default": "unknown"},
+    {"name": "source_datasets", "default": "unknown"},
+    {"name": "target_dataset", "default": "unknown"},
+    {"name": "recursive", "type": "bool", "default": False},
+    {"name": "enabled", "type": "bool", "default": False},
+    {"name": "direction", "default": "unknown"},
+    {"name": "transport", "default": "unknown"},
+    {"name": "auto", "type": "bool", "default": False},
+    {"name": "retention_policy", "default": "unknown"},
+    {"name": "state", "source": "state/state", "default": "unknown"},
+    {"name": "job_state", "source": "job/state", "default": "unknown"},
+    *_JOB_PROGRESS_VALS,
+]
+
+# rsynctask.query.
+_RSYNC_VALS: list[ApiValueSpec] = [
+    {"name": "id", "default": 0},
+    {"name": "path", "default": "unknown"},
+    {"name": "desc", "default": "unknown"},
+    {"name": "remotehost", "default": "unknown"},
+    {"name": "remotemodule", "default": "unknown"},
+    {"name": "direction", "default": "unknown"},
+    {"name": "mode", "default": "unknown"},
+    {"name": "enabled", "type": "bool", "default": False},
+    *_JOB_STATUS_VALS,
+]
+
+# pool.snapshottask.query.
+_SNAPSHOTTASK_VALS: list[ApiValueSpec] = [
+    {"name": "id", "default": 0},
+    {"name": "dataset", "default": "unknown"},
+    {"name": "recursive", "type": "bool", "default": False},
+    {"name": "lifetime_value", "default": 0},
+    {"name": "lifetime_unit", "default": "unknown"},
+    {"name": "enabled", "type": "bool", "default": False},
+    {"name": "naming_schema", "default": "unknown"},
+    {"name": "allow_empty", "type": "bool", "default": False},
+    {"name": "vmware_sync", "type": "bool", "default": False},
+    {"name": "schedule", "default": {}},
+    {"name": "state", "source": "state/state", "default": "unknown"},
+    {
+        "name": "datetime",
+        "source": "state/datetime/$date",
+        "default": 0,
+        "convert": "utc_from_timestamp",
+    },
+]
+
+# cronjob.query.
+_CRONJOB_VALS: list[ApiValueSpec] = [
+    {"name": "id", "default": 0},
+    {"name": "enabled", "type": "bool", "default": False},
+    {"name": "command", "default": ""},
+    {"name": "description", "default": ""},
+    {"name": "user", "default": "unknown"},
+    {"name": "schedule", "default": {}},
+    {"name": "stdout", "type": "bool", "default": False},
+    {"name": "stderr", "type": "bool", "default": False},
+]
+_CRONJOB_ENSURE_VALS: list[ApiValueSpec] = [
+    {"name": "display_name", "default": ""},
+]
