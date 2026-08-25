@@ -107,6 +107,25 @@ async def test_get_dataset_normalizes_pool_dataset_query() -> None:
     assert state.ds["dataset"] == result
 
 
+async def test_get_dataset_keeps_previous_snapshot_on_malformed_response() -> None:
+    """A null/malformed pool.dataset.query response must preserve the
+    previous dataset snapshot instead of collapsing it to empty."""
+    async with FakeTrueNASServer(
+        valid_api_key=API_KEY,
+        responses={"pool.dataset.query": [_ROOT_DATASET]},
+    ) as server:
+        async with make_client(server) as client:
+            await client.connect()
+            state = TrueNASState(client)
+            first = await state.get_dataset()
+
+            server.responses["pool.dataset.query"] = None
+            second = await state.get_dataset()
+
+    assert second == first
+    assert second != {}
+
+
 async def test_get_pool_derives_capacity_from_root_dataset() -> None:
     async with FakeTrueNASServer(
         valid_api_key=API_KEY,

@@ -57,11 +57,18 @@ class TrueNASState:
     async def _compute_dataset(self) -> _EndpointMap:
         """Return a freshly computed dataset map, without publishing it.
 
+        Starts from a copy of the current dataset cache (rather than an empty
+        dict) so a ``None``/malformed ``pool.dataset.query`` response makes
+        ``parse_api()`` preserve the previous snapshot instead of collapsing
+        it to empty; a genuine, non-empty response still ends up containing
+        only its own entries, since ``parse_api()`` prunes anything absent
+        from it.
+
         Caller must hold ``self._lock`` and is responsible for publishing the
         result to ``self._ds["dataset"]``.
         """
         return parse_api(
-            data={},
+            data=copy.deepcopy(self._ds["dataset"]),
             source=await self._client.call("pool.dataset.query"),
             key="id",
             vals=_DATASET_VALS,
