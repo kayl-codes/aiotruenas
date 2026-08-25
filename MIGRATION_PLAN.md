@@ -107,11 +107,20 @@ Datasets). Ein einzelner Umbau wäre schwer reviewbar und schwer rückrollbar.
    weitergemacht wird.
 4. **Schritt 4+ — restliche Endpoints in thematischen Batches**, je eigener PR +
    Minor-Bump: (a) Jobs (replication/rsync/snapshottask/cronjob), (b) Stats
-   (systemstats/arc/ups/disk-temp), (c) Services/VM/Container/App, (d)
-   Alerts/Certificates/Directoryservices. Jeder Batch wird im Bronze-Fork verpflichtend
-   nachgezogen; die Übernahme im Prod-HACS-Repo kann parallel/nachgelagert im eigenen
-   Release-Rhythmus erfolgen, da die Library ab Schritt 1 bereits den vollen (identischen)
-   Endpoint-Bedarf beider Repos abdeckt.
+   (arc/ups; `systemstats`/Disk-Temperatur-Fallback siehe Korrektur unten), (c)
+   Services/VM/Container/App, (d) Alerts/Certificates/Directoryservices. Jeder Batch wird im
+   Bronze-Fork verpflichtend nachgezogen; die Übernahme im Prod-HACS-Repo kann
+   parallel/nachgelagert im eigenen Release-Rhythmus erfolgen, da die Library ab Schritt 1
+   bereits den vollen (identischen) Endpoint-Bedarf beider Repos abdeckt.
+
+   **Korrektur beim Umsetzen von 4b (2026-08-25):** `get_arc()`/`get_ups()` sind reine,
+   eigenständige Normalizer (eigener `ds`-Key, keine Abhängigkeit zu anderen Endpoints) und
+   passen direkt ins etablierte `get_<endpoint>()`-Muster. `get_systemstats()` und die
+   Disk-Temperatur-Ermittlung dagegen sind **keine eigenständigen Endpoints**, sondern
+   Anreicherungen bereits vorhandener `ds`-Einträge anderer, noch nicht migrierter Endpoints
+   (`system_info`/`interface` bzw. `disk`) — sie schreiben in fremde `ds`-Keys statt einen
+   eigenen zurückzugeben. Sie wandern daher zusammen mit `get_systeminfo()`/`get_disk()` in
+   einen späteren Batch, statt hier erzwungen isoliert zu werden.
 
 Jeder Schritt: normaler Feature-Branch-PR-Workflow in aiotruenas (fix→extend→package), synchron
 in `pyproject.toml` + `__init__.py` `__version__`. **Versionierung (Nutzer-Entscheidung
@@ -132,11 +141,17 @@ Commit/Push/PR ohne explizite Freigabe.
   (Snapshot-Publizierung erst nach vollständigem Refresh, `Hashable`-Checks für
   guid/path/name, `_to_int()` statt roher Arithmetik). Bronze-Fork-Validierung gegen echte
   TrueNAS-Instanz noch offen.
-- 🔧 Schritt 4a — Jobs (replication/rsync/snapshottask/cronjob) implementiert
-  (`get_replication()`/`get_rsync()`/`get_snapshottask()`/`get_cronjob()` auf `TrueNASState`,
-  v1.3.3), noch nicht committed/gepusht. Die `cronjob_skip_disabled`-Filterung bleibt bewusst in
-  `coordinator.py` (config-entry-abhängig, keine reine Normalisierung); die
-  `display_name`-Herleitung selbst ist reine Derived-State-Logik und wandert mit.
+- ✅ Schritt 4a — Jobs (replication/rsync/snapshottask/cronjob): PR #18, gemerged, v1.3.3. Die
+  `cronjob_skip_disabled`-Filterung bleibt bewusst in `coordinator.py` (config-entry-abhängig,
+  keine reine Normalisierung); die `display_name`-Herleitung selbst ist reine
+  Derived-State-Logik und wandert mit.
+- 🔧 Schritt 4b — Stats (`get_arc()`/`get_ups()` auf `TrueNASState`, v1.3.4) implementiert, noch
+  nicht committed/gepusht. `get_ups()` cacht die Graph-Discovery (`reporting.netdata_graphs`)
+  bewusst nicht wie das Coordinator-Original, sondern fragt sie bei jedem Aufruf frisch ab, damit
+  ein zur Laufzeit an-/abgestecktes USV ohne Neustart erkannt wird. `systemstats` und die
+  Disk-Temperatur-Ermittlung sind auf spätere Batches verschoben (siehe Korrektur bei Schritt 4
+  oben) — sie sind keine eigenständigen Endpoints, sondern Anreicherungen von
+  `system_info`/`interface`/`disk`, die selbst noch nicht migriert sind.
 
 ## Zu klärende/entscheidende Punkte (Antworten auf die 3 Nutzerfragen)
 

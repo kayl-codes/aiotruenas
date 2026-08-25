@@ -4,7 +4,7 @@ build-backend = "hatchling.build"
 
 [project]
 name = "aiotruenas"
-version = "1.3.3"
+version = "1.3.4"
 description = "Asyncio-native Python client for the TrueNAS JSON-RPC WebSocket API"
 readme = "README.md"
 license = "Apache-2.0"

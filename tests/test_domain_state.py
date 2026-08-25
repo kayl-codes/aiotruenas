@@ -448,6 +448,8 @@ async def test_ds_property_starts_empty_for_all_endpoints() -> None:
         "rsynctask": {},
         "snapshottask": {},
         "cronjob": {},
+        "arc": {},
+        "ups": {},
     }
 
 
@@ -602,3 +604,112 @@ async def test_get_cronjob_display_name_survives_non_string_fields() -> None:
             result = await state.get_cronjob()
 
     assert result[1]["display_name"] == "Cronjob 1"
+
+
+async def test_get_arc_computes_hit_percentages_from_netdata_graphs() -> None:
+    means = {
+        "demanddatahitpercentage": {"hits": 91.234},
+        "demandmetadatahitpercentage": {"hits": 99.5},
+        "l2architpercentage": {"hits": 10.0},
+    }
+
+    def netdata_graph(params: list) -> Any:
+        return [{"aggregations": {"mean": means[params[0]]}}]
+
+    async with FakeTrueNASServer(
+        valid_api_key=API_KEY,
+        responses={"reporting.netdata_graph": netdata_graph},
+    ) as server:
+        async with make_client(server) as client:
+            await client.connect()
+            state = TrueNASState(client)
+            result = await state.get_arc()
+
+    assert result == {
+        "data_hit_percent": 91.23,
+        "metadata_hit_percent": 99.5,
+        "l2_hit_percent": 10.0,
+    }
+    assert state.ds["arc"] == result
+
+
+async def test_get_arc_sets_none_for_missing_graph_data() -> None:
+    async with FakeTrueNASServer(
+        valid_api_key=API_KEY,
+        responses={"reporting.netdata_graph": None},
+    ) as server:
+        async with make_client(server) as client:
+            await client.connect()
+            state = TrueNASState(client)
+            result = await state.get_arc()
+
+    assert result == {
+        "data_hit_percent": None,
+        "metadata_hit_percent": None,
+        "l2_hit_percent": None,
+    }
+
+
+async def test_get_ups_discovers_and_normalizes_available_graphs() -> None:
+    means = {"upscharge": {"ups1": 80.0}, "upsload": {"ups1": 42.0}}
+
+    def netdata_graph(params: list) -> Any:
+        return [{"aggregations": {"mean": means[params[0]]}}]
+
+    async with FakeTrueNASServer(
+        valid_api_key=API_KEY,
+        responses={
+            "reporting.netdata_graphs": [
+                {"name": "upscharge"},
+                {"name": "upsload"},
+                {"name": "cpu"},
+            ],
+            "reporting.netdata_graph": netdata_graph,
+        },
+    ) as server:
+        async with make_client(server) as client:
+            await client.connect()
+            state = TrueNASState(client)
+            result = await state.get_ups()
+
+    assert result == {"battery_charge": 80.0, "load": 42.0}
+    assert state.ds["ups"] == result
+
+
+async def test_get_ups_returns_empty_when_no_ups_graphs_present() -> None:
+    async with FakeTrueNASServer(
+        valid_api_key=API_KEY,
+        responses={
+            "reporting.netdata_graphs": [{"name": "cpu"}, {"name": "load"}],
+        },
+    ) as server:
+        async with make_client(server) as client:
+            await client.connect()
+            state = TrueNASState(client)
+            result = await state.get_ups()
+
+    assert result == {}
+    assert state.ds["ups"] == {}
+
+
+async def test_get_ups_keeps_previous_reading_on_failed_discovery() -> None:
+    async with FakeTrueNASServer(
+        valid_api_key=API_KEY,
+        responses={
+            "reporting.netdata_graphs": [{"name": "upscharge"}],
+            "reporting.netdata_graph": lambda params: [
+                {"aggregations": {"mean": {"ups1": 55.0}}}
+            ],
+        },
+    ) as server:
+        async with make_client(server) as client:
+            await client.connect()
+            state = TrueNASState(client)
+            await state.get_ups()
+            previous_ups = state.ds["ups"]
+
+            server.responses["reporting.netdata_graphs"] = None
+            result = await state.get_ups()
+
+    assert result is previous_ups
+    assert state.ds["ups"] is previous_ups
