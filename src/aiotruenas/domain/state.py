@@ -19,10 +19,15 @@ from typing import Any
 
 from ..client import TrueNASClient
 from ._helpers import _aggregate_topology_errors, _to_int
-from ._normalize import parse_api
+from ._normalize import get_uid, parse_api
 from ._specs import _CLOUDSYNC_VALS, _DATASET_VALS, _POOL_ENSURE_VALS, _POOL_VALS
 
 _EndpointMap = dict[Hashable, dict[str, Any]]
+
+
+def _is_valid_pool_entry(entry: Any) -> bool:
+    """Return True if entry is a dict with a usable (hashable) "guid"."""
+    return get_uid(entry, "guid", None, None, None) is not None
 
 
 class TrueNASState:
@@ -92,11 +97,17 @@ class TrueNASState:
             datasets = await self._compute_dataset()
 
             raw_pools = await self._client.call("pool.query")
-            if not isinstance(raw_pools, list):
-                # A malformed/null pool.query response (e.g. None) cannot be
-                # trusted to reflect the current pool set; leave the previous
+            if not isinstance(raw_pools, list) or (
+                raw_pools and not any(_is_valid_pool_entry(p) for p in raw_pools)
+            ):
+                # A malformed pool.query response -- not a list at all (e.g.
+                # None), or a non-empty list containing no usable pool
+                # entries (e.g. [None] or [{}]) -- cannot be trusted to
+                # reflect the current pool set; leave the previous
                 # dataset/pool snapshot in place rather than pairing it with
-                # a freshly refreshed dataset map from this same call.
+                # a freshly refreshed dataset map from this same call. A
+                # genuinely empty list ([]) is not malformed -- it means
+                # there are no pools left -- so it falls through normally.
                 return self._ds["pool"]
 
             pools = parse_api(
@@ -210,7 +221,9 @@ class TrueNASState:
             if not isinstance(raw_pool, dict):
                 continue
             uid = raw_pool.get("guid")
-            if uid not in pools:
+            # A malformed guid (e.g. a list/dict) is unhashable and would
+            # raise TypeError on the membership check below.
+            if not isinstance(uid, Hashable) or uid not in pools:
                 continue
 
             read, write, checksum = _aggregate_topology_errors(raw_pool.get("topology"))

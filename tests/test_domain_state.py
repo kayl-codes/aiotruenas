@@ -3,7 +3,9 @@
 from __future__ import annotations
 
 from datetime import UTC, datetime
+from typing import Any
 
+import pytest
 from fake_server import FakeTrueNASServer
 
 from aiotruenas import TrueNASClient, TrueNASState
@@ -231,6 +233,58 @@ async def test_get_pool_keeps_previous_snapshot_on_malformed_pool_query() -> Non
     assert result is previous_pool
     assert state.ds["dataset"] is previous_dataset
     assert state.ds["pool"] is previous_pool
+
+
+@pytest.mark.parametrize("malformed_pool_query", [[None], [{}]])
+async def test_get_pool_keeps_previous_snapshot_on_unusable_pool_entries(
+    malformed_pool_query: list[Any],
+) -> None:
+    """A non-empty pool.query response containing no usable (guid-bearing)
+    entries is just as untrustworthy as a null response: neither the dataset
+    nor the pool cache may be updated from it. An empty list ([]) is exempt
+    -- that legitimately means "no pools left", not "malformed"."""
+    async with FakeTrueNASServer(
+        valid_api_key=API_KEY,
+        responses={
+            "pool.dataset.query": [_ROOT_DATASET],
+            "pool.query": [_POOL_TANK],
+            "boot.get_state": _BOOT_POOL,
+        },
+    ) as server:
+        async with make_client(server) as client:
+            await client.connect()
+            state = TrueNASState(client)
+            await state.get_pool()
+            previous_dataset = state.ds["dataset"]
+            previous_pool = state.ds["pool"]
+
+            server.responses["pool.query"] = malformed_pool_query
+            result = await state.get_pool()
+
+    assert result is previous_pool
+    assert state.ds["dataset"] is previous_dataset
+    assert state.ds["pool"] is previous_pool
+
+
+async def test_get_pool_ignores_error_aggregation_for_unhashable_guid() -> None:
+    """A malformed pool entry with an unhashable guid (e.g. a list) must be
+    skipped during error aggregation instead of crashing the whole refresh
+    with a TypeError from the `uid not in pools` membership check."""
+    bad_pool = {**_POOL_TANK, "guid": ["not", "hashable"]}
+    async with FakeTrueNASServer(
+        valid_api_key=API_KEY,
+        responses={
+            "pool.dataset.query": [_ROOT_DATASET],
+            "pool.query": [_POOL_TANK, bad_pool],
+            "boot.get_state": _BOOT_POOL,
+        },
+    ) as server:
+        async with make_client(server) as client:
+            await client.connect()
+            state = TrueNASState(client)
+            result = await state.get_pool()
+
+    assert result["111"]["errors"] == 1
 
 
 async def test_get_pool_without_matching_dataset_falls_back_to_own_free_size() -> None:
