@@ -22,10 +22,24 @@ from typing import Any, TypedDict, cast
 
 from ..client import TrueNASClient
 from ..exceptions import TrueNASError
-from ._helpers import _aggregate_topology_errors, _arc_value, _to_int, _ups_value
+from ._helpers import (
+    _aggregate_topology_errors,
+    _arc_value,
+    _cpuset_size,
+    _first_ipv4,
+    _parse_version_tuple,
+    _to_int,
+    _ups_value,
+)
 from ._normalize import get_uid, parse_api
 from ._specs import (
+    _APP_ENSURE_VALS,
+    _APP_VALS,
     _CLOUDSYNC_VALS,
+    _CONTAINER_ENSURE_VALS,
+    _CONTAINER_V26_ENSURE_VALS,
+    _CONTAINER_V26_VALS,
+    _CONTAINER_VALS,
     _CRONJOB_ENSURE_VALS,
     _CRONJOB_VALS,
     _DATASET_VALS,
@@ -33,7 +47,11 @@ from ._specs import (
     _POOL_VALS,
     _REPLICATION_VALS,
     _RSYNC_VALS,
+    _SERVICE_ENSURE_VALS,
+    _SERVICE_VALS,
     _SNAPSHOTTASK_VALS,
+    _VM_ENSURE_VALS,
+    _VM_VALS,
 )
 
 _EndpointMap = dict[Hashable, dict[str, Any]]
@@ -60,6 +78,10 @@ class _StateMap(TypedDict):
     rsynctask: _EndpointMap
     snapshottask: _EndpointMap
     cronjob: _EndpointMap
+    service: _EndpointMap
+    vm: _EndpointMap
+    container: _EndpointMap
+    app: _EndpointMap
     arc: _ArcMap
     ups: _UpsMap
 
@@ -80,6 +102,27 @@ _UPS_GRAPHS: dict[str, str] = {
     "upscurrent": "current",
     "upsfrequency": "frequency",
     "upstemperature": "temperature",
+}
+
+# Maps a service.query "service" id to its human-friendly display name, used
+# as a fallback when the API's own "name" field is missing/"unknown".
+_SERVICE_DISPLAY_NAMES: dict[str, str] = {
+    "afp": "AFP",
+    "cifs": "SMB",
+    "dynamicdns": "Dynamic DNS",
+    "ftp": "FTP",
+    "iscsitarget": "iSCSI",
+    "lldp": "LLDP",
+    "nfs": "NFS",
+    "openvpn_client": "OpenVPN Client",
+    "openvpn_server": "OpenVPN Server",
+    "rsync": "Rsync",
+    "s3": "S3",
+    "snmp": "SNMP",
+    "ssh": "SSH",
+    "tftp": "TFTP",
+    "ups": "UPS",
+    "webdav": "WebDAV",
 }
 
 
@@ -108,9 +151,18 @@ class TrueNASState:
             "rsynctask": {},
             "snapshottask": {},
             "cronjob": {},
+            "service": {},
+            "vm": {},
+            "container": {},
+            "app": {},
             "arc": {},
             "ups": {},
         }
+        # Cached (major, minor) TrueNAS version, used by get_container() to
+        # pick the right query API; detected lazily on first use (see
+        # _detect_version()) since it cannot change without an appliance
+        # reboot, which drops the underlying connection.
+        self._version: tuple[int, int] | None = None
 
     @property
     def ds(self) -> _PublicStateMap:
@@ -470,3 +522,176 @@ class TrueNASState:
                     ups[_UPS_GRAPHS[graph_name]] = value
             self._ds["ups"] = ups
             return ups
+
+    async def get_service(self) -> _EndpointMap:
+        """Refresh and return normalized services (``service.query``).
+
+        Derives ``running`` from the service state and a ``display_name``
+        that falls back to a known human-friendly label (``_SERVICE_DISPLAY_
+        NAMES``) when the API's own "name" field is missing/"unknown".
+        """
+        async with self._lock:
+            self._ds["service"] = parse_api(
+                data=self._ds["service"],
+                source=await self._client.call("service.query"),
+                key="id",
+                vals=_SERVICE_VALS,
+                ensure_vals=_SERVICE_ENSURE_VALS,
+            )
+            for vals in self._ds["service"].values():
+                vals["running"] = vals["state"] == "RUNNING"
+                name = vals.get("name")
+                if not name or name == "unknown":
+                    name = _SERVICE_DISPLAY_NAMES.get(
+                        vals.get("service"), vals.get("service", "unknown")
+                    )
+                vals["display_name"] = name
+            return self._ds["service"]
+
+    async def get_vm(self) -> _EndpointMap:
+        """Refresh and return normalized VMs (``vm.query``)."""
+        async with self._lock:
+            self._ds["vm"] = parse_api(
+                data=self._ds["vm"],
+                source=await self._client.call("vm.query"),
+                key="id",
+                vals=_VM_VALS,
+                ensure_vals=_VM_ENSURE_VALS,
+            )
+            for vals in self._ds["vm"].values():
+                # Only substitute 0 for a null memory value (e.g. some
+                # instance types report None), which would raise a TypeError
+                # on division; other invalid types should still surface.
+                memory = vals.get("memory")
+                if memory is None:
+                    memory = 0
+                vals["memory"] = round(memory / 1024)
+                vals["running"] = vals["status"] == "RUNNING"
+            return self._ds["vm"]
+
+    async def _detect_version(self) -> tuple[int, int]:
+        """Return the cached (major, minor) TrueNAS version, detecting it on
+        first use via ``system.info``.
+
+        The version cannot change without a full appliance reboot, which
+        drops the underlying WebSocket connection, so a single successful
+        detection is reused for the lifetime of this ``TrueNASState``. A
+        failed/unparsable detection is not cached and is retried on the next
+        call.
+        """
+        if self._version is not None:
+            return self._version
+        raw = await self._client.call("system.info")
+        version_str = raw.get("version") if isinstance(raw, dict) else None
+        version = _parse_version_tuple(version_str)
+        if version != (0, 0):
+            self._version = version
+        return version
+
+    async def get_container(self) -> _EndpointMap:
+        """Refresh and return normalized containers.
+
+        Dispatches to ``container.query`` (LXC, TrueNAS 26.0+) or
+        ``virt.instance.query`` (legacy Incus) depending on the connected
+        TrueNAS version (see ``_detect_version()``). On the legacy API, only
+        CONTAINER-type instances are surfaced -- VM-type Incus instances are
+        covered by ``get_vm()``.
+        """
+        async with self._lock:
+            if await self._detect_version() >= (26, 0):
+                self._ds["container"] = await self._compute_container_v26()
+            else:
+                self._ds["container"] = await self._compute_container_legacy()
+            return self._ds["container"]
+
+    async def _compute_container_legacy(self) -> _EndpointMap:
+        """Return containers via ``virt.instance.query`` (pre-TrueNAS-26.0).
+
+        Caller must hold ``self._lock``.
+        """
+        raw_instances = await self._client.call("virt.instance.query")
+        instances = raw_instances if isinstance(raw_instances, list) else []
+        containers = [
+            instance
+            for instance in instances
+            if isinstance(instance, dict) and instance.get("type") == "CONTAINER"
+        ]
+
+        result = parse_api(
+            data=self._ds["container"],
+            source=containers,
+            key="id",
+            vals=_CONTAINER_VALS,
+            ensure_vals=_CONTAINER_ENSURE_VALS,
+        )
+        for vals in result.values():
+            # cpu is reported as a string (e.g. "1") and may be null;
+            # normalize to an int so the attribute is numeric like memory.
+            vals["cpu"] = _to_int(vals.get("cpu"))
+            # Container memory is reported in bytes and may be null; show MiB.
+            memory = vals.get("memory")
+            if not isinstance(memory, (int, float)):
+                memory = 0
+            vals["memory"] = round(memory / 1048576)
+            vals["running"] = vals.get("status") == "RUNNING"
+            vals["ip_address"] = _first_ipv4(vals.get("aliases"))
+        return result
+
+    async def _compute_container_v26(self) -> _EndpointMap:
+        """Return LXC containers via ``container.query`` (TrueNAS 26.0+).
+
+        The entry carries no memory, image or IP information and its status
+        is nested (``status/state``); the resulting record keeps the same
+        keys as the legacy Incus path so callers see an unchanged shape.
+
+        Caller must hold ``self._lock``.
+        """
+        raw_containers = await self._client.call("container.query")
+        containers = raw_containers if isinstance(raw_containers, list) else []
+
+        result = parse_api(
+            data=self._ds["container"],
+            source=containers,
+            key="id",
+            vals=_CONTAINER_V26_VALS,
+            ensure_vals=_CONTAINER_V26_ENSURE_VALS,
+        )
+        for vals in result.values():
+            vals["type"] = "CONTAINER"
+            vals["cpu"] = _cpuset_size(vals.pop("cpuset", None))
+            vals["memory"] = 0
+            vals["aliases"] = []
+            vals["ip_address"] = "unknown"
+            if not vals.get("image"):
+                vals["image"] = "unknown"
+            vals["running"] = vals.get("status") == "RUNNING"
+        return result
+
+    async def get_app(self) -> _EndpointMap:
+        """Refresh and return normalized apps (``app.query``).
+
+        Derives ``running`` from the app state and ``update_available`` from
+        either a catalog chart upgrade (``upgrade_available``) or, for custom/
+        compose apps only, an available container image update -- a
+        chart-up-to-date catalog app with a newer image digest should not
+        show a phantom update.
+
+        Update-job tracking (``update_jobid``/``update_progress``/...) is
+        left to the caller: polling an app's upgrade job is tied to a
+        consumer's own HA update-entity handling, not TrueNAS normalization.
+        """
+        async with self._lock:
+            self._ds["app"] = parse_api(
+                data=self._ds["app"],
+                source=await self._client.call("app.query"),
+                key="id",
+                vals=_APP_VALS,
+                ensure_vals=_APP_ENSURE_VALS,
+            )
+            for vals in self._ds["app"].values():
+                vals["running"] = vals["state"] == "RUNNING"
+                vals["update_available"] = bool(vals.get("update_available")) or (
+                    bool(vals.get("custom_app"))
+                    and bool(vals.get("image_updates_available"))
+                )
+            return self._ds["app"]

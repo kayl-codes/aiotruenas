@@ -145,13 +145,25 @@ Commit/Push/PR ohne explizite Freigabe.
   `cronjob_skip_disabled`-Filterung bleibt bewusst in `coordinator.py` (config-entry-abhängig,
   keine reine Normalisierung); die `display_name`-Herleitung selbst ist reine
   Derived-State-Logik und wandert mit.
-- 🔧 Schritt 4b — Stats (`get_arc()`/`get_ups()` auf `TrueNASState`, v1.3.4) implementiert, noch
-  nicht committed/gepusht. `get_ups()` cacht die Graph-Discovery (`reporting.netdata_graphs`)
-  bewusst nicht wie das Coordinator-Original, sondern fragt sie bei jedem Aufruf frisch ab, damit
-  ein zur Laufzeit an-/abgestecktes USV ohne Neustart erkannt wird. `systemstats` und die
-  Disk-Temperatur-Ermittlung sind auf spätere Batches verschoben (siehe Korrektur bei Schritt 4
-  oben) — sie sind keine eigenständigen Endpoints, sondern Anreicherungen von
-  `system_info`/`interface`/`disk`, die selbst noch nicht migriert sind.
+- ✅ Schritt 4b — Stats (`get_arc()`/`get_ups()`): PR #19, gemerged, v1.3.4. `get_ups()` cacht die
+  Graph-Discovery (`reporting.netdata_graphs`) bewusst nicht wie das Coordinator-Original, sondern
+  fragt sie bei jedem Aufruf frisch ab, damit ein zur Laufzeit an-/abgestecktes USV ohne Neustart
+  erkannt wird. `systemstats` und die Disk-Temperatur-Ermittlung sind auf spätere Batches
+  verschoben (siehe Korrektur bei Schritt 4 oben) — sie sind keine eigenständigen Endpoints,
+  sondern Anreicherungen von `system_info`/`interface`/`disk`, die selbst noch nicht migriert sind.
+- 🔧 Schritt 4c — Services/VM/Container/App (`get_service()`/`get_vm()`/`get_container()`/
+  `get_app()` auf `TrueNASState`, v1.3.5) implementiert, noch nicht committed/gepusht. Wie bei 4a
+  bleibt die HA-spezifische `_is_group_monitored(...)`-Gatingprüfung (VMs/Container) in
+  `coordinator.py`; `TrueNASState` fragt/normalisiert unbedingt. `get_app()` liefert nur
+  Query+Normalisierung (`running`/`update_available`); die Update-Job-Poll-Logik
+  (`update_jobid`/`update_progress`/...) bleibt in `coordinator.py`, da sie an HA-Update-Entities
+  hängt (siehe "Was in coordinator.py bleibt" oben). `get_app_stats()` wandert nicht — es ist
+  vollständig auf der Websocket-Push-Subscription-Schicht aufgebaut, die laut Zielarchitektur in
+  coordinator.py verbleibt. Neu: `get_container()` muss selbst zwischen `container.query`
+  (TrueNAS 26.0+, LXC) und `virt.instance.query` (Legacy Incus) unterscheiden; dafür ermittelt
+  `TrueNASState._detect_version()` die TrueNAS-Version per eigenem `system.info`-Aufruf (nicht
+  über `ds["system_info"]`, das noch nicht migriert ist) und cacht sie für die Lebensdauer der
+  Instanz, da sie sich ohne einen Neustart des Geräts (und damit Verbindungsabbruch) nicht ändert.
 
 ## Zu klärende/entscheidende Punkte (Antworten auf die 3 Nutzerfragen)
 
