@@ -85,6 +85,13 @@ class TrueNASState:
             datasets = await self._compute_dataset()
 
             raw_pools = await self._client.call("pool.query")
+            if not isinstance(raw_pools, list):
+                # A malformed/null pool.query response (e.g. None) cannot be
+                # trusted to reflect the current pool set; leave the previous
+                # dataset/pool snapshot in place rather than pairing it with
+                # a freshly refreshed dataset map from this same call.
+                return self._ds["pool"]
+
             pools = parse_api(
                 data=copy.deepcopy(self._ds["pool"]),
                 source=raw_pools,

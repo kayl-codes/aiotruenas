@@ -187,6 +187,33 @@ async def test_get_pool_prunes_pools_absent_from_a_later_query() -> None:
     assert set(result) == {"boot-pool"}
 
 
+async def test_get_pool_keeps_previous_snapshot_on_malformed_pool_query() -> None:
+    """A null/malformed pool.query response must not be paired with a freshly
+    refreshed dataset map -- both the dataset and pool caches stay on their
+    previous, mutually-consistent snapshot instead."""
+    async with FakeTrueNASServer(
+        valid_api_key=API_KEY,
+        responses={
+            "pool.dataset.query": [_ROOT_DATASET],
+            "pool.query": [_POOL_TANK],
+            "boot.get_state": _BOOT_POOL,
+        },
+    ) as server:
+        async with make_client(server) as client:
+            await client.connect()
+            state = TrueNASState(client)
+            await state.get_pool()
+            previous_dataset = state.ds["dataset"]
+            previous_pool = state.ds["pool"]
+
+            server.responses["pool.query"] = None
+            result = await state.get_pool()
+
+    assert result is previous_pool
+    assert state.ds["dataset"] is previous_dataset
+    assert state.ds["pool"] is previous_pool
+
+
 async def test_get_pool_without_matching_dataset_falls_back_to_own_free_size() -> None:
     pool_no_match = {**_POOL_TANK, "path": "/mnt/other", "name": "other"}
     async with FakeTrueNASServer(
