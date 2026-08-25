@@ -96,6 +96,12 @@ def test_to_int_rejects_bool() -> None:
     assert _to_int(False, default=7) == 7
 
 
+def test_to_int_falls_back_to_default_on_overflow() -> None:
+    """int(float("inf")) raises OverflowError, not ValueError/TypeError."""
+    assert _to_int(float("inf"), default=7) == 7
+    assert _to_int(float("-inf"), default=7) == 7
+
+
 # ---------------------------
 #   _accumulate_vdev_errors / _aggregate_topology_errors
 # ---------------------------
