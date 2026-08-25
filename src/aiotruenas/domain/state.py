@@ -7,7 +7,9 @@ Each method queries the endpoint, normalizes the response via
 ``domain._normalize.parse_api`` and the field specs in ``domain._specs``, and
 caches the result in ``self.ds[<endpoint>]`` -- the same dict-keyed-by-id
 shape historically produced by consumer integrations' own
-``apiparser.py``/``coordinator.py``.
+``apiparser.py``/``coordinator.py``. Exceptions are the netdata-graph-backed
+endpoints (``arc``, ``ups``), which have no natural object id and instead
+cache a flat dict of scalar readings.
 """
 
 from __future__ import annotations
@@ -19,6 +21,7 @@ from datetime import UTC, datetime
 from typing import Any
 
 from ..client import TrueNASClient
+from ..exceptions import TrueNASError
 from ._helpers import _aggregate_topology_errors, _arc_value, _to_int, _ups_value
 from ._normalize import get_uid, parse_api
 from ._specs import (
@@ -85,7 +88,11 @@ class TrueNASState:
 
     @property
     def ds(self) -> dict[str, _EndpointMap]:
-        """Normalized state, keyed by endpoint name then by object id/guid."""
+        """Normalized state, keyed by endpoint name then by object id/guid.
+
+        The ``arc`` and ``ups`` endpoints have no natural object id and are
+        keyed by endpoint name only, holding a flat dict of scalar readings.
+        """
         return self._ds
 
     async def get_dataset(self) -> _EndpointMap:
@@ -400,7 +407,10 @@ class TrueNASState:
         (retried on the next call).
         """
         async with self._lock:
-            graphs = await self._client.call("reporting.netdata_graphs")
+            try:
+                graphs = await self._client.call("reporting.netdata_graphs")
+            except TrueNASError:
+                return self._ds["ups"]
             if not isinstance(graphs, list):
                 return self._ds["ups"]
 

@@ -713,3 +713,32 @@ async def test_get_ups_keeps_previous_reading_on_failed_discovery() -> None:
 
     assert result is previous_ups
     assert state.ds["ups"] is previous_ups
+
+
+async def test_get_ups_keeps_previous_reading_when_discovery_raises() -> None:
+    async with FakeTrueNASServer(
+        valid_api_key=API_KEY,
+        responses={
+            "reporting.netdata_graphs": [{"name": "upscharge"}],
+            "reporting.netdata_graph": lambda params: [
+                {"aggregations": {"mean": {"ups1": 55.0}}}
+            ],
+        },
+    ) as server:
+        async with make_client(server) as client:
+            await client.connect()
+            state = TrueNASState(client)
+            await state.get_ups()
+            previous_ups = state.ds["ups"]
+
+            server.responses["reporting.netdata_graphs"] = {
+                "error": {
+                    "code": -32603,
+                    "message": "Internal error",
+                    "data": {"error": 1, "errname": "EFAULT", "reason": None},
+                }
+            }
+            result = await state.get_ups()
+
+    assert result is previous_ups
+    assert state.ds["ups"] is previous_ups
