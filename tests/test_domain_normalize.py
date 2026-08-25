@@ -519,6 +519,30 @@ def test_parse_api_key_search_with_unhashable_entry_does_not_crash(
     assert result == {"uid-1": {"guid": "guid-1", "name": "new"}}
 
 
+def test_parse_api_keyless_nondict_entry_does_not_overwrite_with_defaults(
+    ap: ModuleType,
+) -> None:
+    """A non-dict entry (e.g. None) in a keyless, non-empty source must be
+    skipped instead of resetting the previously-parsed fields to their spec
+    defaults -- a keyless parse has no uid to gate matching on, so this
+    would otherwise silently wipe out real data with defaults."""
+    data = {"label": "real-value"}
+    result = ap.parse_api(
+        data=data, source=[None], vals=[{"name": "label", "default": "n/a"}]
+    )
+    assert result == {"label": "real-value"}
+
+
+def test_parse_api_keyless_empty_dict_entry_fills_defaults(ap: ModuleType) -> None:
+    """A genuinely empty dict entry ([{}]) is a normal, supported input
+    (equivalent to a bare dict source) and legitimately fills defaults for
+    its missing fields -- unlike a non-dict entry, it is not malformed."""
+    result = ap.parse_api(
+        data={"label": "stale"}, source=[{}], vals=[{"name": "label", "default": "n/a"}]
+    )
+    assert result == {"label": "n/a"}
+
+
 def test_parse_api_convert_timestamp(ap: ModuleType) -> None:
     result = ap.parse_api(
         source=[{"id": "1", "started": 1700000000}],

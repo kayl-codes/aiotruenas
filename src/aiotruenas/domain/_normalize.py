@@ -318,7 +318,13 @@ def _resolve_entry_uid(
     key requirement that could not be satisfied and should be skipped.
     """
     if not (key or key_search):
-        return None, True
+        # Keyless data has no uid to resolve, but a non-dict entry (e.g. None
+        # from a malformed non-empty source) must still be rejected here --
+        # otherwise _apply_entry() would reset every field to its spec
+        # default. A dict entry, even an empty one, is a normal, supported
+        # input (equivalent to passing it directly as a dict `source`) and
+        # is left to fill_defaults()'s own non-destructive default-filling.
+        return None, isinstance(entry, dict)
 
     uid = get_uid(entry, key, key_secondary, key_search, keymap)
     if uid is None:
