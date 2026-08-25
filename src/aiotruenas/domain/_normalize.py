@@ -219,6 +219,16 @@ def parse_api(
     keymap = generate_keymap(data, key_search)
     seen_uids: set[str] = set()
     for entry in source:
+        # Mark the uid as seen (present in the current source) before applying
+        # only/skip, so an entry that is still there but filtered out this
+        # round is not mistaken for one that was removed from the backend and
+        # pruned. get_uid() is a pure lookup (unlike _resolve_entry_uid, which
+        # side-effects `data` by pre-creating data[uid]) so this is safe to
+        # call even for entries that end up filtered out below.
+        seen_uid = get_uid(entry, key, key_secondary, key_search, keymap)
+        if seen_uid is not None:
+            seen_uids.add(seen_uid)
+
         if _should_skip_entry(entry, only, skip):
             continue
 
@@ -227,8 +237,6 @@ def parse_api(
         )
         if not matched:
             continue
-        if uid is not None:
-            seen_uids.add(uid)
 
         data = _apply_entry(data, entry, uid, vals, ensure_vals, val_proc)
 

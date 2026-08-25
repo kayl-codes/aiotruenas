@@ -417,6 +417,41 @@ def test_parse_api_only_and_skip_combined_skip_wins_on_overlap(ap: ModuleType) -
     assert result == {"2": {"type": "DISK"}}
 
 
+def test_parse_api_only_filter_does_not_prune_still_present_entries(
+    ap: ModuleType,
+) -> None:
+    """A uid excluded by `only` but still present in the raw source must
+    survive pruning: filtering is not the same as the entity being removed
+    from the backend."""
+    data = {"1": {"type": "DISK"}, "2": {"type": "SSD"}}
+    source = [{"id": "1", "type": "DISK"}, {"id": "2", "type": "SSD"}]
+    result = ap.parse_api(
+        data=data,
+        source=source,
+        key="id",
+        vals=[{"name": "type"}],
+        only=[{"key": "type", "value": "DISK"}],
+    )
+    assert result == {"1": {"type": "DISK"}, "2": {"type": "SSD"}}
+
+
+def test_parse_api_only_filter_still_prunes_truly_removed_entries(
+    ap: ModuleType,
+) -> None:
+    """A uid absent from a later, non-empty source is pruned even while an
+    `only` filter is also in play."""
+    data = {"1": {"type": "DISK"}, "2": {"type": "SSD"}}
+    source = [{"id": "1", "type": "DISK"}]
+    result = ap.parse_api(
+        data=data,
+        source=source,
+        key="id",
+        vals=[{"name": "type"}],
+        only=[{"key": "type", "value": "DISK"}],
+    )
+    assert result == {"1": {"type": "DISK"}}
+
+
 def test_parse_api_ensure_vals_adds_missing_keys(ap: ModuleType) -> None:
     result = ap.parse_api(
         source=[{"id": "1"}],
