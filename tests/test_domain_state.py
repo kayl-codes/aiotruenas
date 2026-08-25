@@ -495,6 +495,25 @@ async def test_get_replication_falls_back_to_job_state_when_state_missing() -> N
     assert result[1]["state"] == "RUNNING"
 
 
+async def test_get_replication_falls_back_when_state_is_explicit_null() -> None:
+    raw_replication = {
+        "id": 1,
+        "name": "tank-backup",
+        "state": {"state": None},
+        "job": {"state": "RUNNING"},
+    }
+    async with FakeTrueNASServer(
+        valid_api_key=API_KEY,
+        responses={"replication.query": [raw_replication]},
+    ) as server:
+        async with make_client(server) as client:
+            await client.connect()
+            state = TrueNASState(client)
+            result = await state.get_replication()
+
+    assert result[1]["state"] == "RUNNING"
+
+
 async def test_get_rsync_normalizes_job_status() -> None:
     raw_rsync = {
         "id": 1,

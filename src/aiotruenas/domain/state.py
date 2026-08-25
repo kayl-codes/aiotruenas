@@ -286,7 +286,11 @@ class TrueNASState:
                 vals=_REPLICATION_VALS,
             )
             for vals in self._ds["replication"].values():
-                if vals.get("state", "unknown") == "unknown":
+                # A malformed persistent state (e.g. an explicit null at
+                # "state/state") resolves to None rather than being absent, so
+                # .get("state", "unknown") returns None and skips the fallback
+                # below unless the non-string case is checked for explicitly.
+                if not isinstance(vals.get("state"), str) or vals["state"] == "unknown":
                     vals["state"] = vals.get("job_state", "unknown")
                 vals.pop("job_state", None)
             return self._ds["replication"]
