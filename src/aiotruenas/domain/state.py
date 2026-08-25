@@ -51,17 +51,21 @@ class TrueNASState:
     async def get_dataset(self) -> _EndpointMap:
         """Refresh and return normalized ZFS datasets (``pool.dataset.query``)."""
         async with self._lock:
-            return await self._refresh_dataset()
+            self._ds["dataset"] = await self._compute_dataset()
+            return self._ds["dataset"]
 
-    async def _refresh_dataset(self) -> _EndpointMap:
-        """Refresh ``self._ds["dataset"]``. Caller must hold ``self._lock``."""
-        self._ds["dataset"] = parse_api(
+    async def _compute_dataset(self) -> _EndpointMap:
+        """Return a freshly computed dataset map, without publishing it.
+
+        Caller must hold ``self._lock`` and is responsible for publishing the
+        result to ``self._ds["dataset"]``.
+        """
+        return parse_api(
             data={},
             source=await self._client.call("pool.dataset.query"),
             key="id",
             vals=_DATASET_VALS,
         )
-        return self._ds["dataset"]
 
     async def get_pool(self) -> _EndpointMap:
         """Refresh and return normalized pools (``pool.query`` + boot-pool).
@@ -70,13 +74,15 @@ class TrueNASState:
         root dataset's available/used figures (matching the TrueNAS WebUI),
         which requires up-to-date dataset data.
 
-        The refreshed pool map is built up on a local (deep-copied) snapshot
-        and only published to ``self._ds["pool"]`` once every step -- including
-        the fallible boot-pool lookup -- has succeeded, so a failure partway
-        through leaves the previous, fully-consistent snapshot in place.
+        Both the dataset and pool maps are built up on local (deep-copied)
+        snapshots and only published to ``self._ds`` once every step --
+        including the fallible boot-pool lookup -- has succeeded, so a
+        failure partway through leaves the previous, fully-consistent
+        snapshot of both endpoints in place instead of a dataset/pool pair
+        that no longer agree with each other.
         """
         async with self._lock:
-            datasets = await self._refresh_dataset()
+            datasets = await self._compute_dataset()
 
             raw_pools = await self._client.call("pool.query")
             pools = parse_api(
@@ -113,6 +119,7 @@ class TrueNASState:
                 # (e.g. "48").
                 pools[uid]["fragmentation"] = _to_int(vals.get("fragmentation"))
 
+            self._ds["dataset"] = datasets
             self._ds["pool"] = pools
             return pools
 
