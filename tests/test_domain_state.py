@@ -1165,6 +1165,32 @@ async def test_get_directoryservices_keeps_previous_status_on_malformed_response
     assert result[1]["healthy"] is True
 
 
+async def test_get_directoryservices_keeps_previous_status_on_status_missing_key() -> (
+    None
+):
+    async with FakeTrueNASServer(
+        valid_api_key=API_KEY,
+        responses={
+            "directoryservices.config": {
+                "id": 1,
+                "service_type": "LDAP",
+                "enable": True,
+            },
+            "directoryservices.status": {"status": "HEALTHY"},
+        },
+    ) as server:
+        async with make_client(server) as client:
+            await client.connect()
+            state = TrueNASState(client)
+            await state.get_directoryservices()
+
+            server.responses["directoryservices.status"] = {}
+            result = await state.get_directoryservices()
+
+    assert result[1]["status"] == "HEALTHY"
+    assert result[1]["healthy"] is True
+
+
 async def test_get_alerts_excludes_dismissed_and_aggregates_by_level() -> None:
     raw_alerts = [
         {

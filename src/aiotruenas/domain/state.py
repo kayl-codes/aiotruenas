@@ -766,12 +766,13 @@ class TrueNASState:
                 return self._ds["directoryservices"]
 
             raw_status = await self._client.call("directoryservices.status")
-            if isinstance(raw_status, dict):
-                status_val = raw_status.get("status", "unknown")
+            if isinstance(raw_status, dict) and "status" in raw_status:
+                status_val = raw_status["status"]
                 status_msg = raw_status.get("status_msg")
             else:
-                # Malformed/failed status refresh: keep the last known
-                # status/health instead of falsely reporting "unhealthy".
+                # Malformed/failed status refresh (non-dict, or a dict
+                # missing "status"): keep the last known status/health
+                # instead of falsely reporting "unhealthy".
                 previous = self._ds["directoryservices"].get(1, {})
                 status_val = previous.get("status", "unknown")
                 status_msg = previous.get("status_msg")
