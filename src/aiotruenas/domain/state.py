@@ -767,13 +767,17 @@ class TrueNASState:
                 return self._ds["directoryservices"]
 
             raw_status = await self._client.call("directoryservices.status")
-            if isinstance(raw_status, dict) and "status" in raw_status:
-                status_val = raw_status["status"]
+            status_field = (
+                raw_status.get("status") if isinstance(raw_status, dict) else None
+            )
+            if isinstance(status_field, str) and status_field:
+                status_val = status_field
                 status_msg = raw_status.get("status_msg")
             else:
-                # Malformed/failed status refresh (non-dict, or a dict
-                # missing "status"): keep the last known status/health
-                # instead of falsely reporting "unhealthy".
+                # Malformed/failed status refresh (non-dict, missing
+                # "status", or a non-string/empty value): keep the last
+                # known status/health instead of falsely reporting
+                # "unhealthy".
                 previous = self._ds["directoryservices"].get(1, {})
                 status_val = previous.get("status", "unknown")
                 status_msg = previous.get("status_msg")
@@ -809,11 +813,18 @@ class TrueNASState:
             if not isinstance(raw, list):
                 return self._ds["alerts"]
 
-            active = [
-                alert
-                for alert in raw
-                if isinstance(alert, dict) and not alert.get("dismissed", False)
+            usable = [
+                alert for alert in raw if isinstance(alert, dict) and alert.get("uuid")
             ]
+            if raw and not usable:
+                # A non-empty response with no usable (uuid-bearing) entries
+                # is just as untrustworthy as a malformed/failed query --
+                # keep the previous snapshot instead of publishing a false
+                # "0 alerts" result. An empty list is exempt: that
+                # legitimately means "no alerts left".
+                return self._ds["alerts"]
+
+            active = [alert for alert in usable if not alert.get("dismissed", False)]
 
             disk_issues = False
             for alert in active:

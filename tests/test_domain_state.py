@@ -1218,6 +1218,33 @@ async def test_get_directoryservices_keeps_previous_status_on_status_missing_key
     assert result[1]["healthy"] is True
 
 
+@pytest.mark.parametrize("invalid_status", [None, [], ""])
+async def test_get_directoryservices_keeps_previous_status_on_invalid_status_value(
+    invalid_status: Any,
+) -> None:
+    async with FakeTrueNASServer(
+        valid_api_key=API_KEY,
+        responses={
+            "directoryservices.config": {
+                "id": 1,
+                "service_type": "LDAP",
+                "enable": True,
+            },
+            "directoryservices.status": {"status": "HEALTHY"},
+        },
+    ) as server:
+        async with make_client(server) as client:
+            await client.connect()
+            state = TrueNASState(client)
+            await state.get_directoryservices()
+
+            server.responses["directoryservices.status"] = {"status": invalid_status}
+            result = await state.get_directoryservices()
+
+    assert result[1]["status"] == "HEALTHY"
+    assert result[1]["healthy"] is True
+
+
 async def test_get_alerts_excludes_dismissed_and_aggregates_by_level() -> None:
     raw_alerts = [
         {
@@ -1330,6 +1357,27 @@ async def test_get_alerts_keeps_previous_state_on_malformed_response() -> None:
             previous_alerts = state.ds["alerts"]
 
             server.responses["alert.list"] = None
+            result = await state.get_alerts()
+
+    assert result is previous_alerts
+    assert state.ds["alerts"] is previous_alerts
+
+
+@pytest.mark.parametrize("malformed_alert_list", [[None], [{}]])
+async def test_get_alerts_keeps_previous_state_on_unusable_entries(
+    malformed_alert_list: list[Any],
+) -> None:
+    async with FakeTrueNASServer(
+        valid_api_key=API_KEY,
+        responses={"alert.list": [{"uuid": "a1", "level": "CRITICAL"}]},
+    ) as server:
+        async with make_client(server) as client:
+            await client.connect()
+            state = TrueNASState(client)
+            await state.get_alerts()
+            previous_alerts = state.ds["alerts"]
+
+            server.responses["alert.list"] = malformed_alert_list
             result = await state.get_alerts()
 
     assert result is previous_alerts
