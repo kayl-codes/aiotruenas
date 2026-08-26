@@ -197,7 +197,9 @@ def _disk_temps_from_graph_data(graph_data: list[Any]) -> dict[str, float]:
         if valid_means := [
             v
             for v in mean.values()
-            if isinstance(v, (int, float)) and 0.0 <= v <= 100.0
+            if isinstance(v, (int, float))
+            and not isinstance(v, bool)
+            and 0.0 <= v <= 100.0
         ]:
             temps[str(identifier)] = _median(valid_means)
     return temps

@@ -14,6 +14,7 @@ from aiotruenas.domain._helpers import (
     _aggregate_topology_errors,
     _arc_value,
     _as_int,
+    _disk_temps_from_graph_data,
     _median,
     _netdata_mean_value,
     _stat_name_similar,
@@ -189,3 +190,35 @@ def test_arc_value_delegates_to_netdata_mean_value() -> None:
 def test_ups_value_delegates_to_netdata_mean_value() -> None:
     graph_data = [{"aggregations": {"mean": {"a": 5.0, "b": 15.0}}}]
     assert _ups_value(graph_data) == pytest.approx(10.0)
+
+
+# ---------------------------
+#   _disk_temps_from_graph_data
+# ---------------------------
+def test_disk_temps_from_graph_data_computes_median_per_disk() -> None:
+    graph_data = [
+        {"identifier": "disk1", "aggregations": {"mean": {"a": 30.0, "b": 40.0}}},
+        {"identifier": "disk2", "aggregations": {"mean": {"a": 50.0}}},
+    ]
+    assert _disk_temps_from_graph_data(graph_data) == {"disk1": 35.0, "disk2": 50.0}
+
+
+def test_disk_temps_from_graph_data_discards_out_of_range_values() -> None:
+    graph_data = [{"identifier": "disk1", "aggregations": {"mean": {"a": 150.0}}}]
+    assert _disk_temps_from_graph_data(graph_data) == {}
+
+
+def test_disk_temps_from_graph_data_excludes_bool_values() -> None:
+    """bool is a subclass of int; True must not be read as a 1 degC temperature."""
+    graph_data = [{"identifier": "disk1", "aggregations": {"mean": {"a": True}}}]
+    assert _disk_temps_from_graph_data(graph_data) == {}
+
+
+def test_disk_temps_from_graph_data_ignores_malformed_entries() -> None:
+    graph_data = [
+        "not-a-dict",
+        {"identifier": None, "aggregations": {"mean": {"a": 30.0}}},
+        {"identifier": "disk1", "aggregations": "not-a-dict"},
+        {"identifier": "disk2"},
+    ]
+    assert _disk_temps_from_graph_data(graph_data) == {}

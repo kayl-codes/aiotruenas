@@ -913,7 +913,10 @@ class TrueNASState:
         count rather than reporting a false "0 connections".
         """
         async with self._lock:
-            raw = await self._client.call("smb.status")
+            try:
+                raw = await self._client.call("smb.status")
+            except TrueNASError:
+                return self._ds["smb"]
             if isinstance(raw, list):
                 self._ds["smb"] = {"connections": len(raw)}
             elif isinstance(raw, dict) and isinstance(raw.get("sessions"), list):
@@ -997,9 +1000,15 @@ class TrueNASState:
     async def _update_disk_temperatures(self) -> None:
         """Enrich ``self._ds["disk"]`` with temperatures.
 
-        Caller must hold ``self._lock``.
+        Caller must hold ``self._lock``. A failed netdata query is caught
+        locally (rather than left to propagate to ``get_disk()``'s own
+        try/except) so the ``disk.temperatures`` fallback below still runs
+        for every disk instead of being skipped entirely.
         """
-        netdata_temps = await self._disk_temps_from_netdata()
+        try:
+            netdata_temps = await self._disk_temps_from_netdata()
+        except TrueNASError:
+            netdata_temps = None
         if netdata_temps:
             disk_map = self._build_disk_name_map()
             for name, temp in netdata_temps.items():

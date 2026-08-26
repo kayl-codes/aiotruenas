@@ -1530,6 +1530,28 @@ async def test_get_smb_keeps_previous_count_on_malformed_response() -> None:
     assert result == {"connections": 2}
 
 
+async def test_get_smb_keeps_previous_count_when_query_raises() -> None:
+    async with FakeTrueNASServer(
+        valid_api_key=API_KEY,
+        responses={"smb.status": [{}, {}]},
+    ) as server:
+        async with make_client(server) as client:
+            await client.connect()
+            state = TrueNASState(client)
+            await state.get_smb()
+
+            server.responses["smb.status"] = {
+                "error": {
+                    "code": -32603,
+                    "message": "Internal error",
+                    "data": {"error": 1, "errname": "EFAULT", "reason": None},
+                }
+            }
+            result = await state.get_smb()
+
+    assert result == {"connections": 2}
+
+
 async def test_get_update_reports_available_update_with_manifest_fields() -> None:
     raw_status = {
         "status": {
@@ -1642,6 +1664,41 @@ async def test_get_disk_falls_back_to_disk_temperatures_when_no_netdata_graph() 
         responses={
             "disk.query": [_DISK_SDA],
             "reporting.netdata_graphs": [],
+            "disk.temperatures": {"sda": 42.5},
+        },
+    ) as server:
+        async with make_client(server) as client:
+            await client.connect()
+            state = TrueNASState(client)
+            result = await state.get_disk()
+
+    assert result["{serial}S1"]["temperature"] == 42.5
+
+
+async def test_get_disk_falls_back_when_netdata_query_fails_after_graph_found() -> None:
+    """A netdata graph is discovered, but the actual reading query then fails.
+
+    The ``disk.temperatures`` fallback must still run for every disk instead
+    of being skipped because of the earlier netdata failure.
+    """
+    async with FakeTrueNASServer(
+        valid_api_key=API_KEY,
+        responses={
+            "disk.query": [_DISK_SDA],
+            "reporting.netdata_graphs": [
+                {
+                    "name": "disktemp",
+                    "title": "Disk Temperature",
+                    "vertical_label": "Celsius",
+                }
+            ],
+            "reporting.netdata_graph": {
+                "error": {
+                    "code": -32603,
+                    "message": "Internal error",
+                    "data": {"error": 1, "errname": "EFAULT", "reason": None},
+                }
+            },
             "disk.temperatures": {"sda": 42.5},
         },
     ) as server:
