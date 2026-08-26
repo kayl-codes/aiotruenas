@@ -727,7 +727,7 @@ class TrueNASState:
         """
         async with self._lock:
             self._ds["certificate"] = parse_api(
-                data={},
+                data=self._ds["certificate"],
                 source=await self._client.call("certificate.query"),
                 key="name",
                 vals=_CERTIFICATE_VALS,
@@ -766,12 +766,20 @@ class TrueNASState:
                 return self._ds["directoryservices"]
 
             raw_status = await self._client.call("directoryservices.status")
-            status = raw_status if isinstance(raw_status, dict) else {}
+            if isinstance(raw_status, dict):
+                status_val = raw_status.get("status", "unknown")
+                status_msg = raw_status.get("status_msg")
+            else:
+                # Malformed/failed status refresh: keep the last known
+                # status/health instead of falsely reporting "unhealthy".
+                previous = self._ds["directoryservices"].get(1, {})
+                status_val = previous.get("status", "unknown")
+                status_msg = previous.get("status_msg")
 
             merged = dict(config)
             merged["id"] = 1
-            merged["status"] = status.get("status", "unknown")
-            merged["status_msg"] = status.get("status_msg")
+            merged["status"] = status_val
+            merged["status_msg"] = status_msg
 
             self._ds["directoryservices"] = parse_api(
                 data={},

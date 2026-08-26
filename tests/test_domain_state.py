@@ -1029,6 +1029,25 @@ async def test_get_certificates_sets_days_until_expiry_none_for_unparsable_until
     assert result["broken"]["days_until_expiry"] is None
 
 
+async def test_get_certificates_keeps_previous_snapshot_on_malformed_query() -> None:
+    raw_certificates = [{"id": 1, "name": "truenas_default", "expired": False}]
+    async with FakeTrueNASServer(
+        valid_api_key=API_KEY,
+        responses={"certificate.query": raw_certificates},
+    ) as server:
+        async with make_client(server) as client:
+            await client.connect()
+            state = TrueNASState(client)
+            await state.get_certificates()
+            previous = state.ds["certificate"]
+
+            server.responses["certificate.query"] = None
+            result = await state.get_certificates()
+
+    assert result is previous
+    assert "truenas_default" in result
+
+
 async def test_get_directoryservices_returns_empty_when_not_configured() -> None:
     async with FakeTrueNASServer(
         valid_api_key=API_KEY,
@@ -1117,6 +1136,32 @@ async def test_get_directoryservices_id_key_ignores_config_id() -> None:
 
     assert 42 not in result
     assert result[1]["type"] == "LDAP"
+    assert result[1]["healthy"] is True
+
+
+async def test_get_directoryservices_keeps_previous_status_on_malformed_response() -> (
+    None
+):
+    async with FakeTrueNASServer(
+        valid_api_key=API_KEY,
+        responses={
+            "directoryservices.config": {
+                "id": 1,
+                "service_type": "LDAP",
+                "enable": True,
+            },
+            "directoryservices.status": {"status": "HEALTHY"},
+        },
+    ) as server:
+        async with make_client(server) as client:
+            await client.connect()
+            state = TrueNASState(client)
+            await state.get_directoryservices()
+
+            server.responses["directoryservices.status"] = None
+            result = await state.get_directoryservices()
+
+    assert result[1]["status"] == "HEALTHY"
     assert result[1]["healthy"] is True
 
 
