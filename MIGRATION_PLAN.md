@@ -178,6 +178,27 @@ Commit/Push/PR ohne explizite Freigabe.
   aus dem Coordinator-Original bleibt dort — die Library fragt/normalisiert unbedingt, sobald
   ein Directory-Service konfiguriert+aktiviert ist. Damit ist Schritt 4 (a–d) vollständig
   abgeschlossen.
+- 🚧 Schritt 5 — Restliche PROMPT.md-Pflichtendpoints (`get_interface()`/`get_disk()`/
+  `get_scrub()`/`get_smb()`/`get_update()` auf `TrueNASState`): PR in Arbeit. `core.get_jobs` aus
+  PROMPT.md's 23er-Liste war bereits durch `TrueNASClient.call(..., job=True)` abgedeckt und
+  brauchte keinen eigenen `get_*()`. `get_interface()` liefert `interface.query` +
+  abgeleitetes `link_up`; Live-`rx`/`tx`-Durchsatz bleibt bewusst außen vor (siehe
+  `_INTERFACE_VALS`-Docstring) — der stammt im Coordinator-Original aus der großen kombinierten
+  `systemstats`-Multi-Graph-Abfrage, die mit `get_systeminfo()` zusammenhängt (s.u.).
+  `get_disk()` normalisiert `disk.query` und reichert Temperaturen primär über den
+  auto-discovered Netdata-Disk-Temp-Graph an, mit Fallback auf `disk.temperatures`; beide Pfade
+  sind best-effort (Fehler lassen `temperature` beim vorigen Wert). `get_scrub()`/`get_smb()`/
+  `get_update()` folgen dem bestehenden Muster (`get_smb()`/`get_update()` als flache Dicts wie
+  `arc`/`ups`/`alerts`, ohne natürlichen Objekt-Key). **Bewusst nicht Teil dieses Schritts:**
+  `get_systeminfo()` (`system.info` als eigener `ds["system_info"]`-Endpoint mit Uptime-/
+  Versions-Herleitung) und die zugehörige `systemstats`-Anreicherung (cpu/load/memory/
+  arc-Größe + Interface-rx/tx) — laut Korrektur bei Schritt 4b eigentlich für denselben Batch
+  wie `get_disk()` vorgesehen, aber ein eigenständiger, ungleich größerer Portierungsaufwand
+  (kombinierte Multi-Graph-Netdata-Abfrage über mehrere hundert Zeilen im Coordinator-Original).
+  `system.info` selbst ist über den bereits vorhandenen generischen `call()` nutzbar und erfüllt
+  damit PROMPT.md's Anforderung ("MUSS end-to-end funktionieren"); nur das gecachte, angereicherte
+  `TrueNASState`-Äquivalent fehlt noch. Rückfrage an den Nutzer, ob das als eigener Schritt 6
+  folgt oder der Migrationsplan hier als abgeschlossen gilt.
 
 ## Zu klärende/entscheidende Punkte (Antworten auf die 3 Nutzerfragen)
 
