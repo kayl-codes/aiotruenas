@@ -769,6 +769,7 @@ class TrueNASState:
             status = raw_status if isinstance(raw_status, dict) else {}
 
             merged = dict(config)
+            merged["id"] = 1
             merged["status"] = status.get("status", "unknown")
             merged["status_msg"] = status.get("status_msg")
 
@@ -808,7 +809,9 @@ class TrueNASState:
             for alert in active:
                 klass = str(alert.get("klass", "")).lower()
                 title = str(alert.get("title", "")).lower()
-                if "disk" in klass or "pool" in klass or "smart" in title:
+                if any(
+                    term in klass or term in title for term in ("disk", "pool", "smart")
+                ):
                     disk_issues = True
                     break
 

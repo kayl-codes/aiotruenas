@@ -1098,6 +1098,28 @@ async def test_get_directoryservices_derives_unhealthy_from_faulted_status() -> 
     assert result[1]["healthy"] is False
 
 
+async def test_get_directoryservices_id_key_ignores_config_id() -> None:
+    async with FakeTrueNASServer(
+        valid_api_key=API_KEY,
+        responses={
+            "directoryservices.config": {
+                "id": 42,
+                "service_type": "LDAP",
+                "enable": True,
+            },
+            "directoryservices.status": {"status": "HEALTHY"},
+        },
+    ) as server:
+        async with make_client(server) as client:
+            await client.connect()
+            state = TrueNASState(client)
+            result = await state.get_directoryservices()
+
+    assert 42 not in result
+    assert result[1]["type"] == "LDAP"
+    assert result[1]["healthy"] is True
+
+
 async def test_get_alerts_excludes_dismissed_and_aggregates_by_level() -> None:
     raw_alerts = [
         {
@@ -1164,6 +1186,38 @@ async def test_get_alerts_disk_issues_false_without_disk_pool_or_smart_match() -
             result = await state.get_alerts()
 
     assert result["disk_issues"] is False
+
+
+async def test_get_alerts_disk_issues_true_for_title_or_klass_cross_matches() -> None:
+    raw_alerts = [
+        {
+            "uuid": "a1",
+            "level": "WARNING",
+            "klass": "SmartTest",
+            "title": "Something failed",
+            "formatted": "SMART self-test failed",
+            "dismissed": False,
+        },
+        {
+            "uuid": "a2",
+            "level": "WARNING",
+            "klass": "Hardware",
+            "title": "Disk removed",
+            "formatted": "Disk was removed",
+            "dismissed": False,
+        },
+    ]
+    for alert in raw_alerts:
+        async with FakeTrueNASServer(
+            valid_api_key=API_KEY,
+            responses={"alert.list": [alert]},
+        ) as server:
+            async with make_client(server) as client:
+                await client.connect()
+                state = TrueNASState(client)
+                result = await state.get_alerts()
+
+        assert result["disk_issues"] is True
 
 
 async def test_get_alerts_keeps_previous_state_on_malformed_response() -> None:
