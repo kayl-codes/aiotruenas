@@ -8,8 +8,8 @@ Each method queries the endpoint, normalizes the response via
 caches the result in ``self.ds[<endpoint>]`` -- the same dict-keyed-by-id
 shape historically produced by consumer integrations' own
 ``apiparser.py``/``coordinator.py``. Exceptions are the netdata-graph-backed
-endpoints (``arc``, ``ups``), which have no natural object id and instead
-cache a flat dict of scalar readings.
+endpoints (``arc``, ``ups``) and the hand-aggregated ``alerts`` endpoint,
+which have no natural object id and instead cache a flat dict.
 """
 
 from __future__ import annotations
@@ -72,8 +72,8 @@ _PublicStateMap = dict[str, _EndpointMap | _ArcMap | _UpsMap | _AlertsMap]
 
 
 class _StateMap(TypedDict):
-    """Per-key shape of ``self._ds``: id-keyed maps, except the flat scalar
-    readings of ``arc``/``ups``, which have no natural object id.
+    """Per-key shape of ``self._ds``: id-keyed maps, except the flat
+    ``arc``/``ups``/``alerts`` entries, which have no natural object id.
     """
 
     pool: _EndpointMap
@@ -187,8 +187,8 @@ class TrueNASState:
     def ds(self) -> _PublicStateMap:
         """Normalized state, keyed by endpoint name then by object id/guid.
 
-        The ``arc`` and ``ups`` endpoints have no natural object id and are
-        keyed by endpoint name only, holding a flat dict of scalar readings.
+        The ``arc``, ``ups``, and ``alerts`` endpoints have no natural object
+        id and are keyed by endpoint name only, holding a flat dict.
 
         Typed as a plain mapping rather than the ``TypedDict`` used
         internally, so it can be indexed with a runtime string (e.g. when
