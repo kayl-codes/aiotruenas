@@ -757,11 +757,12 @@ class TrueNASState:
         """
         async with self._lock:
             config = await self._client.call("directoryservices.config")
-            if (
-                not isinstance(config, dict)
-                or not config.get("service_type")
-                or not config.get("enable")
-            ):
+            if not isinstance(config, dict):
+                # Malformed/failed config refresh: keep the last known
+                # snapshot instead of dropping it like a legitimate
+                # disabled/unconfigured service would.
+                return self._ds["directoryservices"]
+            if not config.get("service_type") or not config.get("enable"):
                 self._ds["directoryservices"] = {}
                 return self._ds["directoryservices"]
 
