@@ -454,6 +454,9 @@ async def test_ds_property_starts_empty_for_all_endpoints() -> None:
         "app": {},
         "certificate": {},
         "directoryservices": {},
+        "interface": {},
+        "disk": {},
+        "scrub": {},
         "arc": {},
         "ups": {},
         "alerts": {
@@ -465,6 +468,16 @@ async def test_ds_property_starts_empty_for_all_endpoints() -> None:
             "disk_issues": False,
             "uuids": [],
         },
+        "update": {
+            "update_available": False,
+            "update_state": "IDLE",
+            "update_version": "up-to-date",
+            "update_date": None,
+            "update_profile": None,
+            "update_train": None,
+            "update_filename": None,
+        },
+        "smb": {"connections": 0},
     }
 
 
@@ -1411,3 +1424,252 @@ async def test_get_ups_keeps_previous_reading_when_discovery_raises() -> None:
 
     assert result is previous_ups
     assert state.ds["ups"] is previous_ups
+
+
+async def test_get_interface_normalizes_and_derives_link_up() -> None:
+    raw_interfaces = [
+        {
+            "id": "eno1",
+            "name": "eno1",
+            "description": "",
+            "mtu": 1500,
+            "state": {
+                "link_state": "LINK_STATE_UP",
+                "active_media_type": "Ethernet",
+                "active_media_subtype": "1000baseT Full-duplex",
+                "link_address": "aa:bb:cc:dd:ee:ff",
+            },
+        },
+        {
+            "id": "eno2",
+            "name": "eno2",
+            "state": {"link_state": "LINK_STATE_DOWN"},
+        },
+    ]
+    async with FakeTrueNASServer(
+        valid_api_key=API_KEY,
+        responses={"interface.query": raw_interfaces},
+    ) as server:
+        async with make_client(server) as client:
+            await client.connect()
+            state = TrueNASState(client)
+            result = await state.get_interface()
+
+    assert result["eno1"] == {
+        "id": "eno1",
+        "name": "eno1",
+        "description": "",
+        "mtu": 1500,
+        "link_state": "LINK_STATE_UP",
+        "active_media_type": "Ethernet",
+        "active_media_subtype": "1000baseT Full-duplex",
+        "link_address": "aa:bb:cc:dd:ee:ff",
+        "rx": 0,
+        "tx": 0,
+        "link_up": True,
+    }
+    assert result["eno2"]["link_up"] is False
+    assert state.ds["interface"] == result
+
+
+async def test_get_scrub_normalizes_pool_scrub_query() -> None:
+    raw_scrubs = [{"id": 1, "pool_name": "tank", "enabled": True}]
+    async with FakeTrueNASServer(
+        valid_api_key=API_KEY,
+        responses={"pool.scrub.query": raw_scrubs},
+    ) as server:
+        async with make_client(server) as client:
+            await client.connect()
+            state = TrueNASState(client)
+            result = await state.get_scrub()
+
+    assert result == {1: {"id": 1, "pool_name": "tank", "enabled": True}}
+    assert state.ds["scrub"] == result
+
+
+async def test_get_smb_counts_sessions_from_list_response() -> None:
+    async with FakeTrueNASServer(
+        valid_api_key=API_KEY,
+        responses={"smb.status": [{}, {}, {}]},
+    ) as server:
+        async with make_client(server) as client:
+            await client.connect()
+            state = TrueNASState(client)
+            result = await state.get_smb()
+
+    assert result == {"connections": 3}
+    assert state.ds["smb"] == result
+
+
+async def test_get_smb_counts_sessions_from_dict_response() -> None:
+    async with FakeTrueNASServer(
+        valid_api_key=API_KEY,
+        responses={"smb.status": {"sessions": [{}, {}]}},
+    ) as server:
+        async with make_client(server) as client:
+            await client.connect()
+            state = TrueNASState(client)
+            result = await state.get_smb()
+
+    assert result == {"connections": 2}
+
+
+async def test_get_smb_keeps_previous_count_on_malformed_response() -> None:
+    async with FakeTrueNASServer(
+        valid_api_key=API_KEY,
+        responses={"smb.status": [{}, {}]},
+    ) as server:
+        async with make_client(server) as client:
+            await client.connect()
+            state = TrueNASState(client)
+            await state.get_smb()
+
+            server.responses["smb.status"] = None
+            result = await state.get_smb()
+
+    assert result == {"connections": 2}
+
+
+async def test_get_update_reports_available_update_with_manifest_fields() -> None:
+    raw_status = {
+        "status": {
+            "state": "AVAILABLE",
+            "new_version": {
+                "version": "25.10.0",
+                "manifest": {
+                    "date": "2026-01-01",
+                    "profile": "GENERAL",
+                    "train": "TrueNAS-25.10-STABLE",
+                    "filename": "x.update",
+                },
+            },
+        }
+    }
+    async with FakeTrueNASServer(
+        valid_api_key=API_KEY,
+        responses={"update.status": raw_status},
+    ) as server:
+        async with make_client(server) as client:
+            await client.connect()
+            state = TrueNASState(client)
+            result = await state.get_update()
+
+    assert result == {
+        "update_available": True,
+        "update_state": "AVAILABLE",
+        "update_version": "25.10.0",
+        "update_date": "2026-01-01",
+        "update_profile": "GENERAL",
+        "update_train": "TrueNAS-25.10-STABLE",
+        "update_filename": "x.update",
+    }
+    assert state.ds["update"] == result
+
+
+async def test_get_update_resets_to_no_update_pending_without_new_version() -> None:
+    async with FakeTrueNASServer(
+        valid_api_key=API_KEY,
+        responses={"update.status": {"status": {"state": "IDLE"}}},
+    ) as server:
+        async with make_client(server) as client:
+            await client.connect()
+            state = TrueNASState(client)
+            result = await state.get_update()
+
+    assert result == {
+        "update_available": False,
+        "update_state": "IDLE",
+        "update_version": "up-to-date",
+        "update_date": None,
+        "update_profile": None,
+        "update_train": None,
+        "update_filename": None,
+    }
+
+
+async def test_get_update_resets_to_no_update_pending_on_malformed_response() -> None:
+    async with FakeTrueNASServer(
+        valid_api_key=API_KEY,
+        responses={"update.status": None},
+    ) as server:
+        async with make_client(server) as client:
+            await client.connect()
+            state = TrueNASState(client)
+            result = await state.get_update()
+
+    assert result["update_available"] is False
+    assert result["update_state"] == "IDLE"
+
+
+_DISK_SDA = {
+    "name": "sda",
+    "devname": "sda",
+    "serial": "S1",
+    "size": "1TB",
+    "identifier": "{serial}S1",
+}
+
+
+async def test_get_disk_normalizes_and_applies_netdata_temperature() -> None:
+    async with FakeTrueNASServer(
+        valid_api_key=API_KEY,
+        responses={
+            "disk.query": [_DISK_SDA],
+            "reporting.netdata_graphs": [
+                {
+                    "name": "disktemp",
+                    "title": "Disk Temperature",
+                    "vertical_label": "Celsius",
+                }
+            ],
+            "reporting.netdata_graph": [
+                {"identifier": "{serial}S1", "aggregations": {"mean": {"sda": 35.0}}}
+            ],
+        },
+    ) as server:
+        async with make_client(server) as client:
+            await client.connect()
+            state = TrueNASState(client)
+            result = await state.get_disk()
+
+    assert result["{serial}S1"]["temperature"] == 35.0
+    assert state.ds["disk"] == result
+
+
+async def test_get_disk_falls_back_to_disk_temperatures_when_no_netdata_graph() -> None:
+    async with FakeTrueNASServer(
+        valid_api_key=API_KEY,
+        responses={
+            "disk.query": [_DISK_SDA],
+            "reporting.netdata_graphs": [],
+            "disk.temperatures": {"sda": 42.5},
+        },
+    ) as server:
+        async with make_client(server) as client:
+            await client.connect()
+            state = TrueNASState(client)
+            result = await state.get_disk()
+
+    assert result["{serial}S1"]["temperature"] == 42.5
+
+
+async def test_get_disk_keeps_temperature_none_when_enrichment_fails() -> None:
+    async with FakeTrueNASServer(
+        valid_api_key=API_KEY,
+        responses={
+            "disk.query": [_DISK_SDA],
+            "reporting.netdata_graphs": {
+                "error": {
+                    "code": -32603,
+                    "message": "Internal error",
+                    "data": {"error": 1, "errname": "EFAULT", "reason": None},
+                }
+            },
+        },
+    ) as server:
+        async with make_client(server) as client:
+            await client.connect()
+            state = TrueNASState(client)
+            result = await state.get_disk()
+
+    assert result["{serial}S1"]["temperature"] is None
