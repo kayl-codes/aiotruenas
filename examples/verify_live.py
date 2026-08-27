@@ -39,7 +39,11 @@ import sys
 from collections.abc import Awaitable, Callable
 
 from aiotruenas import TrueNASClient, TrueNASState
-from aiotruenas.exceptions import TrueNASError
+from aiotruenas.exceptions import (
+    TrueNASConnectionError,
+    TrueNASError,
+    TrueNASTimeoutError,
+)
 
 #: Read-only methods from PROMPT.md's "must work end-to-end" RPC list (the
 #: coordinator's integration-test method list), in that order. Some are
@@ -142,6 +146,8 @@ async def _check_domain_state(client: TrueNASClient) -> None:
     for name, call in calls:
         try:
             result = await call()
+        except (TrueNASConnectionError, TrueNASTimeoutError):
+            raise  # a dead/stalled connection invalidates the rest of the pass
         except Exception as exc:  # broad: probing normalizers for real-shape bugs
             failed.append(name)
             print(f"  {name}(): FAILED ({type(exc).__name__}): {exc}")
