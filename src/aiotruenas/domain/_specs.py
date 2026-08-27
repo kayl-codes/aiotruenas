@@ -383,3 +383,57 @@ _DIRECTORYSERVICES_VALS: list[ApiValueSpec] = [
 _DIRECTORYSERVICES_ENSURE_VALS: list[ApiValueSpec] = [
     {"name": "healthy", "type": "bool", "default": False},
 ]
+
+# interface.query. Live rx/tx throughput -- sourced in the legacy coordinator
+# from a separate, much larger multi-graph netdata "interface" stat batch --
+# is out of scope; ensure_vals only defaults rx/tx to 0.
+_INTERFACE_VALS: list[ApiValueSpec] = [
+    {"name": "id", "default": "unknown"},
+    {"name": "name", "default": "unknown"},
+    {"name": "description", "default": "unknown"},
+    {"name": "mtu", "default": "unknown"},
+    {"name": "link_state", "source": "state/link_state", "default": "unknown"},
+    {
+        "name": "active_media_type",
+        "source": "state/active_media_type",
+        "default": "unknown",
+    },
+    {
+        "name": "active_media_subtype",
+        "source": "state/active_media_subtype",
+        "default": "unknown",
+    },
+    {"name": "link_address", "source": "state/link_address", "default": "unknown"},
+]
+_INTERFACE_ENSURE_VALS: list[ApiValueSpec] = [
+    {"name": "rx", "default": 0},
+    {"name": "tx", "default": 0},
+]
+
+# disk.query. Keyed by "identifier" (stable across a devname/name change,
+# e.g. on drive reseat) rather than "name".
+_DISK_VALS: list[ApiValueSpec] = [
+    {"name": "name", "default": "unknown"},
+    {"name": "devname", "default": "unknown"},
+    {"name": "serial", "default": "unknown"},
+    {"name": "size", "default": "unknown"},
+    {"name": "hddstandby", "default": "unknown"},
+    {"name": "hddstandby_force", "type": "bool", "default": False},
+    {"name": "advpowermgmt", "default": "unknown"},
+    {"name": "acousticlevel", "default": "unknown"},
+    {"name": "model", "default": "unknown"},
+    {"name": "rotationrate", "default": "unknown"},
+    {"name": "type", "default": "unknown"},
+    {"name": "zfs_guid", "default": "unknown"},
+    {"name": "identifier", "default": "unknown"},
+]
+_DISK_ENSURE_VALS: list[ApiValueSpec] = [
+    {"name": "temperature", "default": None},
+]
+
+# pool.scrub.query.
+_SCRUB_VALS: list[ApiValueSpec] = [
+    {"name": "id", "default": None},
+    {"name": "pool_name", "default": ""},
+    {"name": "enabled", "type": "bool", "default": False},
+]

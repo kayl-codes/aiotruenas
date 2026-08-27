@@ -26,6 +26,7 @@ from ._helpers import (
     _aggregate_topology_errors,
     _arc_value,
     _cpuset_size,
+    _disk_temps_from_graph_data,
     _first_ipv4,
     _parse_version_tuple,
     _to_int,
@@ -46,10 +47,15 @@ from ._specs import (
     _DATASET_VALS,
     _DIRECTORYSERVICES_ENSURE_VALS,
     _DIRECTORYSERVICES_VALS,
+    _DISK_ENSURE_VALS,
+    _DISK_VALS,
+    _INTERFACE_ENSURE_VALS,
+    _INTERFACE_VALS,
     _POOL_ENSURE_VALS,
     _POOL_VALS,
     _REPLICATION_VALS,
     _RSYNC_VALS,
+    _SCRUB_VALS,
     _SERVICE_ENSURE_VALS,
     _SERVICE_VALS,
     _SNAPSHOTTASK_VALS,
@@ -65,10 +71,16 @@ _ArcMap = dict[str, float | None]
 _UpsMap = dict[str, float]
 #: get_alerts() shape: aggregated counters/messages, no natural object id.
 _AlertsMap = dict[str, Any]
+#: get_update() shape: pending-update status fields, no natural object id.
+_UpdateMap = dict[str, Any]
+#: get_smb() shape: single connection-count reading, no natural object id.
+_SmbMap = dict[str, int]
 #: Public shape of the ``ds`` property: a plain mapping (rather than the
 #: TypedDict used internally) so consumers can index it with a runtime
 #: string, e.g. when iterating over endpoint names.
-_PublicStateMap = dict[str, _EndpointMap | _ArcMap | _UpsMap | _AlertsMap]
+_PublicStateMap = dict[
+    str, _EndpointMap | _ArcMap | _UpsMap | _AlertsMap | _UpdateMap | _SmbMap
+]
 
 
 class _StateMap(TypedDict):
@@ -89,9 +101,14 @@ class _StateMap(TypedDict):
     app: _EndpointMap
     certificate: _EndpointMap
     directoryservices: _EndpointMap
+    interface: _EndpointMap
+    disk: _EndpointMap
+    scrub: _EndpointMap
     arc: _ArcMap
     ups: _UpsMap
     alerts: _AlertsMap
+    update: _UpdateMap
+    smb: _SmbMap
 
 
 # Maps a netdata graph name (``reporting.netdata_graphs``) to its ds["arc"] field.
@@ -165,6 +182,9 @@ class TrueNASState:
             "app": {},
             "certificate": {},
             "directoryservices": {},
+            "interface": {},
+            "disk": {},
+            "scrub": {},
             "arc": {},
             "ups": {},
             "alerts": {
@@ -176,12 +196,18 @@ class TrueNASState:
                 "disk_issues": False,
                 "uuids": [],
             },
+            "update": self._no_update_pending(),
+            "smb": {"connections": 0},
         }
         # Cached (major, minor) TrueNAS version, used by get_container() to
         # pick the right query API; detected lazily on first use (see
         # _detect_version()) since it cannot change without an appliance
         # reboot, which drops the underlying connection.
         self._version: tuple[int, int] | None = None
+        # Cached netdata graph name reporting per-disk temperatures, used by
+        # get_disk(); "" once discovery has run but found none, None until
+        # discovery has run at all (see _disk_temps_from_netdata()).
+        self._disk_temp_graph: str | None = None
 
     @property
     def ds(self) -> _PublicStateMap:
@@ -848,3 +874,226 @@ class TrueNASState:
                 "uuids": [alert.get("uuid") for alert in active if alert.get("uuid")],
             }
             return self._ds["alerts"]
+
+    async def get_interface(self) -> _EndpointMap:
+        """Refresh and return normalized network interfaces (``interface.query``).
+
+        Derives a boolean ``link_up`` from the link state. Live rx/tx
+        throughput is out of scope (see ``_INTERFACE_VALS``'s docstring in
+        ``_specs.py``) -- ``rx``/``tx`` default to 0.
+        """
+        async with self._lock:
+            self._ds["interface"] = parse_api(
+                data=self._ds["interface"],
+                source=await self._client.call("interface.query"),
+                key="id",
+                vals=_INTERFACE_VALS,
+                ensure_vals=_INTERFACE_ENSURE_VALS,
+            )
+            for vals in self._ds["interface"].values():
+                vals["link_up"] = vals.get("link_state") == "LINK_STATE_UP"
+            return self._ds["interface"]
+
+    async def get_scrub(self) -> _EndpointMap:
+        """Refresh and return normalized pool scrub tasks (``pool.scrub.query``)."""
+        async with self._lock:
+            self._ds["scrub"] = parse_api(
+                data=self._ds["scrub"],
+                source=await self._client.call("pool.scrub.query"),
+                key="id",
+                vals=_SCRUB_VALS,
+            )
+            return self._ds["scrub"]
+
+    async def get_smb(self) -> _SmbMap:
+        """Refresh and return the active SMB connection count (``smb.status``).
+
+        Flat dict (single ``connections`` key), matching the ``arc``/``ups``
+        endpoints' shape. A malformed/failed response keeps the previous
+        count rather than reporting a false "0 connections".
+        """
+        async with self._lock:
+            try:
+                raw = await self._client.call("smb.status")
+            except TrueNASError:
+                return self._ds["smb"]
+            if isinstance(raw, list):
+                self._ds["smb"] = {"connections": len(raw)}
+            elif isinstance(raw, dict) and isinstance(raw.get("sessions"), list):
+                self._ds["smb"] = {"connections": len(raw["sessions"])}
+            return self._ds["smb"]
+
+    @staticmethod
+    def _no_update_pending() -> _UpdateMap:
+        """Return the "no update pending" resting state for ``get_update()``."""
+        return {
+            "update_available": False,
+            "update_state": "IDLE",
+            "update_version": "up-to-date",
+            "update_date": None,
+            "update_profile": None,
+            "update_train": None,
+            "update_filename": None,
+        }
+
+    async def get_update(self) -> _UpdateMap:
+        """Refresh and return the pending-update status (``update.status``).
+
+        Flat dict, no natural object id, matching the ``arc``/``ups``/
+        ``alerts`` endpoints' shape. Resets to "no update pending" whenever
+        the response is malformed or carries no new version, rather than
+        reporting a phantom update; progress-tracking of a running install
+        job is left to the caller via the generic ``call(..., job=True)``
+        polling (``core.get_jobs``), not TrueNAS normalization.
+        """
+        async with self._lock:
+            raw = await self._client.call("update.status")
+            status = raw.get("status") if isinstance(raw, dict) else None
+            new_version = (
+                status.get("new_version") if isinstance(status, dict) else None
+            )
+            if not isinstance(new_version, dict) or not new_version.get("version"):
+                self._ds["update"] = self._no_update_pending()
+                return self._ds["update"]
+
+            manifest = new_version.get("manifest")
+            manifest = manifest if isinstance(manifest, dict) else {}
+            state = status.get("state") or status.get("status")
+            self._ds["update"] = {
+                "update_available": True,
+                "update_state": state if isinstance(state, str) else "unknown",
+                "update_version": new_version["version"],
+                "update_date": manifest.get("date"),
+                "update_profile": manifest.get("profile"),
+                "update_train": manifest.get("train"),
+                "update_filename": manifest.get("filename"),
+            }
+            return self._ds["update"]
+
+    async def get_disk(self) -> _EndpointMap:
+        """Refresh and return normalized disks (``disk.query``), enriched
+        with per-disk temperature readings.
+
+        Temperatures are primarily sourced from netdata's disk-temperature
+        graph (auto-discovered once and cached for the lifetime of this
+        ``TrueNASState``); disks it doesn't cover fall back to the
+        ``disk.temperatures`` RPC. Both enrichment paths are best-effort: a
+        failure leaves ``temperature`` at its previous value (or the
+        ``None`` default for a disk seen for the first time) rather than
+        failing the whole refresh, since ``disk.query`` itself is the
+        primary, required result.
+        """
+        async with self._lock:
+            self._ds["disk"] = parse_api(
+                data=self._ds["disk"],
+                source=await self._client.call("disk.query"),
+                key="identifier",
+                vals=_DISK_VALS,
+                ensure_vals=_DISK_ENSURE_VALS,
+            )
+            try:
+                await self._update_disk_temperatures()
+            except TrueNASError:
+                pass
+            return self._ds["disk"]
+
+    async def _update_disk_temperatures(self) -> None:
+        """Enrich ``self._ds["disk"]`` with temperatures.
+
+        Caller must hold ``self._lock``. A failed netdata query is caught
+        locally (rather than left to propagate to ``get_disk()``'s own
+        try/except) so the ``disk.temperatures`` fallback below still runs
+        for every disk instead of being skipped entirely.
+        """
+        try:
+            netdata_temps = await self._disk_temps_from_netdata()
+        except TrueNASError:
+            netdata_temps = None
+        if netdata_temps:
+            disk_map = self._build_disk_name_map()
+            for name, temp in netdata_temps.items():
+                if name in disk_map:
+                    self._ds["disk"][disk_map[name]]["temperature"] = round(temp, 2)
+
+        if missing := [
+            uid
+            for uid, vals in self._ds["disk"].items()
+            if vals.get("temperature") is None
+        ]:
+            await self._fallback_disk_temperatures(missing)
+
+    def _build_disk_name_map(self) -> dict[str, Hashable]:
+        """Map each disk's identifier/devname/name to its ``self._ds["disk"]`` uid."""
+        disk_map: dict[str, Hashable] = {}
+        for uid, vals in self._ds["disk"].items():
+            for key in (vals.get("identifier"), vals.get("devname"), vals.get("name")):
+                if isinstance(key, str) and key and key not in disk_map:
+                    disk_map[key] = uid
+        return disk_map
+
+    async def _disk_temps_from_netdata(self) -> dict[str, float] | None:
+        """Return per-disk temperatures from the netdata disk-temp graph, if any."""
+        if self._disk_temp_graph is None:
+            self._disk_temp_graph = await self._discover_disk_temp_graph()
+        if not self._disk_temp_graph:
+            return None
+
+        report_epoch = int(datetime.now(UTC).replace(microsecond=0).timestamp())
+        graph_data = await self._client.call(
+            "reporting.netdata_graph",
+            [
+                self._disk_temp_graph,
+                {
+                    "start": report_epoch - 90,
+                    "end": report_epoch - 30,
+                    "aggregate": True,
+                },
+            ],
+        )
+        if not isinstance(graph_data, list):
+            return None
+        return _disk_temps_from_graph_data(graph_data) or None
+
+    async def _discover_disk_temp_graph(self) -> str:
+        """Find the netdata graph name that reports disk temperatures, if any."""
+        graphs = await self._client.call("reporting.netdata_graphs")
+        if not isinstance(graphs, list):
+            return ""
+
+        for graph in graphs:
+            if not isinstance(graph, dict):
+                continue
+            name = str(graph.get("name", ""))
+            title = str(graph.get("title", "")).lower()
+            vertical = str(graph.get("vertical_label", "")).lower()
+            if ("disk" in name or "disk" in title) and (
+                "temp" in name or "temp" in title or "celsius" in vertical
+            ):
+                return name
+        return ""
+
+    async def _fallback_disk_temperatures(self, missing_uids: list[Hashable]) -> None:
+        """Fetch temperatures for ``missing_uids`` via ``disk.temperatures``."""
+        disk_names = [
+            name
+            for uid in missing_uids
+            if isinstance(name := self._ds["disk"].get(uid, {}).get("name"), str)
+            and name != "unknown"
+        ]
+        temps = await self._client.call("disk.temperatures", [disk_names])
+        if not isinstance(temps, dict):
+            return
+
+        for uid in missing_uids:
+            vals = self._ds["disk"][uid]
+            candidates = (vals.get("identifier"), vals.get("devname"), vals.get("name"))
+            matched = next(
+                (
+                    temps[key]
+                    for key in candidates
+                    if isinstance(key, str) and key in temps
+                ),
+                None,
+            )
+            if isinstance(matched, (int, float)) and not isinstance(matched, bool):
+                vals["temperature"] = matched

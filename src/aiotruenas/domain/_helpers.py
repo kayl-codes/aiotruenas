@@ -175,6 +175,36 @@ def _first_ipv4(aliases: Any) -> str:
     return "unknown"
 
 
+def _disk_temps_from_graph_data(graph_data: list[Any]) -> dict[str, float]:
+    """Extract a per-disk median temperature from a netdata disk-temp graph response.
+
+    Each entry carries a disk "identifier" and an "aggregations/mean" map of
+    per-series readings; values outside the 0-100 degC sane range are
+    discarded before taking the median, to reduce the impact of transient
+    spikes/outliers.
+    """
+    temps: dict[str, float] = {}
+    for entry in graph_data:
+        if not isinstance(entry, dict):
+            continue
+        identifier = entry.get("identifier")
+        if not identifier:
+            continue
+        mean = entry.get("aggregations", {})
+        mean = mean.get("mean") if isinstance(mean, dict) else None
+        if not isinstance(mean, dict):
+            continue
+        if valid_means := [
+            v
+            for v in mean.values()
+            if isinstance(v, (int, float))
+            and not isinstance(v, bool)
+            and 0.0 <= v <= 100.0
+        ]:
+            temps[str(identifier)] = _median(valid_means)
+    return temps
+
+
 def _parse_version_tuple(version_str: Any) -> tuple[int, int]:
     """Parse (major, minor) from a TrueNAS version string, e.g. "TrueNAS-25.10.0".
 
