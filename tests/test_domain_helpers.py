@@ -15,6 +15,7 @@ from aiotruenas.domain._helpers import (
     _arc_value,
     _as_int,
     _disk_temps_from_graph_data,
+    _is_finite_number,
     _is_virtual_machine,
     _median,
     _netdata_interface_throughput,
@@ -278,6 +279,10 @@ def test_netdata_named_means_returns_empty_dict_for_malformed_response() -> None
 def test_netdata_named_means_excludes_bool_values() -> None:
     graph_data = [{"legend": ["cpu"], "aggregations": {"mean": {"cpu": True}}}]
     assert _netdata_named_means(graph_data, ("cpu",)) == {}
+
+
+def test_is_finite_number_accepts_int_too_large_for_float() -> None:
+    assert _is_finite_number(10**400) is True
 
 
 def test_netdata_named_means_excludes_non_finite_values() -> None:

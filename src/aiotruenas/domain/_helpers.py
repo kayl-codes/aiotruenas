@@ -71,12 +71,15 @@ def _is_finite_number(value: Any) -> bool:
     Excludes ``bool`` (see ``_as_int``) and non-finite floats (``nan``,
     ``inf``, ``-inf``) -- a non-finite Netdata reading is as untrustworthy
     as a missing one and must not be cached or propagated into arithmetic.
+    An ``int`` too large to convert to ``float`` makes ``math.isfinite``
+    raise ``OverflowError``; such a value is finite but must not abort the
+    caller, so it is treated as valid without the ``math.isfinite`` check.
     """
-    return (
-        isinstance(value, (int, float))
-        and not isinstance(value, bool)
-        and math.isfinite(value)
-    )
+    if not isinstance(value, (int, float)) or isinstance(value, bool):
+        return False
+    if isinstance(value, int):
+        return True
+    return math.isfinite(value)
 
 
 def _accumulate_vdev_errors(vdev: Any, totals: dict[str, int]) -> None:
