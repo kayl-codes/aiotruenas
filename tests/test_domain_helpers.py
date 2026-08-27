@@ -334,6 +334,23 @@ def test_netdata_interface_throughput_omits_malformed_item() -> None:
     assert _netdata_interface_throughput(graph_data) == {"eno1": {}}
 
 
+def test_netdata_interface_throughput_falls_back_to_short_alias() -> None:
+    """A non-numeric raw-name value doesn't shadow a valid short-alias value.
+
+    Netdata graphs may report a series under either its long ("received"/
+    "sent") or short ("rx"/"tx") legend name; both must be tried rather than
+    stopping at whichever key happens to be present but invalid.
+    """
+    graph_data = [
+        {
+            "identifier": "eno1",
+            "legend": ["received", "rx"],
+            "aggregations": {"mean": {"received": None, "rx": 8192.0}},
+        }
+    ]
+    assert _netdata_interface_throughput(graph_data) == {"eno1": {"rx": 1000.0}}
+
+
 def test_netdata_interface_throughput_skips_entries_without_identifier() -> None:
     graph_data = ["not-a-dict", {"legend": [], "aggregations": {}}]
     assert _netdata_interface_throughput(graph_data) == {}

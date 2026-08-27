@@ -287,8 +287,16 @@ def _interface_item_throughput(item: dict[str, Any]) -> dict[str, float]:
     for raw_name, short_name in _NETDATA_INTERFACE_RENAME.items():
         if raw_name not in legend and short_name not in legend:
             continue
-        value = mean.get(raw_name, mean.get(short_name))
-        if isinstance(value, (int, float)) and not isinstance(value, bool):
+        value = next(
+            (
+                candidate
+                for candidate in (mean.get(raw_name), mean.get(short_name))
+                if isinstance(candidate, (int, float))
+                and not isinstance(candidate, bool)
+            ),
+            None,
+        )
+        if value is not None:
             throughput[short_name] = round(value * _KILOBITS_TO_KIBIBYTES, 2)
     return throughput
 
