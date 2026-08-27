@@ -1268,7 +1268,11 @@ class TrueNASState:
             )
 
             physmem = info.get("physmem")
-            if isinstance(physmem, (int, float)) and not isinstance(physmem, bool):
+            if (
+                isinstance(physmem, (int, float))
+                and not isinstance(physmem, bool)
+                and physmem > 0
+            ):
                 info["memory-total_value"] = physmem
 
             uptime_seconds = info.get("uptime_seconds")

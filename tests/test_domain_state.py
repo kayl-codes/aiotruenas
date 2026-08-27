@@ -1779,6 +1779,23 @@ async def test_get_systeminfo_normalizes_and_derives_uptime_epoch() -> None:
     assert state.ds["system_info"] == result
 
 
+async def test_get_systeminfo_keeps_previous_total_memory_on_bogus_physmem() -> None:
+    async with FakeTrueNASServer(
+        valid_api_key=API_KEY,
+        responses={"system.info": {"physmem": 16_000_000_000}},
+    ) as server:
+        async with make_client(server) as client:
+            await client.connect()
+            state = TrueNASState(client)
+            await state.get_systeminfo()
+            assert state.ds["system_info"]["memory-total_value"] == 16_000_000_000
+
+            server.responses["system.info"] = {"physmem": 0}
+            result = await state.get_systeminfo()
+
+    assert result["memory-total_value"] == 16_000_000_000
+
+
 async def test_get_systeminfo_keeps_uptime_epoch_stable_within_tolerance() -> None:
     async with FakeTrueNASServer(
         valid_api_key=API_KEY,
