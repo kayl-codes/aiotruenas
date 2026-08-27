@@ -16,11 +16,15 @@ Calls every read-only method from PROMPT.md's "must work end-to-end" list,
 both as raw `TrueNASClient.call()` RPCs and again through every
 `TrueNASState.get_*()` normalizer, to catch regressions in the domain
 normalization layer (`aiotruenas.domain`) against real API response shapes,
-not just the mocked fixtures the unit tests use. A method failing (e.g.
-`directoryservices.*` with no AD/LDAP configured, or `virt.instance.query`
-on a system still on the older `vm.query` API) is reported by name but does
-not stop the remaining methods from running — only a real connection/login
-failure aborts the script.
+not just the mocked fixtures the unit tests use. A method or normalizer
+failing (e.g. `directoryservices.*` with no AD/LDAP configured, or
+`virt.instance.query` on a system still on the older `vm.query` API) is
+reported by name and does not stop the remaining checks -- including a
+connection dropped mid-session, since `TrueNASState`'s own methods are
+designed to catch and absorb per-call `TrueNASError`s themselves rather
+than propagate them (e.g. `get_systemstats()`'s netdata-graph calls). Only
+a failure during the *initial* connection/login, before any checks run,
+aborts the script outright.
 
 `job=True` (the `core.get_jobs` polling convenience) is deliberately NOT
 exercised here: it only makes sense on a call whose result is a freshly
@@ -39,11 +43,7 @@ import sys
 from collections.abc import Awaitable, Callable
 
 from aiotruenas import TrueNASClient, TrueNASState
-from aiotruenas.exceptions import (
-    TrueNASConnectionError,
-    TrueNASError,
-    TrueNASTimeoutError,
-)
+from aiotruenas.exceptions import TrueNASError
 
 #: Read-only methods from PROMPT.md's "must work end-to-end" RPC list (the
 #: coordinator's integration-test method list), in that order. Some are
@@ -146,8 +146,6 @@ async def _check_domain_state(client: TrueNASClient) -> None:
     for name, call in calls:
         try:
             result = await call()
-        except (TrueNASConnectionError, TrueNASTimeoutError):
-            raise  # a dead/stalled connection invalidates the rest of the pass
         except Exception as exc:  # broad: probing normalizers for real-shape bugs
             failed.append(name)
             print(f"  {name}(): FAILED ({type(exc).__name__}): {exc}")
