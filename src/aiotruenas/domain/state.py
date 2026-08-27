@@ -158,6 +158,11 @@ _UPS_GRAPHS: dict[str, str] = {
 # rather than ds["system_info"], and only when that map is non-empty.
 _SYSTEMSTATS_GRAPHS: tuple[str, ...] = ("load", "cpu", "cputemp", "memory", "arcsize")
 
+# RPC method queried by get_systeminfo() and, as a lazy fallback, by
+# _detect_version()/_detect_virtual() -- a shared constant avoids the
+# duplicated-literal finding (SonarQube S1192) across those three call sites.
+_SYSTEM_INFO_METHOD = "system.info"
+
 
 def _apply_cputemp_stat(raw: Any, info: dict[str, Any]) -> None:
     temp = _netdata_max_mean(raw)
@@ -734,7 +739,7 @@ class TrueNASState:
         """
         if self._version is not None:
             return self._version
-        raw = await self._client.call("system.info")
+        raw = await self._client.call(_SYSTEM_INFO_METHOD)
         version_str = raw.get("version") if isinstance(raw, dict) else None
         version = _parse_version_tuple(version_str)
         if version != (0, 0):
@@ -751,7 +756,7 @@ class TrueNASState:
         """
         if self._is_virtual is not None:
             return self._is_virtual
-        raw = await self._client.call("system.info")
+        raw = await self._client.call(_SYSTEM_INFO_METHOD)
         manufacturer = raw.get("system_manufacturer") if isinstance(raw, dict) else None
         product = raw.get("system_product") if isinstance(raw, dict) else None
         self._is_virtual = _is_virtual_machine(manufacturer, product)
@@ -1249,7 +1254,7 @@ class TrueNASState:
         async with self._lock:
             self._ds["system_info"] = parse_api(
                 data=self._ds["system_info"],
-                source=await self._client.call("system.info"),
+                source=await self._client.call(_SYSTEM_INFO_METHOD),
                 vals=_SYSTEMINFO_VALS,
                 ensure_vals=_SYSTEMINFO_ENSURE_VALS,
             )
