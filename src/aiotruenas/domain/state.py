@@ -30,6 +30,7 @@ from ._helpers import (
     _cpuset_size,
     _disk_temps_from_graph_data,
     _first_ipv4,
+    _is_finite_number,
     _is_virtual_machine,
     _netdata_interface_throughput,
     _netdata_max_mean,
@@ -1272,11 +1273,7 @@ class TrueNASState:
             )
 
             physmem = info.get("physmem")
-            if (
-                isinstance(physmem, (int, float))
-                and not isinstance(physmem, bool)
-                and physmem > 0
-            ):
+            if _is_finite_number(physmem) and physmem > 0:
                 info["memory-total_value"] = physmem
 
             uptime_seconds = info.get("uptime_seconds")

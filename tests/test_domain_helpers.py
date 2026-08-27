@@ -350,6 +350,17 @@ def test_netdata_interface_throughput_omits_malformed_item() -> None:
     assert _netdata_interface_throughput(graph_data) == {"eno1": {}}
 
 
+def test_netdata_interface_throughput_omits_non_finite_values() -> None:
+    graph_data = [
+        {
+            "identifier": "eno1",
+            "legend": ["received", "sent"],
+            "aggregations": {"mean": {"received": float("nan"), "sent": float("inf")}},
+        }
+    ]
+    assert _netdata_interface_throughput(graph_data) == {"eno1": {}}
+
+
 def test_netdata_interface_throughput_falls_back_to_short_alias() -> None:
     """A non-numeric raw-name value doesn't shadow a valid short-alias value.
 

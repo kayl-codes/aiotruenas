@@ -1796,6 +1796,26 @@ async def test_get_systeminfo_keeps_previous_total_memory_on_bogus_physmem() -> 
     assert result["memory-total_value"] == 16_000_000_000
 
 
+async def test_get_systeminfo_keeps_previous_total_memory_on_infinite_physmem() -> None:
+    """A non-finite physmem must not be cached, since a later usage-percent
+    calculation (100 * (total - available) / total) would produce nan for
+    an infinite total, and round(nan) (no ndigits) raises ValueError.
+    """
+    async with FakeTrueNASServer(
+        valid_api_key=API_KEY,
+        responses={"system.info": {"physmem": 16_000_000_000}},
+    ) as server:
+        async with make_client(server) as client:
+            await client.connect()
+            state = TrueNASState(client)
+            await state.get_systeminfo()
+
+            server.responses["system.info"] = {"physmem": float("inf")}
+            result = await state.get_systeminfo()
+
+    assert result["memory-total_value"] == 16_000_000_000
+
+
 async def test_get_systeminfo_keeps_uptime_epoch_stable_within_tolerance() -> None:
     async with FakeTrueNASServer(
         valid_api_key=API_KEY,

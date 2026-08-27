@@ -302,8 +302,7 @@ def _interface_item_throughput(item: dict[str, Any]) -> dict[str, float]:
             (
                 candidate
                 for candidate in (mean.get(raw_name), mean.get(short_name))
-                if isinstance(candidate, (int, float))
-                and not isinstance(candidate, bool)
+                if _is_finite_number(candidate)
             ),
             None,
         )
