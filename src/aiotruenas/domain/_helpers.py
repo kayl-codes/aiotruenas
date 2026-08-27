@@ -232,11 +232,8 @@ def _netdata_named_means(graph_data: Any, names: tuple[str, ...]) -> dict[str, f
         if name not in legend:
             continue
         value = mean.get(name) if isinstance(mean, dict) else None
-        result[name] = (
-            float(value)
-            if isinstance(value, (int, float)) and not isinstance(value, bool)
-            else 0.0
-        )
+        if isinstance(value, (int, float)) and not isinstance(value, bool):
+            result[name] = float(value)
     return result
 
 
@@ -274,17 +271,19 @@ _NETDATA_INTERFACE_RENAME = {"received": "rx", "sent": "tx"}
 def _interface_item_throughput(item: dict[str, Any]) -> dict[str, float]:
     """Return one netdata "interface" graph item's rx/tx throughput (KiB/s).
 
-    Falls back to ``{"rx": 0.0, "tx": 0.0}`` for a malformed/missing legend
-    or aggregations -- a live-but-unreadable-this-round interface, not a
-    reason to skip it entirely.
+    Returns only the keys with a valid numeric reading; a malformed/missing
+    legend or aggregations, or an individual missing/invalid series, is
+    simply absent from the result -- so a caller applying this via ``dict.
+    update()`` leaves the previously cached value for that key untouched
+    instead of resetting it to zero.
     """
-    throughput = {"rx": 0.0, "tx": 0.0}
     legend = item.get("legend")
     aggregations = item.get("aggregations")
     mean = aggregations.get("mean") if isinstance(aggregations, dict) else None
     if not isinstance(legend, list) or not isinstance(mean, dict):
-        return throughput
+        return {}
 
+    throughput: dict[str, float] = {}
     for raw_name, short_name in _NETDATA_INTERFACE_RENAME.items():
         if raw_name not in legend and short_name not in legend:
             continue

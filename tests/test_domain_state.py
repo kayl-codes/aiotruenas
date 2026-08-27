@@ -1927,6 +1927,47 @@ async def test_get_systemstats_enriches_interface_throughput() -> None:
     assert state.ds["interface"]["eno1"]["tx"] == 500.0
 
 
+async def test_get_systemstats_keeps_previous_throughput_on_malformed_item() -> None:
+    raw_interfaces = [
+        {"id": "eno1", "name": "eno1", "state": {"link_state": "LINK_STATE_UP"}}
+    ]
+    call_count = 0
+
+    def netdata_graph(params: list) -> Any:
+        nonlocal call_count
+        if params[0] != "interface":
+            return None
+        call_count += 1
+        if call_count == 1:
+            return [
+                {
+                    "identifier": "eno1",
+                    "legend": ["received", "sent"],
+                    "aggregations": {"mean": {"received": 8192.0, "sent": 4096.0}},
+                }
+            ]
+        return [{"identifier": "eno1"}]
+
+    async with FakeTrueNASServer(
+        valid_api_key=API_KEY,
+        responses={
+            "interface.query": raw_interfaces,
+            "reporting.netdata_graph": netdata_graph,
+        },
+    ) as server:
+        async with make_client(server) as client:
+            await client.connect()
+            state = TrueNASState(client)
+            await state.get_interface()
+            await state.get_systemstats()
+            assert state.ds["interface"]["eno1"]["rx"] == 1000.0
+
+            await state.get_systemstats()
+
+    assert state.ds["interface"]["eno1"]["rx"] == 1000.0
+    assert state.ds["interface"]["eno1"]["tx"] == 500.0
+
+
 async def test_get_systemstats_skips_interface_query_without_prior_get_interface() -> (
     None
 ):

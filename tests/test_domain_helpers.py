@@ -247,10 +247,15 @@ def test_netdata_named_means_extracts_only_requested_legend_entries() -> None:
     }
 
 
-def test_netdata_named_means_defaults_present_legend_entry_to_zero() -> None:
-    """A legend entry with no matching mean value is a legitimate zero reading."""
+def test_netdata_named_means_omits_present_legend_entry_with_missing_value() -> None:
+    """A legend entry with no matching mean value is omitted, not zeroed.
+
+    Callers rely on the name being absent (rather than defaulted to 0.0) to
+    tell a malformed reading apart from a legitimately-reported zero and
+    leave their previous cached value untouched.
+    """
     graph_data = [{"legend": ["cpu"], "aggregations": {"mean": {}}}]
-    assert _netdata_named_means(graph_data, ("cpu",)) == {"cpu": 0.0}
+    assert _netdata_named_means(graph_data, ("cpu",)) == {}
 
 
 def test_netdata_named_means_omits_name_absent_from_legend() -> None:
@@ -272,7 +277,7 @@ def test_netdata_named_means_returns_empty_dict_for_malformed_response() -> None
 
 def test_netdata_named_means_excludes_bool_values() -> None:
     graph_data = [{"legend": ["cpu"], "aggregations": {"mean": {"cpu": True}}}]
-    assert _netdata_named_means(graph_data, ("cpu",)) == {"cpu": 0.0}
+    assert _netdata_named_means(graph_data, ("cpu",)) == {}
 
 
 # ---------------------------
@@ -311,16 +316,22 @@ def test_netdata_interface_throughput_converts_kilobits_to_kibibytes() -> None:
     }
 
 
-def test_netdata_interface_throughput_defaults_missing_series_to_zero() -> None:
+def test_netdata_interface_throughput_omits_missing_series() -> None:
+    """A present-but-valueless series is omitted, not zeroed.
+
+    ``get_systemstats()`` applies this via ``dict.update()``, so an omitted
+    key leaves the interface's previously cached value for that key
+    untouched instead of resetting it to zero.
+    """
     graph_data = [
         {"identifier": "eno1", "legend": ["received"], "aggregations": {"mean": {}}}
     ]
-    assert _netdata_interface_throughput(graph_data) == {"eno1": {"rx": 0.0, "tx": 0.0}}
+    assert _netdata_interface_throughput(graph_data) == {"eno1": {}}
 
 
-def test_netdata_interface_throughput_defaults_malformed_item_to_zero() -> None:
+def test_netdata_interface_throughput_omits_malformed_item() -> None:
     graph_data = [{"identifier": "eno1"}]
-    assert _netdata_interface_throughput(graph_data) == {"eno1": {"rx": 0.0, "tx": 0.0}}
+    assert _netdata_interface_throughput(graph_data) == {"eno1": {}}
 
 
 def test_netdata_interface_throughput_skips_entries_without_identifier() -> None:
