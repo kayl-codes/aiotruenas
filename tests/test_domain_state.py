@@ -1833,6 +1833,48 @@ async def test_get_systeminfo_preserves_previous_values_on_malformed_response() 
     assert result is previous
 
 
+async def test_get_systeminfo_preserves_previous_values_on_list_response() -> None:
+    """A malformed list-shaped ``system.info`` response is rejected outright.
+
+    Unlike a scalar/``None`` response (already caught by ``parse_api()``
+    itself), a list of dicts would otherwise be accepted as ordinary
+    multi-entry source data and applied to the singleton state entry by
+    entry, letting unexpected extra entries silently overwrite cached
+    fields.
+    """
+    async with FakeTrueNASServer(
+        valid_api_key=API_KEY,
+        responses={"system.info": {"hostname": "truenas", "uptime_seconds": 500}},
+    ) as server:
+        async with make_client(server) as client:
+            await client.connect()
+            state = TrueNASState(client)
+            await state.get_systeminfo()
+            previous = state.ds["system_info"]
+
+            server.responses["system.info"] = [
+                {"hostname": "bogus1"},
+                {"hostname": "bogus2"},
+            ]
+            result = await state.get_systeminfo()
+
+    assert result["hostname"] == "truenas"
+    assert result is previous
+
+
+async def test_get_systeminfo_derives_uptime_epoch_from_zero_uptime() -> None:
+    async with FakeTrueNASServer(
+        valid_api_key=API_KEY,
+        responses={"system.info": {"uptime_seconds": 0}},
+    ) as server:
+        async with make_client(server) as client:
+            await client.connect()
+            state = TrueNASState(client)
+            result = await state.get_systeminfo()
+
+    assert result["uptimeEpoch"] > 0
+
+
 async def test_get_systemstats_updates_load_cpu_memory_arc_and_cputemp() -> None:
     def netdata_graph(params: list) -> Any:
         graph_name = params[0]

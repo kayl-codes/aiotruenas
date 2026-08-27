@@ -1252,9 +1252,12 @@ class TrueNASState:
         better-normalized ``get_update()``/``get_smb()`` endpoints.
         """
         async with self._lock:
+            raw = await self._client.call(_SYSTEM_INFO_METHOD)
+            if not isinstance(raw, dict):
+                return self._ds["system_info"]
             self._ds["system_info"] = parse_api(
                 data=self._ds["system_info"],
-                source=await self._client.call(_SYSTEM_INFO_METHOD),
+                source=raw,
                 vals=_SYSTEMINFO_VALS,
                 ensure_vals=_SYSTEMINFO_ENSURE_VALS,
             )
@@ -1279,7 +1282,7 @@ class TrueNASState:
             if (
                 isinstance(uptime_seconds, (int, float))
                 and not isinstance(uptime_seconds, bool)
-                and uptime_seconds > 0
+                and uptime_seconds >= 0
             ):
                 now_epoch = int(datetime.now(UTC).replace(microsecond=0).timestamp())
                 info["uptimeEpoch"] = _stable_uptime_epoch(
