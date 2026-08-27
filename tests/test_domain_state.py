@@ -2123,3 +2123,32 @@ async def test_get_systemstats_keeps_previous_value_when_graph_query_raises() ->
             await state.get_systemstats()
 
     assert state.ds["system_info"]["cpu_usage"] == 20.0
+
+
+async def test_get_systemstats_queries_graphs_when_virtual_detection_fails() -> None:
+    """A failed lazy ``system.info`` (virtualization detection) call must not
+    abort the rest of ``get_systemstats()`` -- each netdata graph is
+    independent and best-effort, matching every other failure mode this
+    endpoint already tolerates.
+    """
+    async with FakeTrueNASServer(
+        valid_api_key=API_KEY,
+        responses={
+            "system.info": {
+                "error": {
+                    "code": -32603,
+                    "message": "Internal error",
+                    "data": {"error": 1, "errname": "EFAULT", "reason": None},
+                }
+            },
+            "reporting.netdata_graph": lambda params: [
+                {"legend": ["cpu"], "aggregations": {"mean": {"cpu": 20.0}}}
+            ],
+        },
+    ) as server:
+        async with make_client(server) as client:
+            await client.connect()
+            state = TrueNASState(client)
+            result = await state.get_systemstats()
+
+    assert result["cpu_usage"] == 20.0

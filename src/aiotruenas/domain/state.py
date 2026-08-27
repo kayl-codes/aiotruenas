@@ -1304,9 +1304,10 @@ class TrueNASState:
         previous value rather than resetting to zero, matching this
         library's other endpoints. CPU temperature is skipped entirely on a
         virtualized system (see ``get_systeminfo()``) -- no physical sensor
-        to report. Interface throughput is skipped entirely if
-        ``get_interface()`` hasn't populated ``ds["interface"]`` yet
-        (nothing to attribute it to).
+        to report; a failure detecting that (see ``_detect_virtual()``) is
+        treated as non-virtual so it does not abort the graph queries below.
+        Interface throughput is skipped entirely if ``get_interface()``
+        hasn't populated ``ds["interface"]`` yet (nothing to attribute it to).
         """
         async with self._lock:
             report_epoch = int(datetime.now(UTC).replace(microsecond=0).timestamp())
@@ -1316,7 +1317,10 @@ class TrueNASState:
                 "aggregate": True,
             }
             info = self._ds["system_info"]
-            is_virtual = await self._detect_virtual()
+            try:
+                is_virtual = await self._detect_virtual()
+            except TrueNASError:
+                is_virtual = False
 
             for graph_name in _SYSTEMSTATS_GRAPHS:
                 if graph_name == "cputemp" and is_virtual:
