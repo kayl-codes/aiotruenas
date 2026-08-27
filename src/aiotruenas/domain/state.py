@@ -18,7 +18,7 @@ from __future__ import annotations
 
 import asyncio
 import copy
-from collections.abc import Hashable
+from collections.abc import Callable, Hashable
 from datetime import UTC, datetime
 from typing import Any, TypedDict, cast
 
@@ -157,6 +157,57 @@ _UPS_GRAPHS: dict[str, str] = {
 # separately (see get_systemstats()) since it enriches ds["interface"]
 # rather than ds["system_info"], and only when that map is non-empty.
 _SYSTEMSTATS_GRAPHS: tuple[str, ...] = ("load", "cpu", "cputemp", "memory", "arcsize")
+
+
+def _apply_cputemp_stat(raw: Any, info: dict[str, Any]) -> None:
+    temp = _netdata_max_mean(raw)
+    if temp is not None:
+        info["cpu_temperature"] = temp
+
+
+def _apply_load_stat(raw: Any, info: dict[str, Any]) -> None:
+    means = _netdata_named_means(raw, ("shortterm", "midterm", "longterm"))
+    for series, field in (
+        ("shortterm", "load_shortterm"),
+        ("midterm", "load_midterm"),
+        ("longterm", "load_longterm"),
+    ):
+        if series in means:
+            info[field] = round(means[series], 2)
+
+
+def _apply_cpu_stat(raw: Any, info: dict[str, Any]) -> None:
+    means = _netdata_named_means(raw, ("cpu",))
+    if "cpu" in means:
+        info["cpu_usage"] = round(means["cpu"], 2)
+
+
+def _apply_arcsize_stat(raw: Any, info: dict[str, Any]) -> None:
+    means = _netdata_named_means(raw, ("size",))
+    if "size" in means:
+        info["cache_size-arc_value"] = round(means["size"], 2)
+
+
+def _apply_memory_stat(raw: Any, info: dict[str, Any]) -> None:
+    means = _netdata_named_means(raw, ("available",))
+    if "available" not in means:
+        return
+    info["memory-free_value"] = round(means["available"], 2)
+    total = info.get("memory-total_value", 0)
+    if isinstance(total, (int, float)) and not isinstance(total, bool) and total > 0:
+        info["memory-usage_percent"] = round(100 * (total - means["available"]) / total)
+
+
+# Dispatch table for _apply_systemstat(): keeps that method's cognitive
+# complexity low by moving each graph's field-mapping logic into its own
+# small, independently-testable function (SonarQube S3776).
+_SYSTEMSTAT_HANDLERS: dict[str, Callable[[Any, dict[str, Any]], None]] = {
+    "cputemp": _apply_cputemp_stat,
+    "load": _apply_load_stat,
+    "cpu": _apply_cpu_stat,
+    "arcsize": _apply_arcsize_stat,
+    "memory": _apply_memory_stat,
+}
 
 # Maps a service.query "service" id to its human-friendly display name, used
 # as a fallback when the API's own "name" field is missing/"unknown".
@@ -1265,46 +1316,6 @@ class TrueNASState:
         self, graph_name: str, raw: Any, info: dict[str, Any]
     ) -> None:
         """Apply one netdata graph reading onto ``info`` (``ds["system_info"]``)."""
-        if graph_name == "cputemp":
-            temp = _netdata_max_mean(raw)
-            if temp is not None:
-                info["cpu_temperature"] = temp
-            return
-
-        if graph_name == "load":
-            means = _netdata_named_means(raw, ("shortterm", "midterm", "longterm"))
-            for series, field in (
-                ("shortterm", "load_shortterm"),
-                ("midterm", "load_midterm"),
-                ("longterm", "load_longterm"),
-            ):
-                if series in means:
-                    info[field] = round(means[series], 2)
-            return
-
-        if graph_name == "cpu":
-            means = _netdata_named_means(raw, ("cpu",))
-            if "cpu" in means:
-                info["cpu_usage"] = round(means["cpu"], 2)
-            return
-
-        if graph_name == "arcsize":
-            means = _netdata_named_means(raw, ("size",))
-            if "size" in means:
-                info["cache_size-arc_value"] = round(means["size"], 2)
-            return
-
-        if graph_name == "memory":
-            means = _netdata_named_means(raw, ("available",))
-            if "available" not in means:
-                return
-            info["memory-free_value"] = round(means["available"], 2)
-            total = info.get("memory-total_value", 0)
-            if (
-                isinstance(total, (int, float))
-                and not isinstance(total, bool)
-                and total > 0
-            ):
-                info["memory-usage_percent"] = round(
-                    100 * (total - means["available"]) / total
-                )
+        handler = _SYSTEMSTAT_HANDLERS.get(graph_name)
+        if handler is not None:
+            handler(raw, info)
