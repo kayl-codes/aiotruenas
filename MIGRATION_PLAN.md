@@ -178,8 +178,9 @@ Commit/Push/PR ohne explizite Freigabe.
   aus dem Coordinator-Original bleibt dort — die Library fragt/normalisiert unbedingt, sobald
   ein Directory-Service konfiguriert+aktiviert ist. Damit ist Schritt 4 (a–d) vollständig
   abgeschlossen.
-- 🚧 Schritt 5 — Restliche PROMPT.md-Pflichtendpoints (`get_interface()`/`get_disk()`/
-  `get_scrub()`/`get_smb()`/`get_update()` auf `TrueNASState`): PR in Arbeit. `core.get_jobs` aus
+- ✅ Schritt 5 — Restliche PROMPT.md-Pflichtendpoints (`get_interface()`/`get_disk()`/
+  `get_scrub()`/`get_smb()`/`get_update()` auf `TrueNASState`): PR #22, gemerged, v1.4.0 (noch
+  kein Release). `core.get_jobs` aus
   PROMPT.md's 23er-Liste war bereits durch `TrueNASClient.call(..., job=True)` abgedeckt und
   brauchte keinen eigenen `get_*()`. `get_interface()` liefert `interface.query` +
   abgeleitetes `link_up`; Live-`rx`/`tx`-Durchsatz bleibt bewusst außen vor (siehe
@@ -197,8 +198,34 @@ Commit/Push/PR ohne explizite Freigabe.
   (kombinierte Multi-Graph-Netdata-Abfrage über mehrere hundert Zeilen im Coordinator-Original).
   `system.info` selbst ist über den bereits vorhandenen generischen `call()` nutzbar und erfüllt
   damit PROMPT.md's Anforderung ("MUSS end-to-end funktionieren"); nur das gecachte, angereicherte
-  `TrueNASState`-Äquivalent fehlt noch. Rückfrage an den Nutzer, ob das als eigener Schritt 6
-  folgt oder der Migrationsplan hier als abgeschlossen gilt.
+  `TrueNASState`-Äquivalent fehlt noch. Rückfrage an den Nutzer (2026-08-27): Schritt 6 zuerst
+  umsetzen, dann gemeinsam releasen — siehe unten.
+- ✅ Schritt 6 — `get_systeminfo()` + `get_systemstats()` auf `TrueNASState`, letzter fehlender
+  Endpunkt aus PROMPT.md's 23er-Liste. Version bleibt bei v1.4.0 (noch kein Release; alles bisher
+  nur auf `main`) — kein weiterer Patch-Bump, da dies laut Nutzer-Entscheidung derselbe
+  Release-Batch wie Schritt 1–5 ist. `get_systeminfo()` (`system.info`) ist ein flacher Singleton
+  wie `arc`/`ups`/`alerts`/`update`/`smb` (kein natürlicher Objekt-Key); leitet `uptimeEpoch` aus
+  `uptime_seconds` her (gedämpft gegen Poll-Jitter, `_stable_uptime_epoch()`, Toleranz 5 Minuten),
+  cacht `_is_virtual` (Hersteller/Produkt-Heuristik für `get_systemstats()`, um die
+  `cputemp`-Graph auf VMs zu überspringen) und das geparste `(major, minor)` — spart
+  `get_container()`s eigenem `_detect_version()` einen redundanten `system.info`-Aufruf, sobald
+  `get_systeminfo()` bereits gelaufen ist. Update-Status- und SMB-Verbindungsfelder, die der
+  Original-Coordinator ebenfalls auf `ds["system_info"]` ablegt, werden bewusst nicht dupliziert
+  — dafür gibt es bereits die eigenständigen, besser normalisierten `get_update()`/`get_smb()`.
+  `get_systemstats()` fragt jeden Netdata-Graph (`load`/`cpu`/`cputemp`/`memory`/`arcsize`,
+  optional `interface`) einzeln ab (analog zu `get_arc()`/`get_ups()`s Pro-Graph-Muster statt des
+  Original-Coordinators kombinierter Multi-Graph-Batch-Abfrage) und wendet jeden best-effort an:
+  ein fehlerhafter/ausgefallener einzelner Graph lässt das betroffene Feld beim vorigen Wert statt
+  es auf 0 zurückzusetzen (Divergenz vom Original, aber konsistent mit dem in Schritt 4/5
+  etablierten Bibliotheks-Verhalten). Schreibt neben `ds["system_info"]` auch in
+  `ds["interface"][id]["rx"/"tx"]` (Seiteneffekt, dokumentiert in `_INTERFACE_VALS`s Docstring);
+  wird übersprungen, wenn `get_interface()` noch nicht gelaufen ist. Neue reine Helfer in
+  `_helpers.py`: `_netdata_named_means()` (Mehrfach-Serien-Extraktion für load/cpu/memory/arcsize,
+  im Gegensatz zu `_netdata_mean_value()`s Einzelserien-Mittelwert), `_netdata_max_mean()`
+  (Maximum statt Mittelwert, für die heißeste CPU-Kern-Temperatur), `_netdata_interface_throughput()`
+  (received/sent → rx/tx, Kilobit/s → KiB/s via Faktor 1000/8192), `_is_virtual_machine()` und
+  `_stable_uptime_epoch()`. Damit ist der komplette Migrationsplan (Schritt 1–6) abgeschlossen —
+  nächster Schritt ist ein gemeinsames Release für v1.4.0.
 
 ## Zu klärende/entscheidende Punkte (Antworten auf die 3 Nutzerfragen)
 

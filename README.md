@@ -66,15 +66,18 @@ async with TrueNASClient("truenas.local", "1-abcdef...") as client:
 Supported endpoints so far: `get_pool()`, `get_dataset()`, `get_cloudsync()`, `get_replication()`,
 `get_rsync()`, `get_snapshottask()`, `get_cronjob()`, `get_arc()`, `get_ups()`, `get_service()`,
 `get_vm()`, `get_container()`, `get_app()`, `get_certificates()`, `get_directoryservices()`,
-`get_alerts()`, `get_interface()`, `get_disk()`, `get_scrub()`, `get_smb()`, `get_update()`. This
-covers all RPC methods on PROMPT.md's required list except `get_systeminfo()` (`system.info`'s
-cached, enriched `TrueNASState` equivalent — usable today via the generic `call()` surface) — see
-[MIGRATION_PLAN.md](MIGRATION_PLAN.md) for details and history.
+`get_alerts()`, `get_interface()`, `get_disk()`, `get_scrub()`, `get_smb()`, `get_update()`,
+`get_systeminfo()`, `get_systemstats()`. This covers the full endpoint set migrated from consumer
+integrations' own normalization code — see [MIGRATION_PLAN.md](MIGRATION_PLAN.md) for details and
+history.
 
-`get_arc()`/`get_ups()`/`get_alerts()`/`get_smb()`/`get_update()` are the exception to the
-dict-keyed-by-id shape above: they have no natural object id and instead return a flat dict of
-scalar/aggregate readings (e.g. `{"battery_charge": 80.0, ...}`, `{"count": 2, "critical": 1, ...}`
-for alerts, or `{"connections": 3}` for `get_smb()`).
+`get_arc()`/`get_ups()`/`get_alerts()`/`get_smb()`/`get_update()`/`get_systeminfo()` are the
+exception to the dict-keyed-by-id shape above: they have no natural object id and instead return a
+flat dict of scalar/aggregate readings (e.g. `{"battery_charge": 80.0, ...}`,
+`{"count": 2, "critical": 1, ...}` for alerts, or `{"connections": 3}` for `get_smb()`).
+`get_systemstats()` enriches that same flat `ds["system_info"]` dict (CPU/load/memory/ARC-size)
+and, as a side effect, `ds["interface"][id]["rx"/"tx"]` (interface throughput) rather than
+returning its own endpoint.
 
 ## Status
 

@@ -205,6 +205,140 @@ def _disk_temps_from_graph_data(graph_data: list[Any]) -> dict[str, float]:
     return temps
 
 
+def _netdata_named_means(graph_data: Any, names: tuple[str, ...]) -> dict[str, float]:
+    """Extract named per-series mean values from a netdata graph response.
+
+    Unlike ``_netdata_mean_value`` (which averages all series into one
+    scalar, for single-metric graphs), this looks up each of ``names``
+    individually by its "legend" entry -- for multi-series graphs like
+    "load" (shortterm/midterm/longterm) or "memory" (available). A name
+    missing from a malformed/missing response is simply absent from the
+    result (rather than defaulted to 0.0), so the caller can tell that apart
+    from a legitimately-reported zero and leave its previous cached value
+    untouched instead of resetting it.
+    """
+    if not isinstance(graph_data, list) or not graph_data:
+        return {}
+    item = graph_data[0]
+    if not isinstance(item, dict):
+        return {}
+    legend = item.get("legend")
+    aggregations = item.get("aggregations")
+    if not isinstance(legend, list) or not isinstance(aggregations, dict):
+        return {}
+    mean = aggregations.get("mean")
+    result: dict[str, float] = {}
+    for name in names:
+        if name not in legend:
+            continue
+        value = mean.get(name) if isinstance(mean, dict) else None
+        result[name] = (
+            float(value)
+            if isinstance(value, (int, float)) and not isinstance(value, bool)
+            else 0.0
+        )
+    return result
+
+
+def _netdata_max_mean(graph_data: Any) -> float | None:
+    """Return the highest per-series mean value in a netdata graph response.
+
+    Used for CPU temperature, where each series is one core/sensor and the
+    hottest one is the value of interest -- unlike ``_netdata_mean_value``,
+    which averages series together.
+    """
+    if not isinstance(graph_data, list) or not graph_data:
+        return None
+    item = graph_data[0]
+    if not isinstance(item, dict):
+        return None
+    aggregations = item.get("aggregations")
+    mean = aggregations.get("mean") if isinstance(aggregations, dict) else None
+    if not isinstance(mean, dict):
+        return None
+    valid_means = [
+        v
+        for v in mean.values()
+        if isinstance(v, (int, float)) and not isinstance(v, bool)
+    ]
+    return round(max(valid_means), 2) if valid_means else None
+
+
+# Netdata reports interface throughput in kilobits/s; TrueNAS's own UI (and
+# the coordinator original) shows it in KiB/s. 1000 / 8192 converts between
+# the two (1000 bits/kilobit, 8192 bits/KiB).
+_KILOBITS_TO_KIBIBYTES = 1000 / 8192
+_NETDATA_INTERFACE_RENAME = {"received": "rx", "sent": "tx"}
+
+
+def _interface_item_throughput(item: dict[str, Any]) -> dict[str, float]:
+    """Return one netdata "interface" graph item's rx/tx throughput (KiB/s).
+
+    Falls back to ``{"rx": 0.0, "tx": 0.0}`` for a malformed/missing legend
+    or aggregations -- a live-but-unreadable-this-round interface, not a
+    reason to skip it entirely.
+    """
+    throughput = {"rx": 0.0, "tx": 0.0}
+    legend = item.get("legend")
+    aggregations = item.get("aggregations")
+    mean = aggregations.get("mean") if isinstance(aggregations, dict) else None
+    if not isinstance(legend, list) or not isinstance(mean, dict):
+        return throughput
+
+    for raw_name, short_name in _NETDATA_INTERFACE_RENAME.items():
+        if raw_name not in legend and short_name not in legend:
+            continue
+        value = mean.get(raw_name, mean.get(short_name))
+        if isinstance(value, (int, float)) and not isinstance(value, bool):
+            throughput[short_name] = round(value * _KILOBITS_TO_KIBIBYTES, 2)
+    return throughput
+
+
+def _netdata_interface_throughput(graph_data: Any) -> dict[str, dict[str, float]]:
+    """Extract per-interface rx/tx throughput (KiB/s) from a netdata
+    "interface" graph response.
+
+    Each response item covers one interface, identified by its
+    "identifier". Netdata's raw legend/mean keys ("received"/"sent") are
+    renamed to "rx"/"tx". Returns an empty dict for a missing/malformed
+    response (RPC failure).
+    """
+    if not isinstance(graph_data, list):
+        return {}
+    result: dict[str, dict[str, float]] = {}
+    for item in graph_data:
+        if not isinstance(item, dict):
+            continue
+        identifier = item.get("identifier")
+        if isinstance(identifier, str) and identifier:
+            result[identifier] = _interface_item_throughput(item)
+    return result
+
+
+_VIRTUAL_MANUFACTURERS = {"QEMU", "VMware, Inc.", "Microsoft Corporation", "Xen"}
+_VIRTUAL_PRODUCTS = {"VirtualBox", "Virtual Machine"}
+
+
+def _is_virtual_machine(manufacturer: Any, product: Any) -> bool:
+    """Return True if system.info's manufacturer/product indicates a VM."""
+    return manufacturer in _VIRTUAL_MANUFACTURERS or product in _VIRTUAL_PRODUCTS
+
+
+def _stable_uptime_epoch(
+    previous_epoch: Any, uptime_seconds: float, now_epoch: int, tolerance: int = 300
+) -> int:
+    """Return a boot-time epoch derived from ``uptime_seconds``, damped against jitter.
+
+    Only adopts the newly computed epoch (``now_epoch - uptime_seconds``) if
+    it differs from ``previous_epoch`` by more than ``tolerance`` seconds --
+    small per-poll timing variance would otherwise make an uptime sensor
+    jump around by a few seconds on every refresh.
+    """
+    new_epoch = int(now_epoch - uptime_seconds)
+    previous = previous_epoch if isinstance(previous_epoch, (int, float)) else 0
+    return new_epoch if abs(new_epoch - previous) > tolerance else int(previous)
+
+
 def _parse_version_tuple(version_str: Any) -> tuple[int, int]:
     """Parse (major, minor) from a TrueNAS version string, e.g. "TrueNAS-25.10.0".
 
