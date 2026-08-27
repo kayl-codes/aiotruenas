@@ -281,8 +281,8 @@ def test_netdata_named_means_excludes_bool_values() -> None:
     assert _netdata_named_means(graph_data, ("cpu",)) == {}
 
 
-def test_is_finite_number_accepts_int_too_large_for_float() -> None:
-    assert _is_finite_number(10**400) is True
+def test_is_finite_number_rejects_int_too_large_for_float() -> None:
+    assert _is_finite_number(10**400) is False
 
 
 def test_netdata_named_means_excludes_non_finite_values() -> None:
@@ -293,6 +293,12 @@ def test_netdata_named_means_excludes_non_finite_values() -> None:
         }
     ]
     assert _netdata_named_means(graph_data, ("cpu", "load")) == {}
+
+
+def test_netdata_named_means_excludes_int_too_large_for_float() -> None:
+    """An oversized int must not raise (float() would OverflowError)."""
+    graph_data = [{"legend": ["cpu"], "aggregations": {"mean": {"cpu": 10**400}}}]
+    assert _netdata_named_means(graph_data, ("cpu",)) == {}
 
 
 # ---------------------------
@@ -366,6 +372,18 @@ def test_netdata_interface_throughput_omits_non_finite_values() -> None:
     assert _netdata_interface_throughput(graph_data) == {"eno1": {}}
 
 
+def test_netdata_interface_throughput_omits_int_too_large_for_float() -> None:
+    """An oversized int must not raise (int * float would OverflowError)."""
+    graph_data = [
+        {
+            "identifier": "eno1",
+            "legend": ["received", "sent"],
+            "aggregations": {"mean": {"received": 10**400, "sent": 10**400}},
+        }
+    ]
+    assert _netdata_interface_throughput(graph_data) == {"eno1": {}}
+
+
 def test_netdata_interface_throughput_falls_back_to_short_alias() -> None:
     """A non-numeric raw-name value doesn't shadow a valid short-alias value.
 
@@ -410,6 +428,11 @@ def test_is_virtual_machine(manufacturer: str, product: str, expected: bool) -> 
     assert _is_virtual_machine(manufacturer, product) is expected
 
 
+def test_is_virtual_machine_rejects_unhashable_metadata() -> None:
+    """A malformed list value must not raise (set membership needs hashable)."""
+    assert _is_virtual_machine(["QEMU"], ["Standard PC"]) is False
+
+
 # ---------------------------
 #   _stable_uptime_epoch
 # ---------------------------
@@ -434,3 +457,9 @@ def test_stable_uptime_epoch_rejects_non_finite_uptime() -> None:
     previous = 100_000
     assert _stable_uptime_epoch(previous, float("nan"), 200_000) == previous
     assert _stable_uptime_epoch(previous, float("inf"), 200_000) == previous
+
+
+def test_stable_uptime_epoch_rejects_int_too_large_for_float() -> None:
+    """An oversized int must not raise (math.isfinite() would OverflowError)."""
+    previous = 100_000
+    assert _stable_uptime_epoch(previous, 10**400, 200_000) == previous

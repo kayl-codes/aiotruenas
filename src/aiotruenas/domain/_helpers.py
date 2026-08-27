@@ -66,20 +66,20 @@ def _to_int(value: Any, default: int = 0) -> int:
 
 
 def _is_finite_number(value: Any) -> bool:
-    """Return True if value is a real, finite int/float.
+    """Return True if value is a real, finite int/float usable in float arithmetic.
 
-    Excludes ``bool`` (see ``_as_int``) and non-finite floats (``nan``,
-    ``inf``, ``-inf``) -- a non-finite Netdata reading is as untrustworthy
-    as a missing one and must not be cached or propagated into arithmetic.
-    An ``int`` too large to convert to ``float`` makes ``math.isfinite``
-    raise ``OverflowError``; such a value is finite but must not abort the
-    caller, so it is treated as valid without the ``math.isfinite`` check.
+    Excludes ``bool`` (see ``_as_int``), non-finite floats (``nan``, ``inf``,
+    ``-inf``), and an ``int`` too large to convert to ``float`` -- every
+    caller eventually does float arithmetic (``float()``, multiplication,
+    ``round()``) on the value, so such an int is as unusable as a
+    non-finite reading and must not be cached or propagated.
     """
     if not isinstance(value, (int, float)) or isinstance(value, bool):
         return False
-    if isinstance(value, int):
-        return True
-    return math.isfinite(value)
+    try:
+        return math.isfinite(value)
+    except OverflowError:
+        return False
 
 
 def _accumulate_vdev_errors(vdev: Any, totals: dict[str, int]) -> None:
@@ -340,8 +340,15 @@ _VIRTUAL_PRODUCTS = {"VirtualBox", "Virtual Machine"}
 
 
 def _is_virtual_machine(manufacturer: Any, product: Any) -> bool:
-    """Return True if system.info's manufacturer/product indicates a VM."""
-    return manufacturer in _VIRTUAL_MANUFACTURERS or product in _VIRTUAL_PRODUCTS
+    """Return True if system.info's manufacturer/product indicates a VM.
+
+    Requires ``str`` before set membership -- a malformed response with a
+    non-string (e.g. unhashable ``list``) manufacturer/product would
+    otherwise raise ``TypeError`` from the ``in`` check.
+    """
+    return (
+        isinstance(manufacturer, str) and manufacturer in _VIRTUAL_MANUFACTURERS
+    ) or (isinstance(product, str) and product in _VIRTUAL_PRODUCTS)
 
 
 def _stable_uptime_epoch(
@@ -358,7 +365,7 @@ def _stable_uptime_epoch(
     epoch, rather than raising.
     """
     previous = previous_epoch if isinstance(previous_epoch, (int, float)) else 0
-    if not math.isfinite(uptime_seconds):
+    if not _is_finite_number(uptime_seconds):
         return int(previous)
     new_epoch = int(now_epoch - uptime_seconds)
     return new_epoch if abs(new_epoch - previous) > tolerance else int(previous)

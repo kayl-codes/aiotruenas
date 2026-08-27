@@ -1816,6 +1816,43 @@ async def test_get_systeminfo_keeps_previous_total_memory_on_infinite_physmem() 
     assert result["memory-total_value"] == 16_000_000_000
 
 
+async def test_get_systeminfo_keeps_previous_total_memory_on_oversized_physmem() -> (
+    None
+):
+    """An int too large to convert to float must not raise (OverflowError)."""
+    async with FakeTrueNASServer(
+        valid_api_key=API_KEY,
+        responses={"system.info": {"physmem": 16_000_000_000}},
+    ) as server:
+        async with make_client(server) as client:
+            await client.connect()
+            state = TrueNASState(client)
+            await state.get_systeminfo()
+
+            server.responses["system.info"] = {"physmem": 10**400}
+            result = await state.get_systeminfo()
+
+    assert result["memory-total_value"] == 16_000_000_000
+
+
+async def test_get_systeminfo_keeps_uptime_epoch_stable_on_oversized_uptime() -> None:
+    """An int too large to convert to float must not raise (OverflowError)."""
+    async with FakeTrueNASServer(
+        valid_api_key=API_KEY,
+        responses={"system.info": {"uptime_seconds": 1000}},
+    ) as server:
+        async with make_client(server) as client:
+            await client.connect()
+            state = TrueNASState(client)
+            await state.get_systeminfo()
+            first_epoch = state.ds["system_info"]["uptimeEpoch"]
+
+            server.responses["system.info"] = {"uptime_seconds": 10**400}
+            result = await state.get_systeminfo()
+
+    assert result["uptimeEpoch"] == first_epoch
+
+
 async def test_get_systeminfo_keeps_uptime_epoch_stable_within_tolerance() -> None:
     async with FakeTrueNASServer(
         valid_api_key=API_KEY,
@@ -1971,6 +2008,25 @@ async def test_get_systemstats_skips_cputemp_on_virtual_machine() -> None:
             await state.get_systemstats()
 
     assert "cputemp" not in called_graphs
+
+
+async def test_get_systeminfo_handles_unhashable_manufacturer() -> None:
+    """A malformed list value must not raise (set membership needs hashable)."""
+    async with FakeTrueNASServer(
+        valid_api_key=API_KEY,
+        responses={
+            "system.info": {
+                "system_manufacturer": ["QEMU"],
+                "system_product": ["Standard PC"],
+            }
+        },
+    ) as server:
+        async with make_client(server) as client:
+            await client.connect()
+            state = TrueNASState(client)
+            result = await state.get_systeminfo()
+
+    assert result["system_manufacturer"] == ["QEMU"]
 
 
 async def test_get_systemstats_skips_cputemp_on_vm_without_get_systeminfo() -> None:
