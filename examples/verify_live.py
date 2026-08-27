@@ -142,7 +142,7 @@ async def _check_domain_state(client: TrueNASClient) -> None:
     for name, call in calls:
         try:
             result = await call()
-        except TrueNASError as exc:
+        except Exception as exc:  # broad: probing normalizers for real-shape bugs
             failed.append(name)
             print(f"  {name}(): FAILED ({type(exc).__name__}): {exc}")
         else:
