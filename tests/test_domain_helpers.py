@@ -280,6 +280,16 @@ def test_netdata_named_means_excludes_bool_values() -> None:
     assert _netdata_named_means(graph_data, ("cpu",)) == {}
 
 
+def test_netdata_named_means_excludes_non_finite_values() -> None:
+    graph_data = [
+        {
+            "legend": ["cpu", "load"],
+            "aggregations": {"mean": {"cpu": float("nan"), "load": float("inf")}},
+        }
+    ]
+    assert _netdata_named_means(graph_data, ("cpu", "load")) == {}
+
+
 # ---------------------------
 #   _netdata_max_mean
 # ---------------------------
@@ -298,6 +308,12 @@ def test_netdata_max_mean_returns_none_for_malformed_response() -> None:
 def test_netdata_max_mean_excludes_bool_values() -> None:
     graph_data = [{"aggregations": {"mean": {"a": True, "b": 30.0}}}]
     assert _netdata_max_mean(graph_data) == pytest.approx(30.0)
+
+
+def test_netdata_max_mean_excludes_non_finite_values() -> None:
+    graph_data = [{"aggregations": {"mean": {"a": float("inf"), "b": 30.0}}}]
+    assert _netdata_max_mean(graph_data) == pytest.approx(30.0)
+    assert _netdata_max_mean([{"aggregations": {"mean": {"a": float("nan")}}}]) is None
 
 
 # ---------------------------
@@ -395,3 +411,10 @@ def test_stable_uptime_epoch_ignores_small_jitter() -> None:
 def test_stable_uptime_epoch_adopts_new_epoch_past_tolerance() -> None:
     previous = 100_000
     assert _stable_uptime_epoch(previous, 0, 100_500) == 100_500
+
+
+def test_stable_uptime_epoch_rejects_non_finite_uptime() -> None:
+    """A non-finite uptime_seconds must not raise (int() rejects nan/inf)."""
+    previous = 100_000
+    assert _stable_uptime_epoch(previous, float("nan"), 200_000) == previous
+    assert _stable_uptime_epoch(previous, float("inf"), 200_000) == previous

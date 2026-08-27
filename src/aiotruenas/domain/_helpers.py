@@ -11,6 +11,7 @@ declarative ``parse_api`` mapping engine.
 
 from __future__ import annotations
 
+import math
 import re
 from typing import Any
 
@@ -62,6 +63,20 @@ def _to_int(value: Any, default: int = 0) -> int:
         return int(value)
     except (TypeError, ValueError, OverflowError):
         return default
+
+
+def _is_finite_number(value: Any) -> bool:
+    """Return True if value is a real, finite int/float.
+
+    Excludes ``bool`` (see ``_as_int``) and non-finite floats (``nan``,
+    ``inf``, ``-inf``) -- a non-finite Netdata reading is as untrustworthy
+    as a missing one and must not be cached or propagated into arithmetic.
+    """
+    return (
+        isinstance(value, (int, float))
+        and not isinstance(value, bool)
+        and math.isfinite(value)
+    )
 
 
 def _accumulate_vdev_errors(vdev: Any, totals: dict[str, int]) -> None:
@@ -232,7 +247,7 @@ def _netdata_named_means(graph_data: Any, names: tuple[str, ...]) -> dict[str, f
         if name not in legend:
             continue
         value = mean.get(name) if isinstance(mean, dict) else None
-        if isinstance(value, (int, float)) and not isinstance(value, bool):
+        if _is_finite_number(value):
             result[name] = float(value)
     return result
 
@@ -253,11 +268,7 @@ def _netdata_max_mean(graph_data: Any) -> float | None:
     mean = aggregations.get("mean") if isinstance(aggregations, dict) else None
     if not isinstance(mean, dict):
         return None
-    valid_means = [
-        v
-        for v in mean.values()
-        if isinstance(v, (int, float)) and not isinstance(v, bool)
-    ]
+    valid_means = [v for v in mean.values() if _is_finite_number(v)]
     return round(max(valid_means), 2) if valid_means else None
 
 
@@ -339,10 +350,15 @@ def _stable_uptime_epoch(
     Only adopts the newly computed epoch (``now_epoch - uptime_seconds``) if
     it differs from ``previous_epoch`` by more than ``tolerance`` seconds --
     small per-poll timing variance would otherwise make an uptime sensor
-    jump around by a few seconds on every refresh.
+    jump around by a few seconds on every refresh. A non-finite
+    ``uptime_seconds`` (``nan``/``inf``, which ``int(now_epoch -
+    uptime_seconds)`` cannot convert) is rejected in favor of the previous
+    epoch, rather than raising.
     """
-    new_epoch = int(now_epoch - uptime_seconds)
     previous = previous_epoch if isinstance(previous_epoch, (int, float)) else 0
+    if not math.isfinite(uptime_seconds):
+        return int(previous)
+    new_epoch = int(now_epoch - uptime_seconds)
     return new_epoch if abs(new_epoch - previous) > tolerance else int(previous)
 
 

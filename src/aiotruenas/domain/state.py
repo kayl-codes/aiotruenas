@@ -326,8 +326,9 @@ class TrueNASState:
     def ds(self) -> _PublicStateMap:
         """Normalized state, keyed by endpoint name then by object id/guid.
 
-        The ``arc``, ``ups``, and ``alerts`` endpoints have no natural object
-        id and are keyed by endpoint name only, holding a flat dict.
+        The ``arc``, ``ups``, ``alerts``, ``update``, ``smb``, and
+        ``system_info`` endpoints have no natural object id and are keyed by
+        endpoint name only, holding a flat dict.
 
         Typed as a plain mapping rather than the ``TypedDict`` used
         internally, so it can be indexed with a runtime string (e.g. when
