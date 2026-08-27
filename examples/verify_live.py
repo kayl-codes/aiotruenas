@@ -174,7 +174,10 @@ async def _check_subscriptions(client: TrueNASClient) -> None:
     except TrueNASError as exc:
         print(f"  get_subscription_events: FAILED ({type(exc).__name__}): {exc}")
     finally:
-        await client.unsubscribe(sub_id)
+        try:
+            await client.unsubscribe(sub_id)
+        except TrueNASError as exc:
+            print(f"  unsubscribe: FAILED ({type(exc).__name__}): {exc}")
 
 
 async def _check_job_polling(client: TrueNASClient) -> None:
