@@ -478,6 +478,25 @@ async def test_ds_property_starts_empty_for_all_endpoints() -> None:
             "update_filename": None,
         },
         "smb": {"connections": 0},
+        "system_info": {
+            "version": "unknown",
+            "hostname": "unknown",
+            "uptime_seconds": 0,
+            "system_serial": "unknown",
+            "system_product": "unknown",
+            "system_manufacturer": "unknown",
+            "physmem": 0,
+            "uptimeEpoch": 0,
+            "cpu_temperature": None,
+            "cpu_usage": 0.0,
+            "load_shortterm": 0.0,
+            "load_midterm": 0.0,
+            "load_longterm": 0.0,
+            "cache_size-arc_value": 0.0,
+            "memory-free_value": 0.0,
+            "memory-total_value": 0.0,
+            "memory-usage_percent": 0,
+        },
     }
 
 
@@ -1730,3 +1749,482 @@ async def test_get_disk_keeps_temperature_none_when_enrichment_fails() -> None:
             result = await state.get_disk()
 
     assert result["{serial}S1"]["temperature"] is None
+
+
+async def test_get_systeminfo_normalizes_and_derives_uptime_epoch() -> None:
+    raw_system_info = {
+        "version": "TrueNAS-25.10.0",
+        "hostname": "truenas",
+        "uptime_seconds": 3600,
+        "system_serial": "SN123",
+        "system_product": "TrueNAS Mini",
+        "system_manufacturer": "iXsystems",
+        "physmem": 16_000_000_000,
+    }
+    async with FakeTrueNASServer(
+        valid_api_key=API_KEY,
+        responses={"system.info": raw_system_info},
+    ) as server:
+        async with make_client(server) as client:
+            await client.connect()
+            state = TrueNASState(client)
+            result = await state.get_systeminfo()
+
+    assert result["version"] == "TrueNAS-25.10.0"
+    assert result["hostname"] == "truenas"
+    assert result["system_serial"] == "SN123"
+    assert result["memory-total_value"] == 16_000_000_000
+    assert isinstance(result["uptimeEpoch"], int)
+    assert result["uptimeEpoch"] > 0
+    assert state.ds["system_info"] == result
+
+
+async def test_get_systeminfo_keeps_previous_total_memory_on_bogus_physmem() -> None:
+    async with FakeTrueNASServer(
+        valid_api_key=API_KEY,
+        responses={"system.info": {"physmem": 16_000_000_000}},
+    ) as server:
+        async with make_client(server) as client:
+            await client.connect()
+            state = TrueNASState(client)
+            await state.get_systeminfo()
+            assert state.ds["system_info"]["memory-total_value"] == 16_000_000_000
+
+            server.responses["system.info"] = {"physmem": 0}
+            result = await state.get_systeminfo()
+
+    assert result["memory-total_value"] == 16_000_000_000
+
+
+async def test_get_systeminfo_keeps_previous_total_memory_on_infinite_physmem() -> None:
+    """A non-finite physmem must not be cached, since a later usage-percent
+    calculation (100 * (total - available) / total) would produce nan for
+    an infinite total, and round(nan) (no ndigits) raises ValueError.
+    """
+    async with FakeTrueNASServer(
+        valid_api_key=API_KEY,
+        responses={"system.info": {"physmem": 16_000_000_000}},
+    ) as server:
+        async with make_client(server) as client:
+            await client.connect()
+            state = TrueNASState(client)
+            await state.get_systeminfo()
+
+            server.responses["system.info"] = {"physmem": float("inf")}
+            result = await state.get_systeminfo()
+
+    assert result["memory-total_value"] == 16_000_000_000
+
+
+async def test_get_systeminfo_keeps_previous_total_memory_on_oversized_physmem() -> (
+    None
+):
+    """An int too large to convert to float must not raise (OverflowError)."""
+    async with FakeTrueNASServer(
+        valid_api_key=API_KEY,
+        responses={"system.info": {"physmem": 16_000_000_000}},
+    ) as server:
+        async with make_client(server) as client:
+            await client.connect()
+            state = TrueNASState(client)
+            await state.get_systeminfo()
+
+            server.responses["system.info"] = {"physmem": 10**400}
+            result = await state.get_systeminfo()
+
+    assert result["memory-total_value"] == 16_000_000_000
+
+
+async def test_get_systeminfo_keeps_uptime_epoch_stable_on_oversized_uptime() -> None:
+    """An int too large to convert to float must not raise (OverflowError)."""
+    async with FakeTrueNASServer(
+        valid_api_key=API_KEY,
+        responses={"system.info": {"uptime_seconds": 1000}},
+    ) as server:
+        async with make_client(server) as client:
+            await client.connect()
+            state = TrueNASState(client)
+            await state.get_systeminfo()
+            first_epoch = state.ds["system_info"]["uptimeEpoch"]
+
+            server.responses["system.info"] = {"uptime_seconds": 10**400}
+            result = await state.get_systeminfo()
+
+    assert result["uptimeEpoch"] == first_epoch
+
+
+async def test_get_systeminfo_keeps_uptime_epoch_stable_within_tolerance() -> None:
+    async with FakeTrueNASServer(
+        valid_api_key=API_KEY,
+        responses={"system.info": {"uptime_seconds": 1000}},
+    ) as server:
+        async with make_client(server) as client:
+            await client.connect()
+            state = TrueNASState(client)
+            await state.get_systeminfo()
+            first_epoch = state.ds["system_info"]["uptimeEpoch"]
+
+            # A few seconds of poll jitter in the reported uptime must not
+            # move the derived boot-time epoch.
+            server.responses["system.info"] = {"uptime_seconds": 1003}
+            await state.get_systeminfo()
+
+    assert state.ds["system_info"]["uptimeEpoch"] == first_epoch
+
+
+async def test_get_systeminfo_preserves_previous_values_on_malformed_response() -> None:
+    async with FakeTrueNASServer(
+        valid_api_key=API_KEY,
+        responses={"system.info": {"hostname": "truenas", "uptime_seconds": 500}},
+    ) as server:
+        async with make_client(server) as client:
+            await client.connect()
+            state = TrueNASState(client)
+            await state.get_systeminfo()
+            previous = state.ds["system_info"]
+
+            server.responses["system.info"] = None
+            result = await state.get_systeminfo()
+
+    assert result["hostname"] == "truenas"
+    assert result is previous
+
+
+async def test_get_systeminfo_preserves_previous_values_on_list_response() -> None:
+    """A malformed list-shaped ``system.info`` response is rejected outright.
+
+    Unlike a scalar/``None`` response (already caught by ``parse_api()``
+    itself), a list of dicts would otherwise be accepted as ordinary
+    multi-entry source data and applied to the singleton state entry by
+    entry, letting unexpected extra entries silently overwrite cached
+    fields.
+    """
+    async with FakeTrueNASServer(
+        valid_api_key=API_KEY,
+        responses={"system.info": {"hostname": "truenas", "uptime_seconds": 500}},
+    ) as server:
+        async with make_client(server) as client:
+            await client.connect()
+            state = TrueNASState(client)
+            await state.get_systeminfo()
+            previous = state.ds["system_info"]
+
+            server.responses["system.info"] = [
+                {"hostname": "bogus1"},
+                {"hostname": "bogus2"},
+            ]
+            result = await state.get_systeminfo()
+
+    assert result["hostname"] == "truenas"
+    assert result is previous
+
+
+async def test_get_systeminfo_derives_uptime_epoch_from_zero_uptime() -> None:
+    async with FakeTrueNASServer(
+        valid_api_key=API_KEY,
+        responses={"system.info": {"uptime_seconds": 0}},
+    ) as server:
+        async with make_client(server) as client:
+            await client.connect()
+            state = TrueNASState(client)
+            result = await state.get_systeminfo()
+
+    assert result["uptimeEpoch"] > 0
+
+
+async def test_get_systemstats_updates_load_cpu_memory_arc_and_cputemp() -> None:
+    def netdata_graph(params: list) -> Any:
+        graph_name = params[0]
+        if graph_name == "load":
+            return [
+                {
+                    "legend": ["shortterm", "midterm", "longterm"],
+                    "aggregations": {
+                        "mean": {"shortterm": 0.5, "midterm": 0.75, "longterm": 1.0}
+                    },
+                }
+            ]
+        if graph_name == "cpu":
+            return [{"legend": ["cpu"], "aggregations": {"mean": {"cpu": 12.345}}}]
+        if graph_name == "cputemp":
+            return [{"aggregations": {"mean": {"core0": 40.0, "core1": 45.5}}}]
+        if graph_name == "memory":
+            return [
+                {
+                    "legend": ["available"],
+                    "aggregations": {"mean": {"available": 2000.0}},
+                }
+            ]
+        if graph_name == "arcsize":
+            return [{"legend": ["size"], "aggregations": {"mean": {"size": 1500.0}}}]
+        raise AssertionError(f"unexpected graph {graph_name}")
+
+    async with FakeTrueNASServer(
+        valid_api_key=API_KEY,
+        responses={
+            "system.info": {"physmem": 8000.0},
+            "reporting.netdata_graph": netdata_graph,
+        },
+    ) as server:
+        async with make_client(server) as client:
+            await client.connect()
+            state = TrueNASState(client)
+            await state.get_systeminfo()
+            result = await state.get_systemstats()
+
+    assert result["load_shortterm"] == 0.5
+    assert result["load_midterm"] == 0.75
+    assert result["load_longterm"] == 1.0
+    assert result["cpu_usage"] == 12.35
+    assert result["cpu_temperature"] == 45.5
+    assert result["memory-free_value"] == 2000.0
+    assert result["memory-total_value"] == 8000.0
+    assert result["memory-usage_percent"] == 75
+    assert result["cache_size-arc_value"] == 1500.0
+    assert state.ds["system_info"] == result
+
+
+async def test_get_systemstats_skips_cputemp_on_virtual_machine() -> None:
+    called_graphs: list[str] = []
+
+    def netdata_graph(params: list) -> Any:
+        called_graphs.append(params[0])
+        return None
+
+    async with FakeTrueNASServer(
+        valid_api_key=API_KEY,
+        responses={
+            "system.info": {
+                "system_manufacturer": "QEMU",
+                "system_product": "Standard PC",
+            },
+            "reporting.netdata_graph": netdata_graph,
+        },
+    ) as server:
+        async with make_client(server) as client:
+            await client.connect()
+            state = TrueNASState(client)
+            await state.get_systeminfo()
+            await state.get_systemstats()
+
+    assert "cputemp" not in called_graphs
+
+
+async def test_get_systeminfo_handles_unhashable_manufacturer() -> None:
+    """A malformed list value must not raise (set membership needs hashable)."""
+    async with FakeTrueNASServer(
+        valid_api_key=API_KEY,
+        responses={
+            "system.info": {
+                "system_manufacturer": ["QEMU"],
+                "system_product": ["Standard PC"],
+            }
+        },
+    ) as server:
+        async with make_client(server) as client:
+            await client.connect()
+            state = TrueNASState(client)
+            result = await state.get_systeminfo()
+
+    assert result["system_manufacturer"] == ["QEMU"]
+
+
+async def test_get_systemstats_skips_cputemp_on_vm_without_get_systeminfo() -> None:
+    called_graphs: list[str] = []
+
+    def netdata_graph(params: list) -> Any:
+        called_graphs.append(params[0])
+        return None
+
+    async with FakeTrueNASServer(
+        valid_api_key=API_KEY,
+        responses={
+            "system.info": {
+                "system_manufacturer": "QEMU",
+                "system_product": "Standard PC",
+            },
+            "reporting.netdata_graph": netdata_graph,
+        },
+    ) as server:
+        async with make_client(server) as client:
+            await client.connect()
+            state = TrueNASState(client)
+            await state.get_systemstats()
+
+    assert "cputemp" not in called_graphs
+
+
+async def test_get_systemstats_enriches_interface_throughput() -> None:
+    raw_interfaces = [
+        {"id": "eno1", "name": "eno1", "state": {"link_state": "LINK_STATE_UP"}}
+    ]
+
+    def netdata_graph(params: list) -> Any:
+        if params[0] == "interface":
+            return [
+                {
+                    "identifier": "eno1",
+                    "legend": ["received", "sent"],
+                    "aggregations": {"mean": {"received": 8192.0, "sent": 4096.0}},
+                }
+            ]
+        return None
+
+    async with FakeTrueNASServer(
+        valid_api_key=API_KEY,
+        responses={
+            "system.info": {},
+            "interface.query": raw_interfaces,
+            "reporting.netdata_graph": netdata_graph,
+        },
+    ) as server:
+        async with make_client(server) as client:
+            await client.connect()
+            state = TrueNASState(client)
+            await state.get_interface()
+            await state.get_systemstats()
+
+    assert state.ds["interface"]["eno1"]["rx"] == 1000.0
+    assert state.ds["interface"]["eno1"]["tx"] == 500.0
+
+
+async def test_get_systemstats_keeps_previous_throughput_on_malformed_item() -> None:
+    raw_interfaces = [
+        {"id": "eno1", "name": "eno1", "state": {"link_state": "LINK_STATE_UP"}}
+    ]
+    call_count = 0
+
+    def netdata_graph(params: list) -> Any:
+        nonlocal call_count
+        if params[0] != "interface":
+            return None
+        call_count += 1
+        if call_count == 1:
+            return [
+                {
+                    "identifier": "eno1",
+                    "legend": ["received", "sent"],
+                    "aggregations": {"mean": {"received": 8192.0, "sent": 4096.0}},
+                }
+            ]
+        return [{"identifier": "eno1"}]
+
+    async with FakeTrueNASServer(
+        valid_api_key=API_KEY,
+        responses={
+            "system.info": {},
+            "interface.query": raw_interfaces,
+            "reporting.netdata_graph": netdata_graph,
+        },
+    ) as server:
+        async with make_client(server) as client:
+            await client.connect()
+            state = TrueNASState(client)
+            await state.get_interface()
+            await state.get_systemstats()
+            assert state.ds["interface"]["eno1"]["rx"] == 1000.0
+
+            await state.get_systemstats()
+
+    assert state.ds["interface"]["eno1"]["rx"] == 1000.0
+    assert state.ds["interface"]["eno1"]["tx"] == 500.0
+
+
+async def test_get_systemstats_skips_interface_query_without_prior_get_interface() -> (
+    None
+):
+    called_graphs: list[str] = []
+
+    def netdata_graph(params: list) -> Any:
+        called_graphs.append(params[0])
+        return None
+
+    async with FakeTrueNASServer(
+        valid_api_key=API_KEY,
+        responses={"system.info": {}, "reporting.netdata_graph": netdata_graph},
+    ) as server:
+        async with make_client(server) as client:
+            await client.connect()
+            state = TrueNASState(client)
+            await state.get_systemstats()
+
+    assert "interface" not in called_graphs
+
+
+async def test_get_systemstats_keeps_previous_value_on_malformed_graph() -> None:
+    async with FakeTrueNASServer(
+        valid_api_key=API_KEY,
+        responses={
+            "system.info": {},
+            "reporting.netdata_graph": lambda params: [
+                {"legend": ["cpu"], "aggregations": {"mean": {"cpu": 20.0}}}
+            ],
+        },
+    ) as server:
+        async with make_client(server) as client:
+            await client.connect()
+            state = TrueNASState(client)
+            await state.get_systemstats()
+            assert state.ds["system_info"]["cpu_usage"] == 20.0
+
+            server.responses["reporting.netdata_graph"] = None
+            await state.get_systemstats()
+
+    assert state.ds["system_info"]["cpu_usage"] == 20.0
+
+
+async def test_get_systemstats_keeps_previous_value_when_graph_query_raises() -> None:
+    async with FakeTrueNASServer(
+        valid_api_key=API_KEY,
+        responses={
+            "system.info": {},
+            "reporting.netdata_graph": lambda params: [
+                {"legend": ["cpu"], "aggregations": {"mean": {"cpu": 20.0}}}
+            ],
+        },
+    ) as server:
+        async with make_client(server) as client:
+            await client.connect()
+            state = TrueNASState(client)
+            await state.get_systemstats()
+            assert state.ds["system_info"]["cpu_usage"] == 20.0
+
+            server.responses["reporting.netdata_graph"] = {
+                "error": {
+                    "code": -32603,
+                    "message": "Internal error",
+                    "data": {"error": 1, "errname": "EFAULT", "reason": None},
+                }
+            }
+            await state.get_systemstats()
+
+    assert state.ds["system_info"]["cpu_usage"] == 20.0
+
+
+async def test_get_systemstats_queries_graphs_when_virtual_detection_fails() -> None:
+    """A failed lazy ``system.info`` (virtualization detection) call must not
+    abort the rest of ``get_systemstats()`` -- each netdata graph is
+    independent and best-effort, matching every other failure mode this
+    endpoint already tolerates.
+    """
+    async with FakeTrueNASServer(
+        valid_api_key=API_KEY,
+        responses={
+            "system.info": {
+                "error": {
+                    "code": -32603,
+                    "message": "Internal error",
+                    "data": {"error": 1, "errname": "EFAULT", "reason": None},
+                }
+            },
+            "reporting.netdata_graph": lambda params: [
+                {"legend": ["cpu"], "aggregations": {"mean": {"cpu": 20.0}}}
+            ],
+        },
+    ) as server:
+        async with make_client(server) as client:
+            await client.connect()
+            state = TrueNASState(client)
+            result = await state.get_systemstats()
+
+    assert result["cpu_usage"] == 20.0

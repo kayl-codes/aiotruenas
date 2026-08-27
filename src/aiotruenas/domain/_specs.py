@@ -437,3 +437,30 @@ _SCRUB_VALS: list[ApiValueSpec] = [
     {"name": "pool_name", "default": ""},
     {"name": "enabled", "type": "bool", "default": False},
 ]
+
+# system.info. Keyless (flat singleton, like _ARC_GRAPHS/_UPS_GRAPHS in
+# state.py) -- there is only ever one system. CPU/load/memory/ARC-size stats
+# and interface throughput are not part of system.info itself; ensure_vals
+# only guarantees their keys exist until TrueNASState.get_systemstats() (a
+# separate, much larger netdata-graph query) fills them in.
+_SYSTEMINFO_VALS: list[ApiValueSpec] = [
+    {"name": "version", "default": "unknown"},
+    {"name": "hostname", "default": "unknown"},
+    {"name": "uptime_seconds", "default": 0},
+    {"name": "system_serial", "default": "unknown"},
+    {"name": "system_product", "default": "unknown"},
+    {"name": "system_manufacturer", "default": "unknown"},
+    {"name": "physmem", "default": 0},
+]
+_SYSTEMINFO_ENSURE_VALS: list[ApiValueSpec] = [
+    {"name": "uptimeEpoch", "default": 0},
+    {"name": "cpu_temperature", "default": None},
+    {"name": "cpu_usage", "default": 0.0},
+    {"name": "load_shortterm", "default": 0.0},
+    {"name": "load_midterm", "default": 0.0},
+    {"name": "load_longterm", "default": 0.0},
+    {"name": "cache_size-arc_value", "default": 0.0},
+    {"name": "memory-free_value", "default": 0.0},
+    {"name": "memory-total_value", "default": 0.0},
+    {"name": "memory-usage_percent", "default": 0},
+]

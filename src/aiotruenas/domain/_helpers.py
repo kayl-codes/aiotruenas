@@ -11,6 +11,7 @@ declarative ``parse_api`` mapping engine.
 
 from __future__ import annotations
 
+import math
 import re
 from typing import Any
 
@@ -62,6 +63,23 @@ def _to_int(value: Any, default: int = 0) -> int:
         return int(value)
     except (TypeError, ValueError, OverflowError):
         return default
+
+
+def _is_finite_number(value: Any) -> bool:
+    """Return True if value is a real, finite int/float usable in float arithmetic.
+
+    Excludes ``bool`` (see ``_as_int``), non-finite floats (``nan``, ``inf``,
+    ``-inf``), and an ``int`` too large to convert to ``float`` -- every
+    caller eventually does float arithmetic (``float()``, multiplication,
+    ``round()``) on the value, so such an int is as unusable as a
+    non-finite reading and must not be cached or propagated.
+    """
+    if not isinstance(value, (int, float)) or isinstance(value, bool):
+        return False
+    try:
+        return math.isfinite(value)
+    except OverflowError:
+        return False
 
 
 def _accumulate_vdev_errors(vdev: Any, totals: dict[str, int]) -> None:
@@ -203,6 +221,154 @@ def _disk_temps_from_graph_data(graph_data: list[Any]) -> dict[str, float]:
         ]:
             temps[str(identifier)] = _median(valid_means)
     return temps
+
+
+def _netdata_named_means(graph_data: Any, names: tuple[str, ...]) -> dict[str, float]:
+    """Extract named per-series mean values from a netdata graph response.
+
+    Unlike ``_netdata_mean_value`` (which averages all series into one
+    scalar, for single-metric graphs), this looks up each of ``names``
+    individually by its "legend" entry -- for multi-series graphs like
+    "load" (shortterm/midterm/longterm) or "memory" (available). A name
+    missing from a malformed/missing response is simply absent from the
+    result (rather than defaulted to 0.0), so the caller can tell that apart
+    from a legitimately-reported zero and leave its previous cached value
+    untouched instead of resetting it.
+    """
+    if not isinstance(graph_data, list) or not graph_data:
+        return {}
+    item = graph_data[0]
+    if not isinstance(item, dict):
+        return {}
+    legend = item.get("legend")
+    aggregations = item.get("aggregations")
+    if not isinstance(legend, list) or not isinstance(aggregations, dict):
+        return {}
+    mean = aggregations.get("mean")
+    result: dict[str, float] = {}
+    for name in names:
+        if name not in legend:
+            continue
+        value = mean.get(name) if isinstance(mean, dict) else None
+        if _is_finite_number(value):
+            result[name] = float(value)
+    return result
+
+
+def _netdata_max_mean(graph_data: Any) -> float | None:
+    """Return the highest per-series mean value in a netdata graph response.
+
+    Used for CPU temperature, where each series is one core/sensor and the
+    hottest one is the value of interest -- unlike ``_netdata_mean_value``,
+    which averages series together.
+    """
+    if not isinstance(graph_data, list) or not graph_data:
+        return None
+    item = graph_data[0]
+    if not isinstance(item, dict):
+        return None
+    aggregations = item.get("aggregations")
+    mean = aggregations.get("mean") if isinstance(aggregations, dict) else None
+    if not isinstance(mean, dict):
+        return None
+    valid_means = [v for v in mean.values() if _is_finite_number(v)]
+    return round(max(valid_means), 2) if valid_means else None
+
+
+# Netdata reports interface throughput in kilobits/s; TrueNAS's own UI (and
+# the coordinator original) shows it in KiB/s. 1000 / 8192 converts between
+# the two (1000 bits/kilobit, 8192 bits/KiB).
+_KILOBITS_TO_KIBIBYTES = 1000 / 8192
+_NETDATA_INTERFACE_RENAME = {"received": "rx", "sent": "tx"}
+
+
+def _interface_item_throughput(item: dict[str, Any]) -> dict[str, float]:
+    """Return one netdata "interface" graph item's rx/tx throughput (KiB/s).
+
+    Returns only the keys with a valid numeric reading; a malformed/missing
+    legend or aggregations, or an individual missing/invalid series, is
+    simply absent from the result -- so a caller applying this via ``dict.
+    update()`` leaves the previously cached value for that key untouched
+    instead of resetting it to zero.
+    """
+    legend = item.get("legend")
+    aggregations = item.get("aggregations")
+    mean = aggregations.get("mean") if isinstance(aggregations, dict) else None
+    if not isinstance(legend, list) or not isinstance(mean, dict):
+        return {}
+
+    throughput: dict[str, float] = {}
+    for raw_name, short_name in _NETDATA_INTERFACE_RENAME.items():
+        if raw_name not in legend and short_name not in legend:
+            continue
+        value = next(
+            (
+                candidate
+                for candidate in (mean.get(raw_name), mean.get(short_name))
+                if _is_finite_number(candidate)
+            ),
+            None,
+        )
+        if value is not None:
+            throughput[short_name] = round(value * _KILOBITS_TO_KIBIBYTES, 2)
+    return throughput
+
+
+def _netdata_interface_throughput(graph_data: Any) -> dict[str, dict[str, float]]:
+    """Extract per-interface rx/tx throughput (KiB/s) from a netdata
+    "interface" graph response.
+
+    Each response item covers one interface, identified by its
+    "identifier". Netdata's raw legend/mean keys ("received"/"sent") are
+    renamed to "rx"/"tx". Returns an empty dict for a missing/malformed
+    response (RPC failure).
+    """
+    if not isinstance(graph_data, list):
+        return {}
+    result: dict[str, dict[str, float]] = {}
+    for item in graph_data:
+        if not isinstance(item, dict):
+            continue
+        identifier = item.get("identifier")
+        if isinstance(identifier, str) and identifier:
+            result[identifier] = _interface_item_throughput(item)
+    return result
+
+
+_VIRTUAL_MANUFACTURERS = {"QEMU", "VMware, Inc.", "Microsoft Corporation", "Xen"}
+_VIRTUAL_PRODUCTS = {"VirtualBox", "Virtual Machine"}
+
+
+def _is_virtual_machine(manufacturer: Any, product: Any) -> bool:
+    """Return True if system.info's manufacturer/product indicates a VM.
+
+    Requires ``str`` before set membership -- a malformed response with a
+    non-string (e.g. unhashable ``list``) manufacturer/product would
+    otherwise raise ``TypeError`` from the ``in`` check.
+    """
+    return (
+        isinstance(manufacturer, str) and manufacturer in _VIRTUAL_MANUFACTURERS
+    ) or (isinstance(product, str) and product in _VIRTUAL_PRODUCTS)
+
+
+def _stable_uptime_epoch(
+    previous_epoch: Any, uptime_seconds: float, now_epoch: int, tolerance: int = 300
+) -> int:
+    """Return a boot-time epoch derived from ``uptime_seconds``, damped against jitter.
+
+    Only adopts the newly computed epoch (``now_epoch - uptime_seconds``) if
+    it differs from ``previous_epoch`` by more than ``tolerance`` seconds --
+    small per-poll timing variance would otherwise make an uptime sensor
+    jump around by a few seconds on every refresh. A non-finite
+    ``uptime_seconds`` (``nan``/``inf``, which ``int(now_epoch -
+    uptime_seconds)`` cannot convert) is rejected in favor of the previous
+    epoch, rather than raising.
+    """
+    previous = previous_epoch if isinstance(previous_epoch, (int, float)) else 0
+    if not _is_finite_number(uptime_seconds):
+        return int(previous)
+    new_epoch = int(now_epoch - uptime_seconds)
+    return new_epoch if abs(new_epoch - previous) > tolerance else int(previous)
 
 
 def _parse_version_tuple(version_str: Any) -> tuple[int, int]:

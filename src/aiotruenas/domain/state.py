@@ -8,15 +8,17 @@ Each method queries the endpoint, normalizes the response via
 caches the result in ``self.ds[<endpoint>]`` -- the same dict-keyed-by-id
 shape historically produced by consumer integrations' own
 ``apiparser.py``/``coordinator.py``. Exceptions are the netdata-graph-backed
-endpoints (``arc``, ``ups``) and the hand-aggregated ``alerts`` endpoint,
-which have no natural object id and instead cache a flat dict.
+endpoints (``arc``, ``ups``), ``system_info`` (a flat singleton -- there is
+only ever one system), and the hand-aggregated ``alerts``/``update``/``smb``
+endpoints, none of which have a natural object id and instead cache a flat
+dict.
 """
 
 from __future__ import annotations
 
 import asyncio
 import copy
-from collections.abc import Hashable
+from collections.abc import Callable, Hashable
 from datetime import UTC, datetime
 from typing import Any, TypedDict, cast
 
@@ -28,7 +30,13 @@ from ._helpers import (
     _cpuset_size,
     _disk_temps_from_graph_data,
     _first_ipv4,
+    _is_finite_number,
+    _is_virtual_machine,
+    _netdata_interface_throughput,
+    _netdata_max_mean,
+    _netdata_named_means,
     _parse_version_tuple,
+    _stable_uptime_epoch,
     _to_int,
     _ups_value,
 )
@@ -59,6 +67,8 @@ from ._specs import (
     _SERVICE_ENSURE_VALS,
     _SERVICE_VALS,
     _SNAPSHOTTASK_VALS,
+    _SYSTEMINFO_ENSURE_VALS,
+    _SYSTEMINFO_VALS,
     _VM_ENSURE_VALS,
     _VM_VALS,
 )
@@ -75,17 +85,29 @@ _AlertsMap = dict[str, Any]
 _UpdateMap = dict[str, Any]
 #: get_smb() shape: single connection-count reading, no natural object id.
 _SmbMap = dict[str, int]
+#: get_systeminfo()/get_systemstats() shape: flat singleton system fields
+#: (hostname, uptime, CPU/load/memory/ARC-size readings), no natural object
+#: id -- there is only ever one system.
+_SystemInfoMap = dict[str, Any]
 #: Public shape of the ``ds`` property: a plain mapping (rather than the
 #: TypedDict used internally) so consumers can index it with a runtime
 #: string, e.g. when iterating over endpoint names.
 _PublicStateMap = dict[
-    str, _EndpointMap | _ArcMap | _UpsMap | _AlertsMap | _UpdateMap | _SmbMap
+    str,
+    _EndpointMap
+    | _ArcMap
+    | _UpsMap
+    | _AlertsMap
+    | _UpdateMap
+    | _SmbMap
+    | _SystemInfoMap,
 ]
 
 
 class _StateMap(TypedDict):
     """Per-key shape of ``self._ds``: id-keyed maps, except the flat
-    ``arc``/``ups``/``alerts`` entries, which have no natural object id.
+    ``arc``/``ups``/``alerts``/``update``/``smb``/``system_info`` entries,
+    which have no natural object id.
     """
 
     pool: _EndpointMap
@@ -109,6 +131,7 @@ class _StateMap(TypedDict):
     alerts: _AlertsMap
     update: _UpdateMap
     smb: _SmbMap
+    system_info: _SystemInfoMap
 
 
 # Maps a netdata graph name (``reporting.netdata_graphs``) to its ds["arc"] field.
@@ -127,6 +150,69 @@ _UPS_GRAPHS: dict[str, str] = {
     "upscurrent": "current",
     "upsfrequency": "frequency",
     "upstemperature": "temperature",
+}
+
+# Netdata graphs queried by get_systemstats(), each independently (matching
+# get_arc()/get_ups()'s per-graph query pattern) rather than the original
+# coordinator's single combined multi-graph batch. "interface" is queried
+# separately (see get_systemstats()) since it enriches ds["interface"]
+# rather than ds["system_info"], and only when that map is non-empty.
+_SYSTEMSTATS_GRAPHS: tuple[str, ...] = ("load", "cpu", "cputemp", "memory", "arcsize")
+
+# RPC method queried by get_systeminfo() and, as a lazy fallback, by
+# _detect_version()/_detect_virtual() -- a shared constant avoids the
+# duplicated-literal finding (SonarQube S1192) across those three call sites.
+_SYSTEM_INFO_METHOD = "system.info"
+
+
+def _apply_cputemp_stat(raw: Any, info: dict[str, Any]) -> None:
+    temp = _netdata_max_mean(raw)
+    if temp is not None:
+        info["cpu_temperature"] = temp
+
+
+def _apply_load_stat(raw: Any, info: dict[str, Any]) -> None:
+    means = _netdata_named_means(raw, ("shortterm", "midterm", "longterm"))
+    for series, field in (
+        ("shortterm", "load_shortterm"),
+        ("midterm", "load_midterm"),
+        ("longterm", "load_longterm"),
+    ):
+        if series in means:
+            info[field] = round(means[series], 2)
+
+
+def _apply_cpu_stat(raw: Any, info: dict[str, Any]) -> None:
+    means = _netdata_named_means(raw, ("cpu",))
+    if "cpu" in means:
+        info["cpu_usage"] = round(means["cpu"], 2)
+
+
+def _apply_arcsize_stat(raw: Any, info: dict[str, Any]) -> None:
+    means = _netdata_named_means(raw, ("size",))
+    if "size" in means:
+        info["cache_size-arc_value"] = round(means["size"], 2)
+
+
+def _apply_memory_stat(raw: Any, info: dict[str, Any]) -> None:
+    means = _netdata_named_means(raw, ("available",))
+    if "available" not in means:
+        return
+    info["memory-free_value"] = round(means["available"], 2)
+    total = info.get("memory-total_value", 0)
+    if isinstance(total, (int, float)) and not isinstance(total, bool) and total > 0:
+        info["memory-usage_percent"] = round(100 * (total - means["available"]) / total)
+
+
+# Dispatch table for _apply_systemstat(): keeps that method's cognitive
+# complexity low by moving each graph's field-mapping logic into its own
+# small, independently-testable function (SonarQube S3776).
+_SYSTEMSTAT_HANDLERS: dict[str, Callable[[Any, dict[str, Any]], None]] = {
+    "cputemp": _apply_cputemp_stat,
+    "load": _apply_load_stat,
+    "cpu": _apply_cpu_stat,
+    "arcsize": _apply_arcsize_stat,
+    "memory": _apply_memory_stat,
 }
 
 # Maps a service.query "service" id to its human-friendly display name, used
@@ -198,23 +284,52 @@ class TrueNASState:
             },
             "update": self._no_update_pending(),
             "smb": {"connections": 0},
+            "system_info": {
+                "version": "unknown",
+                "hostname": "unknown",
+                "uptime_seconds": 0,
+                "system_serial": "unknown",
+                "system_product": "unknown",
+                "system_manufacturer": "unknown",
+                "physmem": 0,
+                "uptimeEpoch": 0,
+                "cpu_temperature": None,
+                "cpu_usage": 0.0,
+                "load_shortterm": 0.0,
+                "load_midterm": 0.0,
+                "load_longterm": 0.0,
+                "cache_size-arc_value": 0.0,
+                "memory-free_value": 0.0,
+                "memory-total_value": 0.0,
+                "memory-usage_percent": 0,
+            },
         }
         # Cached (major, minor) TrueNAS version, used by get_container() to
         # pick the right query API; detected lazily on first use (see
         # _detect_version()) since it cannot change without an appliance
-        # reboot, which drops the underlying connection.
+        # reboot, which drops the underlying connection. get_systeminfo()
+        # also populates this from its own system.info call, sparing
+        # _detect_version() a redundant one once it has run.
         self._version: tuple[int, int] | None = None
         # Cached netdata graph name reporting per-disk temperatures, used by
         # get_disk(); "" once discovery has run but found none, None until
         # discovery has run at all (see _disk_temps_from_netdata()).
         self._disk_temp_graph: str | None = None
+        # Whether the connected system is virtualized; used by
+        # get_systemstats() to skip the CPU-temperature graph, which has no
+        # physical sensor on a VM. Populated by get_systeminfo(), or lazily
+        # detected on first use by _detect_virtual() if get_systemstats() is
+        # called before get_systeminfo() ever has been -- None means "not
+        # yet known" (see _detect_virtual()), distinct from a confirmed False.
+        self._is_virtual: bool | None = None
 
     @property
     def ds(self) -> _PublicStateMap:
         """Normalized state, keyed by endpoint name then by object id/guid.
 
-        The ``arc``, ``ups``, and ``alerts`` endpoints have no natural object
-        id and are keyed by endpoint name only, holding a flat dict.
+        The ``arc``, ``ups``, ``alerts``, ``update``, ``smb``, and
+        ``system_info`` endpoints have no natural object id and are keyed by
+        endpoint name only, holding a flat dict.
 
         Typed as a plain mapping rather than the ``TypedDict`` used
         internally, so it can be indexed with a runtime string (e.g. when
@@ -626,12 +741,28 @@ class TrueNASState:
         """
         if self._version is not None:
             return self._version
-        raw = await self._client.call("system.info")
+        raw = await self._client.call(_SYSTEM_INFO_METHOD)
         version_str = raw.get("version") if isinstance(raw, dict) else None
         version = _parse_version_tuple(version_str)
         if version != (0, 0):
             self._version = version
         return version
+
+    async def _detect_virtual(self) -> bool:
+        """Return whether the system is virtualized, detecting it on first use.
+
+        Mirrors ``_detect_version()``'s lazy, cached-on-first-use pattern, so
+        ``get_systemstats()`` correctly skips the ``cputemp`` graph even when
+        called before ``get_systeminfo()`` has ever populated
+        ``self._is_virtual``.
+        """
+        if self._is_virtual is not None:
+            return self._is_virtual
+        raw = await self._client.call(_SYSTEM_INFO_METHOD)
+        manufacturer = raw.get("system_manufacturer") if isinstance(raw, dict) else None
+        product = raw.get("system_product") if isinstance(raw, dict) else None
+        self._is_virtual = _is_virtual_machine(manufacturer, product)
+        return self._is_virtual
 
     async def get_container(self) -> _EndpointMap:
         """Refresh and return normalized containers.
@@ -1097,3 +1228,128 @@ class TrueNASState:
             )
             if isinstance(matched, (int, float)) and not isinstance(matched, bool):
                 vals["temperature"] = matched
+
+    async def get_systeminfo(self) -> _SystemInfoMap:
+        """Refresh and return system info (``system.info``).
+
+        Flat singleton dict, no natural object id, matching the ``arc``/
+        ``ups``/``alerts``/``update``/``smb`` endpoints' shape.
+
+        Derives ``uptimeEpoch`` from ``uptime_seconds``, damped against small
+        per-poll timing jitter (see ``_stable_uptime_epoch()``). Also caches
+        whether the system is virtualized (used by ``get_systemstats()`` to
+        skip the CPU-temperature graph -- no physical sensor to report on a
+        VM) and the parsed ``(major, minor)`` version, sparing
+        ``get_container()``'s own ``_detect_version()`` a redundant
+        ``system.info`` call once this has already run.
+
+        CPU/load/memory/ARC-size stats and interface throughput are not part
+        of ``system.info`` itself; ``ensure_vals`` only guarantees their keys
+        exist with a resting default until ``get_systemstats()`` -- a much
+        larger, independent netdata-graph query -- fills them in.
+
+        Update-status and SMB-connection-count fields the original
+        coordinator also stored on ``ds["system_info"]`` are intentionally
+        not duplicated here: they are already covered by the dedicated,
+        better-normalized ``get_update()``/``get_smb()`` endpoints.
+        """
+        async with self._lock:
+            raw = await self._client.call(_SYSTEM_INFO_METHOD)
+            if not isinstance(raw, dict):
+                return self._ds["system_info"]
+            self._ds["system_info"] = parse_api(
+                data=self._ds["system_info"],
+                source=raw,
+                vals=_SYSTEMINFO_VALS,
+                ensure_vals=_SYSTEMINFO_ENSURE_VALS,
+            )
+            info = self._ds["system_info"]
+
+            version = _parse_version_tuple(info.get("version"))
+            if version != (0, 0):
+                self._version = version
+            self._is_virtual = _is_virtual_machine(
+                info.get("system_manufacturer"), info.get("system_product")
+            )
+
+            physmem = info.get("physmem")
+            if _is_finite_number(physmem) and physmem > 0:
+                info["memory-total_value"] = physmem
+
+            uptime_seconds = info.get("uptime_seconds")
+            if (
+                isinstance(uptime_seconds, (int, float))
+                and not isinstance(uptime_seconds, bool)
+                and uptime_seconds >= 0
+            ):
+                now_epoch = int(datetime.now(UTC).replace(microsecond=0).timestamp())
+                info["uptimeEpoch"] = _stable_uptime_epoch(
+                    info.get("uptimeEpoch"), uptime_seconds, now_epoch
+                )
+            return info
+
+    async def get_systemstats(self) -> _SystemInfoMap:
+        """Refresh CPU/load/memory/ARC-size stats and interface throughput
+        from netdata graphs (``reporting.netdata_graph``).
+
+        Enriches ``ds["system_info"]`` (the primary target, also returned)
+        and ``ds["interface"]`` (rx/tx, a side effect -- see
+        ``_INTERFACE_VALS``'s docstring in ``_specs.py``).
+
+        Unlike the original coordinator's single combined multi-graph batch,
+        each graph is queried and applied independently and best-effort: a
+        failed/malformed individual graph leaves its field(s) at their
+        previous value rather than resetting to zero, matching this
+        library's other endpoints. CPU temperature is skipped entirely on a
+        virtualized system (see ``get_systeminfo()``) -- no physical sensor
+        to report; a failure detecting that (see ``_detect_virtual()``) is
+        treated as non-virtual so it does not abort the graph queries below.
+        Interface throughput is skipped entirely if ``get_interface()``
+        hasn't populated ``ds["interface"]`` yet (nothing to attribute it to).
+        """
+        async with self._lock:
+            report_epoch = int(datetime.now(UTC).replace(microsecond=0).timestamp())
+            graph_query = {
+                "start": report_epoch - 90,
+                "end": report_epoch - 30,
+                "aggregate": True,
+            }
+            info = self._ds["system_info"]
+            try:
+                is_virtual = await self._detect_virtual()
+            except TrueNASError:
+                is_virtual = False
+
+            for graph_name in _SYSTEMSTATS_GRAPHS:
+                if graph_name == "cputemp" and is_virtual:
+                    continue
+                try:
+                    raw = await self._client.call(
+                        "reporting.netdata_graph", [graph_name, graph_query]
+                    )
+                except TrueNASError:
+                    continue
+                self._apply_systemstat(graph_name, raw, info)
+
+            if self._ds["interface"]:
+                try:
+                    raw_interface = await self._client.call(
+                        "reporting.netdata_graph", ["interface", graph_query]
+                    )
+                except TrueNASError:
+                    raw_interface = None
+                for identifier, throughput in _netdata_interface_throughput(
+                    raw_interface
+                ).items():
+                    if identifier in self._ds["interface"]:
+                        self._ds["interface"][identifier].update(throughput)
+
+            return info
+
+    def _apply_systemstat(
+        self, graph_name: str, raw: Any, info: dict[str, Any]
+    ) -> None:
+        """Apply one netdata graph reading onto ``info`` (``ds["system_info"]``)."""
+        handler = _SYSTEMSTAT_HANDLERS.get(graph_name)
+        if handler is not None:
+            handler(raw, info)

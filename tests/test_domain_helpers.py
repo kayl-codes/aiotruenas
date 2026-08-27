@@ -15,8 +15,14 @@ from aiotruenas.domain._helpers import (
     _arc_value,
     _as_int,
     _disk_temps_from_graph_data,
+    _is_finite_number,
+    _is_virtual_machine,
     _median,
+    _netdata_interface_throughput,
+    _netdata_max_mean,
     _netdata_mean_value,
+    _netdata_named_means,
+    _stable_uptime_epoch,
     _stat_name_similar,
     _to_int,
     _ups_value,
@@ -222,3 +228,238 @@ def test_disk_temps_from_graph_data_ignores_malformed_entries() -> None:
         {"identifier": "disk2"},
     ]
     assert _disk_temps_from_graph_data(graph_data) == {}
+
+
+# ---------------------------
+#   _netdata_named_means
+# ---------------------------
+def test_netdata_named_means_extracts_only_requested_legend_entries() -> None:
+    graph_data = [
+        {
+            "legend": ["shortterm", "midterm", "longterm"],
+            "aggregations": {
+                "mean": {"shortterm": 0.5, "midterm": 0.75, "longterm": 1.0}
+            },
+        }
+    ]
+    assert _netdata_named_means(graph_data, ("shortterm", "longterm")) == {
+        "shortterm": 0.5,
+        "longterm": 1.0,
+    }
+
+
+def test_netdata_named_means_omits_present_legend_entry_with_missing_value() -> None:
+    """A legend entry with no matching mean value is omitted, not zeroed.
+
+    Callers rely on the name being absent (rather than defaulted to 0.0) to
+    tell a malformed reading apart from a legitimately-reported zero and
+    leave their previous cached value untouched.
+    """
+    graph_data = [{"legend": ["cpu"], "aggregations": {"mean": {}}}]
+    assert _netdata_named_means(graph_data, ("cpu",)) == {}
+
+
+def test_netdata_named_means_omits_name_absent_from_legend() -> None:
+    graph_data = [
+        {"legend": ["shortterm"], "aggregations": {"mean": {"shortterm": 1.0}}}
+    ]
+    assert _netdata_named_means(graph_data, ("shortterm", "midterm")) == {
+        "shortterm": 1.0
+    }
+
+
+def test_netdata_named_means_returns_empty_dict_for_malformed_response() -> None:
+    assert _netdata_named_means(None, ("cpu",)) == {}
+    assert _netdata_named_means([], ("cpu",)) == {}
+    assert _netdata_named_means(["not-a-dict"], ("cpu",)) == {}
+    assert _netdata_named_means([{"aggregations": {"mean": {}}}], ("cpu",)) == {}
+    assert _netdata_named_means([{"legend": ["cpu"]}], ("cpu",)) == {}
+
+
+def test_netdata_named_means_excludes_bool_values() -> None:
+    graph_data = [{"legend": ["cpu"], "aggregations": {"mean": {"cpu": True}}}]
+    assert _netdata_named_means(graph_data, ("cpu",)) == {}
+
+
+def test_is_finite_number_rejects_int_too_large_for_float() -> None:
+    assert _is_finite_number(10**400) is False
+
+
+def test_netdata_named_means_excludes_non_finite_values() -> None:
+    graph_data = [
+        {
+            "legend": ["cpu", "load"],
+            "aggregations": {"mean": {"cpu": float("nan"), "load": float("inf")}},
+        }
+    ]
+    assert _netdata_named_means(graph_data, ("cpu", "load")) == {}
+
+
+def test_netdata_named_means_excludes_int_too_large_for_float() -> None:
+    """An oversized int must not raise (float() would OverflowError)."""
+    graph_data = [{"legend": ["cpu"], "aggregations": {"mean": {"cpu": 10**400}}}]
+    assert _netdata_named_means(graph_data, ("cpu",)) == {}
+
+
+# ---------------------------
+#   _netdata_max_mean
+# ---------------------------
+def test_netdata_max_mean_returns_highest_series_value() -> None:
+    graph_data = [{"aggregations": {"mean": {"core0": 40.0, "core1": 55.5}}}]
+    assert _netdata_max_mean(graph_data) == pytest.approx(55.5)
+
+
+def test_netdata_max_mean_returns_none_for_malformed_response() -> None:
+    assert _netdata_max_mean(None) is None
+    assert _netdata_max_mean([]) is None
+    assert _netdata_max_mean(["not-a-dict"]) is None
+    assert _netdata_max_mean([{"aggregations": {"mean": {}}}]) is None
+
+
+def test_netdata_max_mean_excludes_bool_values() -> None:
+    graph_data = [{"aggregations": {"mean": {"a": True, "b": 30.0}}}]
+    assert _netdata_max_mean(graph_data) == pytest.approx(30.0)
+
+
+def test_netdata_max_mean_excludes_non_finite_values() -> None:
+    graph_data = [{"aggregations": {"mean": {"a": float("inf"), "b": 30.0}}}]
+    assert _netdata_max_mean(graph_data) == pytest.approx(30.0)
+    assert _netdata_max_mean([{"aggregations": {"mean": {"a": float("nan")}}}]) is None
+
+
+# ---------------------------
+#   _netdata_interface_throughput
+# ---------------------------
+def test_netdata_interface_throughput_converts_kilobits_to_kibibytes() -> None:
+    graph_data = [
+        {
+            "identifier": "eno1",
+            "legend": ["received", "sent"],
+            "aggregations": {"mean": {"received": 8192.0, "sent": 4096.0}},
+        }
+    ]
+    assert _netdata_interface_throughput(graph_data) == {
+        "eno1": {"rx": 1000.0, "tx": 500.0}
+    }
+
+
+def test_netdata_interface_throughput_omits_missing_series() -> None:
+    """A present-but-valueless series is omitted, not zeroed.
+
+    ``get_systemstats()`` applies this via ``dict.update()``, so an omitted
+    key leaves the interface's previously cached value for that key
+    untouched instead of resetting it to zero.
+    """
+    graph_data = [
+        {"identifier": "eno1", "legend": ["received"], "aggregations": {"mean": {}}}
+    ]
+    assert _netdata_interface_throughput(graph_data) == {"eno1": {}}
+
+
+def test_netdata_interface_throughput_omits_malformed_item() -> None:
+    graph_data = [{"identifier": "eno1"}]
+    assert _netdata_interface_throughput(graph_data) == {"eno1": {}}
+
+
+def test_netdata_interface_throughput_omits_non_finite_values() -> None:
+    graph_data = [
+        {
+            "identifier": "eno1",
+            "legend": ["received", "sent"],
+            "aggregations": {"mean": {"received": float("nan"), "sent": float("inf")}},
+        }
+    ]
+    assert _netdata_interface_throughput(graph_data) == {"eno1": {}}
+
+
+def test_netdata_interface_throughput_omits_int_too_large_for_float() -> None:
+    """An oversized int must not raise (int * float would OverflowError)."""
+    graph_data = [
+        {
+            "identifier": "eno1",
+            "legend": ["received", "sent"],
+            "aggregations": {"mean": {"received": 10**400, "sent": 10**400}},
+        }
+    ]
+    assert _netdata_interface_throughput(graph_data) == {"eno1": {}}
+
+
+def test_netdata_interface_throughput_falls_back_to_short_alias() -> None:
+    """A non-numeric raw-name value doesn't shadow a valid short-alias value.
+
+    Netdata graphs may report a series under either its long ("received"/
+    "sent") or short ("rx"/"tx") legend name; both must be tried rather than
+    stopping at whichever key happens to be present but invalid.
+    """
+    graph_data = [
+        {
+            "identifier": "eno1",
+            "legend": ["received", "rx"],
+            "aggregations": {"mean": {"received": None, "rx": 8192.0}},
+        }
+    ]
+    assert _netdata_interface_throughput(graph_data) == {"eno1": {"rx": 1000.0}}
+
+
+def test_netdata_interface_throughput_skips_entries_without_identifier() -> None:
+    graph_data = ["not-a-dict", {"legend": [], "aggregations": {}}]
+    assert _netdata_interface_throughput(graph_data) == {}
+
+
+def test_netdata_interface_throughput_returns_empty_dict_for_malformed_response() -> (
+    None
+):
+    assert _netdata_interface_throughput(None) == {}
+
+
+# ---------------------------
+#   _is_virtual_machine
+# ---------------------------
+@pytest.mark.parametrize(
+    ("manufacturer", "product", "expected"),
+    [
+        ("QEMU", "Standard PC", True),
+        ("iXsystems", "VirtualBox", True),
+        ("iXsystems", "TrueNAS Mini", False),
+        ("unknown", "unknown", False),
+    ],
+)
+def test_is_virtual_machine(manufacturer: str, product: str, expected: bool) -> None:
+    assert _is_virtual_machine(manufacturer, product) is expected
+
+
+def test_is_virtual_machine_rejects_unhashable_metadata() -> None:
+    """A malformed list value must not raise (set membership needs hashable)."""
+    assert _is_virtual_machine(["QEMU"], ["Standard PC"]) is False
+
+
+# ---------------------------
+#   _stable_uptime_epoch
+# ---------------------------
+def test_stable_uptime_epoch_adopts_new_epoch_on_first_run() -> None:
+    assert _stable_uptime_epoch(0, 100, 100_100) == 100_000
+
+
+def test_stable_uptime_epoch_ignores_small_jitter() -> None:
+    """A few seconds of poll timing drift must not move the stored epoch."""
+    previous = 100_000
+    # 3 seconds later, uptime_seconds also 3 higher -- same true boot time.
+    assert _stable_uptime_epoch(previous, 103, 100_103) == previous
+
+
+def test_stable_uptime_epoch_adopts_new_epoch_past_tolerance() -> None:
+    previous = 100_000
+    assert _stable_uptime_epoch(previous, 0, 100_500) == 100_500
+
+
+def test_stable_uptime_epoch_rejects_non_finite_uptime() -> None:
+    """A non-finite uptime_seconds must not raise (int() rejects nan/inf)."""
+    previous = 100_000
+    assert _stable_uptime_epoch(previous, float("nan"), 200_000) == previous
+    assert _stable_uptime_epoch(previous, float("inf"), 200_000) == previous
+
+
+def test_stable_uptime_epoch_rejects_int_too_large_for_float() -> None:
+    """An oversized int must not raise (math.isfinite() would OverflowError)."""
+    previous = 100_000
+    assert _stable_uptime_epoch(previous, 10**400, 200_000) == previous
