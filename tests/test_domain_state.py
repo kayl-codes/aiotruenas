@@ -1894,6 +1894,31 @@ async def test_get_systemstats_skips_cputemp_on_virtual_machine() -> None:
     assert "cputemp" not in called_graphs
 
 
+async def test_get_systemstats_skips_cputemp_on_vm_without_get_systeminfo() -> None:
+    called_graphs: list[str] = []
+
+    def netdata_graph(params: list) -> Any:
+        called_graphs.append(params[0])
+        return None
+
+    async with FakeTrueNASServer(
+        valid_api_key=API_KEY,
+        responses={
+            "system.info": {
+                "system_manufacturer": "QEMU",
+                "system_product": "Standard PC",
+            },
+            "reporting.netdata_graph": netdata_graph,
+        },
+    ) as server:
+        async with make_client(server) as client:
+            await client.connect()
+            state = TrueNASState(client)
+            await state.get_systemstats()
+
+    assert "cputemp" not in called_graphs
+
+
 async def test_get_systemstats_enriches_interface_throughput() -> None:
     raw_interfaces = [
         {"id": "eno1", "name": "eno1", "state": {"link_state": "LINK_STATE_UP"}}
@@ -1913,6 +1938,7 @@ async def test_get_systemstats_enriches_interface_throughput() -> None:
     async with FakeTrueNASServer(
         valid_api_key=API_KEY,
         responses={
+            "system.info": {},
             "interface.query": raw_interfaces,
             "reporting.netdata_graph": netdata_graph,
         },
@@ -1951,6 +1977,7 @@ async def test_get_systemstats_keeps_previous_throughput_on_malformed_item() -> 
     async with FakeTrueNASServer(
         valid_api_key=API_KEY,
         responses={
+            "system.info": {},
             "interface.query": raw_interfaces,
             "reporting.netdata_graph": netdata_graph,
         },
@@ -1979,7 +2006,7 @@ async def test_get_systemstats_skips_interface_query_without_prior_get_interface
 
     async with FakeTrueNASServer(
         valid_api_key=API_KEY,
-        responses={"reporting.netdata_graph": netdata_graph},
+        responses={"system.info": {}, "reporting.netdata_graph": netdata_graph},
     ) as server:
         async with make_client(server) as client:
             await client.connect()
@@ -1993,6 +2020,7 @@ async def test_get_systemstats_keeps_previous_value_on_malformed_graph() -> None
     async with FakeTrueNASServer(
         valid_api_key=API_KEY,
         responses={
+            "system.info": {},
             "reporting.netdata_graph": lambda params: [
                 {"legend": ["cpu"], "aggregations": {"mean": {"cpu": 20.0}}}
             ],
@@ -2014,6 +2042,7 @@ async def test_get_systemstats_keeps_previous_value_when_graph_query_raises() ->
     async with FakeTrueNASServer(
         valid_api_key=API_KEY,
         responses={
+            "system.info": {},
             "reporting.netdata_graph": lambda params: [
                 {"legend": ["cpu"], "aggregations": {"mean": {"cpu": 20.0}}}
             ],

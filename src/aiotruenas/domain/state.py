@@ -309,10 +309,13 @@ class TrueNASState:
         # get_disk(); "" once discovery has run but found none, None until
         # discovery has run at all (see _disk_temps_from_netdata()).
         self._disk_temp_graph: str | None = None
-        # Whether the connected system is virtualized (set by
-        # get_systeminfo()); used by get_systemstats() to skip the
-        # CPU-temperature graph, which has no physical sensor on a VM.
-        self._is_virtual: bool = False
+        # Whether the connected system is virtualized; used by
+        # get_systemstats() to skip the CPU-temperature graph, which has no
+        # physical sensor on a VM. Populated by get_systeminfo(), or lazily
+        # detected on first use by _detect_virtual() if get_systemstats() is
+        # called before get_systeminfo() ever has been -- None means "not
+        # yet known" (see _detect_virtual()), distinct from a confirmed False.
+        self._is_virtual: bool | None = None
 
     @property
     def ds(self) -> _PublicStateMap:
@@ -737,6 +740,22 @@ class TrueNASState:
         if version != (0, 0):
             self._version = version
         return version
+
+    async def _detect_virtual(self) -> bool:
+        """Return whether the system is virtualized, detecting it on first use.
+
+        Mirrors ``_detect_version()``'s lazy, cached-on-first-use pattern, so
+        ``get_systemstats()`` correctly skips the ``cputemp`` graph even when
+        called before ``get_systeminfo()`` has ever populated
+        ``self._is_virtual``.
+        """
+        if self._is_virtual is not None:
+            return self._is_virtual
+        raw = await self._client.call("system.info")
+        manufacturer = raw.get("system_manufacturer") if isinstance(raw, dict) else None
+        product = raw.get("system_product") if isinstance(raw, dict) else None
+        self._is_virtual = _is_virtual_machine(manufacturer, product)
+        return self._is_virtual
 
     async def get_container(self) -> _EndpointMap:
         """Refresh and return normalized containers.
@@ -1285,9 +1304,10 @@ class TrueNASState:
                 "aggregate": True,
             }
             info = self._ds["system_info"]
+            is_virtual = await self._detect_virtual()
 
             for graph_name in _SYSTEMSTATS_GRAPHS:
-                if graph_name == "cputemp" and self._is_virtual:
+                if graph_name == "cputemp" and is_virtual:
                     continue
                 try:
                     raw = await self._client.call(
