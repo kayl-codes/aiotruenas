@@ -1400,10 +1400,12 @@ class TrueNASState:
         except TrueNASError:
             raw_interface = None
         throughput_by_id = _netdata_interface_throughput(raw_interface)
+        applied = False
         for identifier, throughput in throughput_by_id.items():
-            if identifier in self._ds["interface"]:
+            if identifier in self._ds["interface"] and throughput:
                 self._ds["interface"][identifier].update(throughput)
-        return set() if throughput_by_id else {"interface"}
+                applied = True
+        return set() if applied else {"interface"}
 
     def _apply_systemstat(
         self, graph_name: str, raw: Any, info: dict[str, Any]

@@ -2433,3 +2433,43 @@ async def test_systemstats_stale_graphs_reports_malformed_interface_without_erro
 
     assert "interface" in state.systemstats_stale_graphs
     assert "cpu" not in state.systemstats_stale_graphs
+
+
+async def test_systemstats_stale_graphs_reports_interface_with_no_matching_id() -> None:
+    """A graph response with entries is still "no usable reading" if none of
+    its identifiers match a known interface, or their throughput is empty --
+    both must mark ``"interface"`` stale, not just an empty/failed response.
+    """
+    raw_interfaces = [
+        {"id": "eno1", "name": "eno1", "state": {"link_state": "LINK_STATE_UP"}}
+    ]
+
+    def netdata_graph(params: list) -> Any:
+        if params[0] == "interface":
+            return [
+                {
+                    "identifier": "unknown0",
+                    "legend": ["received", "sent"],
+                    "aggregations": {"mean": {"received": 8192.0, "sent": 4096.0}},
+                },
+                {"identifier": "eno1"},
+            ]
+        return [{"legend": ["cpu"], "aggregations": {"mean": {"cpu": 20.0}}}]
+
+    async with FakeTrueNASServer(
+        valid_api_key=API_KEY,
+        responses={
+            "system.info": {},
+            "interface.query": raw_interfaces,
+            "reporting.netdata_graph": netdata_graph,
+        },
+    ) as server:
+        async with make_client(server) as client:
+            await client.connect()
+            state = TrueNASState(client)
+            await state.get_interface()
+            await state.get_systemstats()
+
+    assert "interface" in state.systemstats_stale_graphs
+    assert "cpu" not in state.systemstats_stale_graphs
+    assert state.ds["interface"]["eno1"]["rx"] == 0
