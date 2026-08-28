@@ -2228,3 +2228,248 @@ async def test_get_systemstats_queries_graphs_when_virtual_detection_fails() -> 
             result = await state.get_systemstats()
 
     assert result["cpu_usage"] == 20.0
+
+
+async def test_systemstats_stale_graphs_empty_before_first_call() -> None:
+    async with FakeTrueNASServer(valid_api_key=API_KEY) as server:
+        async with make_client(server) as client:
+            await client.connect()
+            state = TrueNASState(client)
+
+    assert state.systemstats_stale_graphs == frozenset()
+
+
+def _well_formed_netdata_graph(params: list) -> Any:
+    """Return a realistic, correctly-shaped response for every systemstats
+    graph -- unlike a single shared fixture value, this lets a "full
+    success" test actually succeed for every graph rather than only "cpu"
+    (whose shape happens to also satisfy ``_netdata_max_mean``, used for
+    "cputemp", but not the named-series lookups "load"/"memory"/"arcsize"
+    need).
+    """
+    graph_name = params[0]
+    if graph_name == "load":
+        return [
+            {
+                "legend": ["shortterm", "midterm", "longterm"],
+                "aggregations": {
+                    "mean": {"shortterm": 0.5, "midterm": 0.75, "longterm": 1.0}
+                },
+            }
+        ]
+    if graph_name == "memory":
+        return [
+            {"legend": ["available"], "aggregations": {"mean": {"available": 2000.0}}}
+        ]
+    if graph_name == "arcsize":
+        return [{"legend": ["size"], "aggregations": {"mean": {"size": 1500.0}}}]
+    return [{"legend": ["cpu"], "aggregations": {"mean": {"cpu": 20.0}}}]
+
+
+async def test_systemstats_stale_graphs_empty_on_full_success() -> None:
+    async with FakeTrueNASServer(
+        valid_api_key=API_KEY,
+        responses={
+            "system.info": {},
+            "reporting.netdata_graph": _well_formed_netdata_graph,
+        },
+    ) as server:
+        async with make_client(server) as client:
+            await client.connect()
+            state = TrueNASState(client)
+            await state.get_systemstats()
+
+    assert state.systemstats_stale_graphs == frozenset()
+
+
+async def test_systemstats_stale_graphs_reports_failed_graph() -> None:
+    async with FakeTrueNASServer(
+        valid_api_key=API_KEY,
+        responses={
+            "system.info": {},
+            "reporting.netdata_graph": {
+                "error": {
+                    "code": -32603,
+                    "message": "Internal error",
+                    "data": {"error": 1, "errname": "EFAULT", "reason": None},
+                }
+            },
+        },
+    ) as server:
+        async with make_client(server) as client:
+            await client.connect()
+            state = TrueNASState(client)
+            await state.get_systemstats()
+
+    assert state.systemstats_stale_graphs == frozenset(
+        {"load", "cpu", "cputemp", "memory", "arcsize"}
+    )
+
+
+async def test_systemstats_stale_graphs_reports_failed_interface_graph() -> None:
+    raw_interfaces = [
+        {"id": "eno1", "name": "eno1", "state": {"link_state": "LINK_STATE_UP"}}
+    ]
+
+    async with FakeTrueNASServer(
+        valid_api_key=API_KEY,
+        responses={
+            "system.info": {},
+            "interface.query": raw_interfaces,
+            "reporting.netdata_graph": lambda params: (
+                {
+                    "error": {
+                        "code": -32603,
+                        "message": "Internal error",
+                        "data": {"error": 1, "errname": "EFAULT", "reason": None},
+                    }
+                }
+                if params[0] == "interface"
+                else [{"legend": ["cpu"], "aggregations": {"mean": {"cpu": 20.0}}}]
+            ),
+        },
+    ) as server:
+        async with make_client(server) as client:
+            await client.connect()
+            state = TrueNASState(client)
+            await state.get_interface()
+            await state.get_systemstats()
+
+    assert "interface" in state.systemstats_stale_graphs
+    assert "cpu" not in state.systemstats_stale_graphs
+
+
+async def test_systemstats_stale_graphs_reset_on_next_successful_call() -> None:
+    call_count = 0
+
+    def netdata_graph(params: list) -> Any:
+        nonlocal call_count
+        call_count += 1
+        # 5 systemstats graphs (load, cpu, cputemp, memory, arcsize) are
+        # queried per get_systemstats() call; fail all of them on the first
+        # round, then succeed on the second.
+        if call_count <= 5:
+            return {
+                "error": {
+                    "code": -32603,
+                    "message": "Internal error",
+                    "data": {"error": 1, "errname": "EFAULT", "reason": None},
+                }
+            }
+        return _well_formed_netdata_graph(params)
+
+    async with FakeTrueNASServer(
+        valid_api_key=API_KEY,
+        responses={"system.info": {}, "reporting.netdata_graph": netdata_graph},
+    ) as server:
+        async with make_client(server) as client:
+            await client.connect()
+            state = TrueNASState(client)
+            await state.get_systemstats()
+            assert state.systemstats_stale_graphs
+
+            await state.get_systemstats()
+
+    assert state.systemstats_stale_graphs == frozenset()
+
+
+async def test_systemstats_stale_graphs_reports_malformed_graph_without_rpc_error() -> (
+    None
+):
+    """A graph query that succeeds (no ``TrueNASError``) but returns a
+    malformed/empty payload must be reported as stale too -- not just an
+    outright RPC failure. Otherwise a caller sees ``systemstats_stale_graphs``
+    empty even though e.g. ``cpu_usage`` was silently left at its previous
+    value.
+    """
+    async with FakeTrueNASServer(
+        valid_api_key=API_KEY,
+        responses={
+            "system.info": {},
+            "reporting.netdata_graph": _well_formed_netdata_graph,
+        },
+    ) as server:
+        async with make_client(server) as client:
+            await client.connect()
+            state = TrueNASState(client)
+            await state.get_systemstats()
+            assert state.systemstats_stale_graphs == frozenset()
+
+            server.responses["reporting.netdata_graph"] = lambda params: None
+            await state.get_systemstats()
+
+    assert "cpu" in state.systemstats_stale_graphs
+
+
+async def test_systemstats_stale_graphs_reports_malformed_interface_without_error() -> (
+    None
+):
+    """Mirrors the graph-level case above for the interface throughput
+    enrichment: an RPC that succeeds but returns no usable interface entries
+    must mark ``"interface"`` stale, not just an outright RPC failure.
+    """
+    raw_interfaces = [
+        {"id": "eno1", "name": "eno1", "state": {"link_state": "LINK_STATE_UP"}}
+    ]
+
+    def netdata_graph(params: list) -> Any:
+        if params[0] == "interface":
+            return []
+        return [{"legend": ["cpu"], "aggregations": {"mean": {"cpu": 20.0}}}]
+
+    async with FakeTrueNASServer(
+        valid_api_key=API_KEY,
+        responses={
+            "system.info": {},
+            "interface.query": raw_interfaces,
+            "reporting.netdata_graph": netdata_graph,
+        },
+    ) as server:
+        async with make_client(server) as client:
+            await client.connect()
+            state = TrueNASState(client)
+            await state.get_interface()
+            await state.get_systemstats()
+
+    assert "interface" in state.systemstats_stale_graphs
+    assert "cpu" not in state.systemstats_stale_graphs
+
+
+async def test_systemstats_stale_graphs_reports_interface_with_no_matching_id() -> None:
+    """A graph response with entries is still "no usable reading" if none of
+    its identifiers match a known interface, or their throughput is empty --
+    both must mark ``"interface"`` stale, not just an empty/failed response.
+    """
+    raw_interfaces = [
+        {"id": "eno1", "name": "eno1", "state": {"link_state": "LINK_STATE_UP"}}
+    ]
+
+    def netdata_graph(params: list) -> Any:
+        if params[0] == "interface":
+            return [
+                {
+                    "identifier": "unknown0",
+                    "legend": ["received", "sent"],
+                    "aggregations": {"mean": {"received": 8192.0, "sent": 4096.0}},
+                },
+                {"identifier": "eno1"},
+            ]
+        return [{"legend": ["cpu"], "aggregations": {"mean": {"cpu": 20.0}}}]
+
+    async with FakeTrueNASServer(
+        valid_api_key=API_KEY,
+        responses={
+            "system.info": {},
+            "interface.query": raw_interfaces,
+            "reporting.netdata_graph": netdata_graph,
+        },
+    ) as server:
+        async with make_client(server) as client:
+            await client.connect()
+            state = TrueNASState(client)
+            await state.get_interface()
+            await state.get_systemstats()
+
+    assert "interface" in state.systemstats_stale_graphs
+    assert "cpu" not in state.systemstats_stale_graphs
+    assert state.ds["interface"]["eno1"]["rx"] == 0

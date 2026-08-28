@@ -22,8 +22,10 @@ failing (e.g. `directoryservices.*` with no AD/LDAP configured, or
 reported by name and does not stop the remaining checks -- including a
 connection dropped mid-session, since `TrueNASState`'s own methods are
 designed to catch and absorb per-call `TrueNASError`s themselves rather
-than propagate them (e.g. `get_systemstats()`'s netdata-graph calls). Only
-a failure during the *initial* connection/login, before any checks run,
+than propagate them (e.g. `get_systemstats()`'s netdata-graph calls, flagged
+as "partially stale" below via `TrueNASState.systemstats_stale_graphs`
+rather than being silently reported as a fully fresh success). Only a
+failure during the *initial* connection/login, before any checks run,
 aborts the script outright.
 
 `job=True` (the `core.get_jobs` polling convenience) is deliberately NOT
@@ -150,7 +152,12 @@ async def _check_domain_state(client: TrueNASClient) -> None:
             failed.append(name)
             print(f"  {name}(): FAILED ({type(exc).__name__}): {exc}")
         else:
-            print(f"  {name}(): OK -> {_summarize(result)}")
+            if name == "get_systemstats" and state.systemstats_stale_graphs:
+                stale = ", ".join(sorted(state.systemstats_stale_graphs))
+                summary = _summarize(result)
+                print(f"  {name}(): OK (partially stale: {stale}) -> {summary}")
+            else:
+                print(f"  {name}(): OK -> {_summarize(result)}")
 
     if failed:
         print(
