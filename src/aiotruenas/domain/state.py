@@ -1347,41 +1347,63 @@ class TrueNASState:
                 "aggregate": True,
             }
             info = self._ds["system_info"]
-            stale: set[str] = set()
             try:
                 is_virtual = await self._detect_virtual()
             except TrueNASError:
                 is_virtual = False
 
-            for graph_name in _SYSTEMSTATS_GRAPHS:
-                if graph_name == "cputemp" and is_virtual:
-                    continue
-                try:
-                    raw = await self._client.call(
-                        "reporting.netdata_graph", [graph_name, graph_query]
-                    )
-                except TrueNASError:
-                    stale.add(graph_name)
-                    continue
-                if not self._apply_systemstat(graph_name, raw, info):
-                    stale.add(graph_name)
-
-            if self._ds["interface"]:
-                try:
-                    raw_interface = await self._client.call(
-                        "reporting.netdata_graph", ["interface", graph_query]
-                    )
-                except TrueNASError:
-                    raw_interface = None
-                throughput_by_id = _netdata_interface_throughput(raw_interface)
-                if not throughput_by_id:
-                    stale.add("interface")
-                for identifier, throughput in throughput_by_id.items():
-                    if identifier in self._ds["interface"]:
-                        self._ds["interface"][identifier].update(throughput)
+            stale = await self._refresh_systemstat_graphs(
+                graph_query, info, is_virtual=is_virtual
+            )
+            stale |= await self._refresh_interface_throughput(graph_query)
 
             self._systemstats_stale_graphs = frozenset(stale)
             return info
+
+    async def _refresh_systemstat_graphs(
+        self, graph_query: dict[str, Any], info: dict[str, Any], *, is_virtual: bool
+    ) -> set[str]:
+        """Query each netdata stats graph in ``_SYSTEMSTATS_GRAPHS`` and apply it.
+
+        Returns the set of graph names that failed or yielded no usable
+        reading, per ``get_systemstats()``'s staleness contract.
+        """
+        stale: set[str] = set()
+        for graph_name in _SYSTEMSTATS_GRAPHS:
+            if graph_name == "cputemp" and is_virtual:
+                continue
+            try:
+                raw = await self._client.call(
+                    "reporting.netdata_graph", [graph_name, graph_query]
+                )
+            except TrueNASError:
+                stale.add(graph_name)
+                continue
+            if not self._apply_systemstat(graph_name, raw, info):
+                stale.add(graph_name)
+        return stale
+
+    async def _refresh_interface_throughput(
+        self, graph_query: dict[str, Any]
+    ) -> set[str]:
+        """Enrich ``ds["interface"]`` with rx/tx throughput, if populated.
+
+        Returns ``{"interface"}`` if the graph failed or yielded no usable
+        reading, an empty set otherwise -- see ``get_systemstats()``.
+        """
+        if not self._ds["interface"]:
+            return set()
+        try:
+            raw_interface = await self._client.call(
+                "reporting.netdata_graph", ["interface", graph_query]
+            )
+        except TrueNASError:
+            raw_interface = None
+        throughput_by_id = _netdata_interface_throughput(raw_interface)
+        for identifier, throughput in throughput_by_id.items():
+            if identifier in self._ds["interface"]:
+                self._ds["interface"][identifier].update(throughput)
+        return set() if throughput_by_id else {"interface"}
 
     def _apply_systemstat(
         self, graph_name: str, raw: Any, info: dict[str, Any]
