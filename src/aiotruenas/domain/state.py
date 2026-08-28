@@ -165,13 +165,15 @@ _SYSTEMSTATS_GRAPHS: tuple[str, ...] = ("load", "cpu", "cputemp", "memory", "arc
 _SYSTEM_INFO_METHOD = "system.info"
 
 
-def _apply_cputemp_stat(raw: Any, info: dict[str, Any]) -> None:
+def _apply_cputemp_stat(raw: Any, info: dict[str, Any]) -> bool:
     temp = _netdata_max_mean(raw)
-    if temp is not None:
-        info["cpu_temperature"] = temp
+    if temp is None:
+        return False
+    info["cpu_temperature"] = temp
+    return True
 
 
-def _apply_load_stat(raw: Any, info: dict[str, Any]) -> None:
+def _apply_load_stat(raw: Any, info: dict[str, Any]) -> bool:
     means = _netdata_named_means(raw, ("shortterm", "midterm", "longterm"))
     for series, field in (
         ("shortterm", "load_shortterm"),
@@ -180,34 +182,40 @@ def _apply_load_stat(raw: Any, info: dict[str, Any]) -> None:
     ):
         if series in means:
             info[field] = round(means[series], 2)
+    return bool(means)
 
 
-def _apply_cpu_stat(raw: Any, info: dict[str, Any]) -> None:
+def _apply_cpu_stat(raw: Any, info: dict[str, Any]) -> bool:
     means = _netdata_named_means(raw, ("cpu",))
-    if "cpu" in means:
-        info["cpu_usage"] = round(means["cpu"], 2)
+    if "cpu" not in means:
+        return False
+    info["cpu_usage"] = round(means["cpu"], 2)
+    return True
 
 
-def _apply_arcsize_stat(raw: Any, info: dict[str, Any]) -> None:
+def _apply_arcsize_stat(raw: Any, info: dict[str, Any]) -> bool:
     means = _netdata_named_means(raw, ("size",))
-    if "size" in means:
-        info["cache_size-arc_value"] = round(means["size"], 2)
+    if "size" not in means:
+        return False
+    info["cache_size-arc_value"] = round(means["size"], 2)
+    return True
 
 
-def _apply_memory_stat(raw: Any, info: dict[str, Any]) -> None:
+def _apply_memory_stat(raw: Any, info: dict[str, Any]) -> bool:
     means = _netdata_named_means(raw, ("available",))
     if "available" not in means:
-        return
+        return False
     info["memory-free_value"] = round(means["available"], 2)
     total = info.get("memory-total_value", 0)
     if isinstance(total, (int, float)) and not isinstance(total, bool) and total > 0:
         info["memory-usage_percent"] = round(100 * (total - means["available"]) / total)
+    return True
 
 
 # Dispatch table for _apply_systemstat(): keeps that method's cognitive
 # complexity low by moving each graph's field-mapping logic into its own
 # small, independently-testable function (SonarQube S3776).
-_SYSTEMSTAT_HANDLERS: dict[str, Callable[[Any, dict[str, Any]], None]] = {
+_SYSTEMSTAT_HANDLERS: dict[str, Callable[[Any, dict[str, Any]], bool]] = {
     "cputemp": _apply_cputemp_stat,
     "load": _apply_load_stat,
     "cpu": _apply_cpu_stat,
@@ -1327,7 +1335,9 @@ class TrueNASState:
 
         A graph that fails is recorded in ``systemstats_stale_graphs`` (named
         ``"interface"`` for the throughput enrichment) so a caller can tell
-        a partially-stale result apart from a fully fresh one.
+        a partially-stale result apart from a fully fresh one -- this covers
+        both an outright RPC failure and an RPC that succeeds but returns a
+        malformed/empty payload with no usable reading.
         """
         async with self._lock:
             report_epoch = int(datetime.now(UTC).replace(microsecond=0).timestamp())
@@ -1353,7 +1363,8 @@ class TrueNASState:
                 except TrueNASError:
                     stale.add(graph_name)
                     continue
-                self._apply_systemstat(graph_name, raw, info)
+                if not self._apply_systemstat(graph_name, raw, info):
+                    stale.add(graph_name)
 
             if self._ds["interface"]:
                 try:
@@ -1362,10 +1373,10 @@ class TrueNASState:
                     )
                 except TrueNASError:
                     raw_interface = None
+                throughput_by_id = _netdata_interface_throughput(raw_interface)
+                if not throughput_by_id:
                     stale.add("interface")
-                for identifier, throughput in _netdata_interface_throughput(
-                    raw_interface
-                ).items():
+                for identifier, throughput in throughput_by_id.items():
                     if identifier in self._ds["interface"]:
                         self._ds["interface"][identifier].update(throughput)
 
@@ -1374,8 +1385,13 @@ class TrueNASState:
 
     def _apply_systemstat(
         self, graph_name: str, raw: Any, info: dict[str, Any]
-    ) -> None:
-        """Apply one netdata graph reading onto ``info`` (``ds["system_info"]``)."""
+    ) -> bool:
+        """Apply one netdata graph reading onto ``info`` (``ds["system_info"]``).
+
+        Returns whether a usable reading was actually applied, so a raw
+        response that is present but malformed/empty (RPC succeeded, but
+        the payload has no valid data) can be reported as stale too, not
+        just an outright RPC failure -- see ``systemstats_stale_graphs``.
+        """
         handler = _SYSTEMSTAT_HANDLERS.get(graph_name)
-        if handler is not None:
-            handler(raw, info)
+        return handler(raw, info) if handler is not None else True
