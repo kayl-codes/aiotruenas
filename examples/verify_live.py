@@ -12,11 +12,19 @@ Usage:
     TRUENAS_HOST=truenas.local TRUENAS_API_KEY=... python examples/verify_live.py
     python examples/verify_live.py --no-verify-ssl
 
-Calls every read-only method from PROMPT.md's "must work end-to-end" list. A
-method failing (e.g. `directoryservices.*` with no AD/LDAP configured, or
+Calls every read-only method from PROMPT.md's "must work end-to-end" list,
+both as raw `TrueNASClient.call()` RPCs and again through every
+`TrueNASState.get_*()` normalizer, to catch regressions in the domain
+normalization layer (`aiotruenas.domain`) against real API response shapes,
+not just the mocked fixtures the unit tests use. A method or normalizer
+failing (e.g. `directoryservices.*` with no AD/LDAP configured, or
 `virt.instance.query` on a system still on the older `vm.query` API) is
-reported by name but does not stop the remaining methods from running — only
-a real connection/login failure aborts the script.
+reported by name and does not stop the remaining checks -- including a
+connection dropped mid-session, since `TrueNASState`'s own methods are
+designed to catch and absorb per-call `TrueNASError`s themselves rather
+than propagate them (e.g. `get_systemstats()`'s netdata-graph calls). Only
+a failure during the *initial* connection/login, before any checks run,
+aborts the script outright.
 
 `job=True` (the `core.get_jobs` polling convenience) is deliberately NOT
 exercised here: it only makes sense on a call whose result is a freshly
@@ -32,8 +40,9 @@ import argparse
 import asyncio
 import os
 import sys
+from collections.abc import Awaitable, Callable
 
-from aiotruenas import TrueNASClient
+from aiotruenas import TrueNASClient, TrueNASState
 from aiotruenas.exceptions import TrueNASError
 
 #: Read-only methods from PROMPT.md's "must work end-to-end" RPC list (the
@@ -96,6 +105,62 @@ def _summarize(result: object) -> str:
     return repr(result)
 
 
+async def _check_domain_state(client: TrueNASClient) -> None:
+    """Exercise every `TrueNASState.get_*()` normalizer against the live client.
+
+    Ordered so `get_interface()` runs before `get_systemstats()`: the latter
+    enriches `ds["interface"]` with rx/tx as a side effect, but only if
+    `get_interface()` has already populated it (nothing to attribute
+    throughput to otherwise) — see `TrueNASState.get_systemstats()`'s
+    docstring.
+    """
+    state = TrueNASState(client)
+    calls: list[tuple[str, Callable[[], Awaitable[object]]]] = [
+        ("get_systeminfo", state.get_systeminfo),
+        ("get_interface", state.get_interface),
+        ("get_disk", state.get_disk),
+        ("get_dataset", state.get_dataset),
+        ("get_pool", state.get_pool),
+        ("get_cloudsync", state.get_cloudsync),
+        ("get_replication", state.get_replication),
+        ("get_rsync", state.get_rsync),
+        ("get_snapshottask", state.get_snapshottask),
+        ("get_cronjob", state.get_cronjob),
+        ("get_service", state.get_service),
+        ("get_vm", state.get_vm),
+        ("get_container", state.get_container),
+        ("get_app", state.get_app),
+        ("get_certificates", state.get_certificates),
+        ("get_directoryservices", state.get_directoryservices),
+        ("get_alerts", state.get_alerts),
+        ("get_scrub", state.get_scrub),
+        ("get_smb", state.get_smb),
+        ("get_update", state.get_update),
+        ("get_arc", state.get_arc),
+        ("get_ups", state.get_ups),
+        ("get_systemstats", state.get_systemstats),
+    ]
+
+    print("\nTrueNASState (domain normalization layer):")
+    failed = []
+    for name, call in calls:
+        try:
+            result = await call()
+        except Exception as exc:  # broad: probing normalizers for real-shape bugs
+            failed.append(name)
+            print(f"  {name}(): FAILED ({type(exc).__name__}): {exc}")
+        else:
+            print(f"  {name}(): OK -> {_summarize(result)}")
+
+    if failed:
+        print(
+            f"\n{len(failed)}/{len(calls)} TrueNASState methods failed: "
+            f"{', '.join(failed)}"
+        )
+    else:
+        print(f"\nall {len(calls)} TrueNASState methods OK")
+
+
 async def _check_subscriptions(client: TrueNASClient) -> None:
     """Subscribe to ``app.stats`` and drain any queued events."""
     try:
@@ -109,7 +174,10 @@ async def _check_subscriptions(client: TrueNASClient) -> None:
     except TrueNASError as exc:
         print(f"  get_subscription_events: FAILED ({type(exc).__name__}): {exc}")
     finally:
-        await client.unsubscribe(sub_id)
+        try:
+            await client.unsubscribe(sub_id)
+        except TrueNASError as exc:
+            print(f"  unsubscribe: FAILED ({type(exc).__name__}): {exc}")
 
 
 async def _check_job_polling(client: TrueNASClient) -> None:
@@ -157,6 +225,7 @@ async def _run(host: str, api_key: str, *, verify_ssl: bool) -> None:
 
         await _check_job_polling(client)
         await _check_subscriptions(client)
+        await _check_domain_state(client)
 
         if failed:
             print(
