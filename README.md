@@ -77,7 +77,10 @@ flat dict of scalar/aggregate readings (e.g. `{"battery_charge": 80.0, ...}`,
 `{"count": 2, "critical": 1, ...}` for alerts, or `{"connections": 3}` for `get_smb()`).
 `get_systemstats()` enriches that same flat `ds["system_info"]` dict (CPU/load/memory/ARC-size)
 and, as a side effect, `ds["interface"][id]["rx"/"tx"]` (interface throughput) rather than
-returning its own endpoint.
+returning its own endpoint. Its underlying netdata graph queries are best-effort: a failed graph
+leaves its field(s) at the previous value instead of failing the whole call. Check
+`state.systemstats_stale_graphs` after calling it to see which graphs (if any) failed on the most
+recent refresh, so a caller can distinguish a partially stale result from a fully fresh one.
 
 ## Status
 

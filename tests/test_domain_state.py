@@ -2228,3 +2228,118 @@ async def test_get_systemstats_queries_graphs_when_virtual_detection_fails() -> 
             result = await state.get_systemstats()
 
     assert result["cpu_usage"] == 20.0
+
+
+async def test_systemstats_stale_graphs_empty_before_first_call() -> None:
+    async with FakeTrueNASServer(valid_api_key=API_KEY) as server:
+        async with make_client(server) as client:
+            await client.connect()
+            state = TrueNASState(client)
+
+    assert state.systemstats_stale_graphs == frozenset()
+
+
+async def test_systemstats_stale_graphs_empty_on_full_success() -> None:
+    async with FakeTrueNASServer(
+        valid_api_key=API_KEY,
+        responses={
+            "system.info": {},
+            "reporting.netdata_graph": lambda params: [
+                {"legend": ["cpu"], "aggregations": {"mean": {"cpu": 20.0}}}
+            ],
+        },
+    ) as server:
+        async with make_client(server) as client:
+            await client.connect()
+            state = TrueNASState(client)
+            await state.get_systemstats()
+
+    assert state.systemstats_stale_graphs == frozenset()
+
+
+async def test_systemstats_stale_graphs_reports_failed_graph() -> None:
+    async with FakeTrueNASServer(
+        valid_api_key=API_KEY,
+        responses={
+            "system.info": {},
+            "reporting.netdata_graph": {
+                "error": {
+                    "code": -32603,
+                    "message": "Internal error",
+                    "data": {"error": 1, "errname": "EFAULT", "reason": None},
+                }
+            },
+        },
+    ) as server:
+        async with make_client(server) as client:
+            await client.connect()
+            state = TrueNASState(client)
+            await state.get_systemstats()
+
+    assert state.systemstats_stale_graphs == frozenset(
+        {"load", "cpu", "cputemp", "memory", "arcsize"}
+    )
+
+
+async def test_systemstats_stale_graphs_reports_failed_interface_graph() -> None:
+    raw_interfaces = [
+        {"id": "eno1", "name": "eno1", "state": {"link_state": "LINK_STATE_UP"}}
+    ]
+
+    async with FakeTrueNASServer(
+        valid_api_key=API_KEY,
+        responses={
+            "system.info": {},
+            "interface.query": raw_interfaces,
+            "reporting.netdata_graph": lambda params: (
+                {
+                    "error": {
+                        "code": -32603,
+                        "message": "Internal error",
+                        "data": {"error": 1, "errname": "EFAULT", "reason": None},
+                    }
+                }
+                if params[0] == "interface"
+                else [{"legend": ["cpu"], "aggregations": {"mean": {"cpu": 20.0}}}]
+            ),
+        },
+    ) as server:
+        async with make_client(server) as client:
+            await client.connect()
+            state = TrueNASState(client)
+            await state.get_interface()
+            await state.get_systemstats()
+
+    assert "interface" in state.systemstats_stale_graphs
+    assert "cpu" not in state.systemstats_stale_graphs
+
+
+async def test_systemstats_stale_graphs_reset_on_next_successful_call() -> None:
+    call_count = 0
+
+    def netdata_graph(params: list) -> Any:
+        nonlocal call_count
+        call_count += 1
+        if call_count == 1:
+            return {
+                "error": {
+                    "code": -32603,
+                    "message": "Internal error",
+                    "data": {"error": 1, "errname": "EFAULT", "reason": None},
+                }
+            }
+        return [{"legend": ["cpu"], "aggregations": {"mean": {"cpu": 20.0}}}]
+
+    async with FakeTrueNASServer(
+        valid_api_key=API_KEY,
+        responses={"system.info": {}, "reporting.netdata_graph": netdata_graph},
+    ) as server:
+        async with make_client(server) as client:
+            await client.connect()
+            state = TrueNASState(client)
+            await state.get_systemstats()
+            assert state.systemstats_stale_graphs
+
+            await state.get_systemstats()
+
+    assert state.systemstats_stale_graphs == frozenset()

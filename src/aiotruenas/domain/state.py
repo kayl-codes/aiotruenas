@@ -322,6 +322,10 @@ class TrueNASState:
         # called before get_systeminfo() ever has been -- None means "not
         # yet known" (see _detect_virtual()), distinct from a confirmed False.
         self._is_virtual: bool | None = None
+        # Names of get_systemstats()'s netdata graphs that failed on the most
+        # recent call, leaving their field(s) at the previous value instead
+        # of a fresh reading -- see systemstats_stale_graphs.
+        self._systemstats_stale_graphs: frozenset[str] = frozenset()
 
     @property
     def ds(self) -> _PublicStateMap:
@@ -336,6 +340,20 @@ class TrueNASState:
         iterating over endpoint names) under static type checking.
         """
         return cast(_PublicStateMap, self._ds)
+
+    @property
+    def systemstats_stale_graphs(self) -> frozenset[str]:
+        """Names of ``get_systemstats()``'s netdata graphs that failed on the
+        most recent call, leaving their field(s) at the previous value
+        instead of a fresh reading. Empty after a fully fresh refresh, and
+        also empty before ``get_systemstats()`` has ever been called.
+
+        A non-empty result does not mean ``get_systemstats()`` failed -- it
+        still returns the current (partially stale) ``ds["system_info"]`` --
+        only that some of its fields may be outdated, e.g. because a netdata
+        RPC failed transiently or the connection dropped mid-refresh.
+        """
+        return self._systemstats_stale_graphs
 
     async def get_dataset(self) -> _EndpointMap:
         """Refresh and return normalized ZFS datasets (``pool.dataset.query``)."""
@@ -1306,6 +1324,10 @@ class TrueNASState:
         treated as non-virtual so it does not abort the graph queries below.
         Interface throughput is skipped entirely if ``get_interface()``
         hasn't populated ``ds["interface"]`` yet (nothing to attribute it to).
+
+        A graph that fails is recorded in ``systemstats_stale_graphs`` (named
+        ``"interface"`` for the throughput enrichment) so a caller can tell
+        a partially-stale result apart from a fully fresh one.
         """
         async with self._lock:
             report_epoch = int(datetime.now(UTC).replace(microsecond=0).timestamp())
@@ -1315,6 +1337,7 @@ class TrueNASState:
                 "aggregate": True,
             }
             info = self._ds["system_info"]
+            stale: set[str] = set()
             try:
                 is_virtual = await self._detect_virtual()
             except TrueNASError:
@@ -1328,6 +1351,7 @@ class TrueNASState:
                         "reporting.netdata_graph", [graph_name, graph_query]
                     )
                 except TrueNASError:
+                    stale.add(graph_name)
                     continue
                 self._apply_systemstat(graph_name, raw, info)
 
@@ -1338,12 +1362,14 @@ class TrueNASState:
                     )
                 except TrueNASError:
                     raw_interface = None
+                    stale.add("interface")
                 for identifier, throughput in _netdata_interface_throughput(
                     raw_interface
                 ).items():
                     if identifier in self._ds["interface"]:
                         self._ds["interface"][identifier].update(throughput)
 
+            self._systemstats_stale_graphs = frozenset(stale)
             return info
 
     def _apply_systemstat(
