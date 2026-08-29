@@ -492,9 +492,8 @@ class TrueNASClient:
                 send_error = exc
 
             if send_error is not None:
-                async with self._lock:
-                    self._pending_calls.pop(rpc_id, None)
-                    await self._close_websocket_locked()
+                self._pending_calls.pop(rpc_id, None)
+                await self._close_websocket_locked()
                 raise TrueNASConnectionClosedError(
                     str(send_error), phase="call"
                 ) from send_error

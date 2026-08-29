@@ -167,6 +167,24 @@ async def test_call_timeout_disconnects_client() -> None:
         assert not client.connected
 
 
+async def test_call_send_failure_does_not_deadlock(monkeypatch) -> None:
+    """Regression test: a failed ``send()`` must not try to reacquire
+    ``self._lock`` while the outer ``call()`` lock is still held (that
+    double-acquire on a non-reentrant asyncio.Lock deadlocks the task)."""
+    async with FakeTrueNASServer(valid_api_key=API_KEY) as server:
+        async with make_client(server) as client:
+            await client.connect()
+
+            async def failing_send(self, message, text=None) -> None:
+                raise ConnectionResetError("send failed")
+
+            monkeypatch.setattr(type(client._ws), "send", failing_send)
+
+            with pytest.raises(TrueNASConnectionClosedError) as exc_info:
+                await asyncio.wait_for(client.call("system.info"), timeout=5)
+            assert exc_info.value.phase == "call"
+
+
 async def test_connection_lost_mid_query() -> None:
     async with FakeTrueNASServer(
         valid_api_key=API_KEY, close_on_method={"system.info"}
