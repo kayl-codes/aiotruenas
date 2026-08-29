@@ -180,8 +180,9 @@ async def test_call_send_failure_does_not_deadlock(monkeypatch) -> None:
 
             monkeypatch.setattr(type(client._ws), "send", failing_send)
 
+            pending_call = client.call("system.info")
             with pytest.raises(TrueNASConnectionClosedError) as exc_info:
-                await asyncio.wait_for(client.call("system.info"), timeout=5)
+                await asyncio.wait_for(pending_call, timeout=5)
             assert exc_info.value.phase == "call"
 
 
