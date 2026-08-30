@@ -1365,21 +1365,31 @@ class TrueNASState:
     ) -> set[str]:
         """Query each netdata stats graph in ``_SYSTEMSTATS_GRAPHS`` and apply it.
 
+        All graphs are fetched concurrently so a single slow/unresponsive
+        graph cannot delay the others -- see ``get_systemstats()``'s
+        staleness contract for how failures are surfaced instead of raising.
+
         Returns the set of graph names that failed or yielded no usable
-        reading, per ``get_systemstats()``'s staleness contract.
+        reading.
         """
+        graph_names = [
+            name for name in _SYSTEMSTATS_GRAPHS if name != "cputemp" or not is_virtual
+        ]
+        results = await asyncio.gather(
+            *(
+                self._client.call("reporting.netdata_graph", [graph_name, graph_query])
+                for graph_name in graph_names
+            ),
+            return_exceptions=True,
+        )
         stale: set[str] = set()
-        for graph_name in _SYSTEMSTATS_GRAPHS:
-            if graph_name == "cputemp" and is_virtual:
-                continue
-            try:
-                raw = await self._client.call(
-                    "reporting.netdata_graph", [graph_name, graph_query]
-                )
-            except TrueNASError:
+        for graph_name, result in zip(graph_names, results, strict=True):
+            if isinstance(result, TrueNASError):
                 stale.add(graph_name)
                 continue
-            if not self._apply_systemstat(graph_name, raw, info):
+            if isinstance(result, BaseException):
+                raise result
+            if not self._apply_systemstat(graph_name, result, info):
                 stale.add(graph_name)
         return stale
 

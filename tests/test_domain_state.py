@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import asyncio
 from datetime import UTC, datetime
 from typing import Any
 
@@ -2228,6 +2229,42 @@ async def test_get_systemstats_queries_graphs_when_virtual_detection_fails() -> 
             result = await state.get_systemstats()
 
     assert result["cpu_usage"] == 20.0
+
+
+async def test_get_systemstats_fetches_graphs_concurrently() -> None:
+    """Regression test for a sequential-fetch bug: all systemstats graphs
+    must be requested concurrently (via ``asyncio.gather``), so one
+    slow/unresponsive graph does not delay the others from even starting --
+    see homeassistant-truenas PR #118, which hit exactly this with a
+    sequential ``for`` loop.
+    """
+    expected_graphs = {"load", "cpu", "cputemp", "memory", "arcsize"}
+    started: set[str] = set()
+    all_started = asyncio.Event()
+
+    async def fake_call(method: str, params: Any = None, **kwargs: Any) -> Any:
+        if method == "system.info":
+            return {}
+        assert method == "reporting.netdata_graph"
+        started.add(params[0])
+        if started == expected_graphs:
+            all_started.set()
+        else:
+            # If graphs were fetched one at a time, this call would already
+            # hold the (implicit) turn while the others haven't started
+            # yet, so waiting here for the rest to start would deadlock and
+            # fail the test on timeout instead of hanging forever.
+            await asyncio.wait_for(all_started.wait(), timeout=2)
+        return [{"legend": ["cpu"], "aggregations": {"mean": {"cpu": 1.0}}}]
+
+    async with FakeTrueNASServer(valid_api_key=API_KEY) as server:
+        async with make_client(server) as client:
+            await client.connect()
+            state = TrueNASState(client)
+            client.call = fake_call  # type: ignore[method-assign]
+            await state.get_systemstats()
+
+    assert started == expected_graphs
 
 
 async def test_systemstats_stale_graphs_empty_before_first_call() -> None:
