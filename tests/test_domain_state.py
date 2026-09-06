@@ -1870,6 +1870,84 @@ async def test_get_disk_logs_warning_when_fallback_response_is_malformed(
     assert "disk.temperatures" in warnings[0].getMessage()
 
 
+async def test_get_disk_logs_warning_when_fallback_rpc_raises(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """A ``disk.temperatures`` RPC error (not just a malformed response) must
+    also surface a warning and set the failing flag -- previously it
+    propagated out of ``_fallback_disk_temperatures()`` and was swallowed
+    silently by ``get_disk()``'s own ``TrueNASError`` handling
+    (kayl-codes/homeassistant-truenas#131).
+    """
+    async with FakeTrueNASServer(
+        valid_api_key=API_KEY,
+        responses={
+            "disk.query": [_DISK_SDA],
+            "reporting.netdata_graphs": [],
+            "disk.temperatures": {
+                "error": {
+                    "code": -32603,
+                    "message": "Internal error",
+                    "data": {"error": 1, "errname": "EFAULT", "reason": None},
+                }
+            },
+        },
+    ) as server:
+        async with make_client(server) as client:
+            await client.connect()
+            state = TrueNASState(client)
+            with caplog.at_level(logging.DEBUG, logger="aiotruenas.domain.state"):
+                result = await state.get_disk()
+
+    assert result["{serial}S1"]["temperature"] is None
+    warnings = [
+        r
+        for r in caplog.records
+        if r.name == "aiotruenas.domain.state" and r.levelno == logging.WARNING
+    ]
+    assert len(warnings) == 1
+    assert "disk.temperatures" in warnings[0].getMessage()
+
+
+async def test_get_disk_treats_null_fallback_result_as_failure(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """A ``disk.temperatures`` RPC result of ``None`` is not a dict either,
+    so it must warn and set the failing flag just like any other malformed
+    response -- and, on a later poll, must not be mistaken for a recovery
+    from a still-ongoing failure just because it equals the "no failure"
+    sentinel value.
+    """
+    async with FakeTrueNASServer(
+        valid_api_key=API_KEY,
+        responses={
+            "disk.query": [_DISK_SDA],
+            "reporting.netdata_graphs": [],
+            "disk.temperatures": "not-a-dict",
+        },
+    ) as server:
+        async with make_client(server) as client:
+            await client.connect()
+            state = TrueNASState(client)
+            with caplog.at_level(logging.DEBUG, logger="aiotruenas.domain.state"):
+                first = await state.get_disk()
+
+                server.responses["disk.temperatures"] = None
+                second = await state.get_disk()
+
+    assert first["{serial}S1"]["temperature"] is None
+    assert second["{serial}S1"]["temperature"] is None
+    state_records = [r for r in caplog.records if r.name == "aiotruenas.domain.state"]
+    warnings = [r for r in state_records if r.levelno == logging.WARNING]
+    recoveries = [
+        r
+        for r in state_records
+        if r.levelno == logging.DEBUG and "recovered" in r.getMessage()
+    ]
+    assert len(warnings) == 1
+    assert not recoveries
+
+
 async def test_get_disk_only_warns_once_across_a_persistent_fallback_outage(
     caplog: pytest.LogCaptureFixture,
 ) -> None:

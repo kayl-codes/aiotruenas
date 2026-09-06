@@ -326,10 +326,11 @@ class TrueNASState:
         # get_disk(); "" once discovery has run but found none, None until
         # discovery has run at all (see _disk_temps_from_netdata()).
         self._disk_temp_graph: str | None = None
-        # Whether the last ``disk.temperatures`` fallback call got a
-        # malformed (non-dict) response -- lets _fallback_disk_temperatures()
-        # warn once on the failing transition and once on recovery instead
-        # of every poll for the duration of an outage.
+        # Whether the last ``disk.temperatures`` fallback call raised an RPC
+        # error or got a malformed (non-dict) response -- lets
+        # _fallback_disk_temperatures() warn once on the failing transition
+        # and once on recovery instead of every poll for the duration of an
+        # outage.
         self._disk_temp_fallback_failing = False
         # Whether the connected system is virtualized; used by
         # get_systemstats() to skip the CPU-temperature graph, which has no
@@ -1261,15 +1262,40 @@ class TrueNASState:
                 return name
         return ""
 
+    def _note_disk_temp_fallback_outcome(
+        self, *, failed: bool, reason: object = None
+    ) -> None:
+        """Track the ``disk.temperatures`` fallback's failing/recovered state.
+
+        ``failed`` decides the transition explicitly -- it is not inferred
+        from ``reason``, since a legitimate ``disk.temperatures`` response of
+        ``None`` would otherwise be indistinguishable from "no failure".
+        Warns only on the failing transition and logs recovery at debug, so
+        a persistent outage does not re-warn every poll (see
+        ``_fallback_disk_temperatures``).
+        """
+        if failed:
+            if not self._disk_temp_fallback_failing:
+                _LOGGER.warning(
+                    "Failed to update disk temperatures from API "
+                    "'disk.temperatures': %s",
+                    reason,
+                )
+                self._disk_temp_fallback_failing = True
+        elif self._disk_temp_fallback_failing:
+            _LOGGER.debug("Disk temperatures from API 'disk.temperatures' recovered")
+            self._disk_temp_fallback_failing = False
+
     async def _fallback_disk_temperatures(self, stale_uids: list[Hashable]) -> None:
         """Fetch temperatures for ``stale_uids`` via ``disk.temperatures``.
 
         Every ``stale_uids`` entry is a disk netdata did not refresh this
-        poll (see ``_update_disk_temperatures``), so a malformed response
-        here always leaves at least one disk's temperature stuck -- it is
-        warned about regardless of whether netdata covered other disks fine.
-        The warning only fires on the failing transition (and recovery is
-        logged at debug) so a persistent outage does not re-warn every poll.
+        poll (see ``_update_disk_temperatures``), so a failure here -- an
+        RPC error just as much as a malformed response -- always leaves at
+        least one disk's temperature stuck; it is warned about regardless
+        of whether netdata covered other disks fine. The warning only fires
+        on the failing transition (and recovery is logged at debug) so a
+        persistent outage does not re-warn every poll.
         """
         disk_names = [
             name
@@ -1277,19 +1303,15 @@ class TrueNASState:
             if isinstance(name := self._ds["disk"].get(uid, {}).get("name"), str)
             and name != "unknown"
         ]
-        temps = await self._client.call("disk.temperatures", [disk_names])
-        if not isinstance(temps, dict):
-            if not self._disk_temp_fallback_failing:
-                _LOGGER.warning(
-                    "Failed to update disk temperatures from API "
-                    "'disk.temperatures': %s",
-                    temps,
-                )
-                self._disk_temp_fallback_failing = True
+        try:
+            temps = await self._client.call("disk.temperatures", [disk_names])
+        except TrueNASError as err:
+            self._note_disk_temp_fallback_outcome(failed=True, reason=err)
             return
-        if self._disk_temp_fallback_failing:
-            _LOGGER.debug("Disk temperatures from API 'disk.temperatures' recovered")
-            self._disk_temp_fallback_failing = False
+        if not isinstance(temps, dict):
+            self._note_disk_temp_fallback_outcome(failed=True, reason=temps)
+            return
+        self._note_disk_temp_fallback_outcome(failed=False)
 
         for uid in stale_uids:
             vals = self._ds["disk"][uid]
