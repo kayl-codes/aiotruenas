@@ -20,6 +20,7 @@ import asyncio
 import copy
 from collections.abc import Callable, Hashable
 from datetime import UTC, datetime
+from logging import getLogger
 from typing import Any, TypedDict, cast
 
 from ..client import TrueNASClient
@@ -72,6 +73,8 @@ from ._specs import (
     _VM_ENSURE_VALS,
     _VM_VALS,
 )
+
+_LOGGER = getLogger(__name__)
 
 _EndpointMap = dict[Hashable, dict[str, Any]]
 #: get_arc() shape: one entry per known metric, None where currently unavailable.
@@ -323,6 +326,11 @@ class TrueNASState:
         # get_disk(); "" once discovery has run but found none, None until
         # discovery has run at all (see _disk_temps_from_netdata()).
         self._disk_temp_graph: str | None = None
+        # Whether the last ``disk.temperatures`` fallback call got a
+        # malformed (non-dict) response -- lets _fallback_disk_temperatures()
+        # warn once on the failing transition and once on recovery instead
+        # of every poll for the duration of an outage.
+        self._disk_temp_fallback_failing = False
         # Whether the connected system is virtualized; used by
         # get_systemstats() to skip the CPU-temperature graph, which has no
         # physical sensor on a VM. Populated by get_systeminfo(), or lazily
@@ -1161,31 +1169,55 @@ class TrueNASState:
         locally (rather than left to propagate to ``get_disk()``'s own
         try/except) so the ``disk.temperatures`` fallback below still runs
         for every disk instead of being skipped entirely.
+
+        Once netdata has produced a reading for a disk, that disk's
+        ``temperature`` is never ``None`` again, so gating the fallback on
+        ``temperature is None`` alone would only ever cover a disk on its
+        very first poll. If netdata later stops covering that disk (e.g. its
+        graph disappears, a name-mapping mismatch, or the query starts
+        failing), the stale reading would then persist indefinitely instead
+        of being refreshed. Falling back for every disk this poll's netdata
+        read did not actually refresh -- not just ones with no reading at
+        all -- keeps the value moving in that case too.
         """
         try:
             netdata_temps = await self._disk_temps_from_netdata()
         except TrueNASError:
             netdata_temps = None
+
+        refreshed: set[Hashable] = set()
         if netdata_temps:
             disk_map = self._build_disk_name_map()
             for name, temp in netdata_temps.items():
-                if name in disk_map:
-                    self._ds["disk"][disk_map[name]]["temperature"] = round(temp, 2)
+                if (uid := disk_map.get(name)) is not None:
+                    self._ds["disk"][uid]["temperature"] = round(temp, 2)
+                    refreshed.add(uid)
 
-        if missing := [
-            uid
-            for uid, vals in self._ds["disk"].items()
-            if vals.get("temperature") is None
-        ]:
-            await self._fallback_disk_temperatures(missing)
+        if fallback_uids := [uid for uid in self._ds["disk"] if uid not in refreshed]:
+            await self._fallback_disk_temperatures(fallback_uids)
+        else:
+            # netdata alone covered every disk this poll -- the fallback
+            # wasn't even consulted, so a prior failure can no longer be
+            # confirmed. Clear it rather than leaving it stuck True forever,
+            # or a later fallback failure would stay silently unwarned.
+            self._disk_temp_fallback_failing = False
 
     def _build_disk_name_map(self) -> dict[str, Hashable]:
         """Map each disk's identifier/devname/name to its ``self._ds["disk"]`` uid."""
         disk_map: dict[str, Hashable] = {}
         for uid, vals in self._ds["disk"].items():
             for key in (vals.get("identifier"), vals.get("devname"), vals.get("name")):
-                if isinstance(key, str) and key and key not in disk_map:
-                    disk_map[key] = uid
+                if isinstance(key, str) and key:
+                    if key not in disk_map:
+                        disk_map[key] = uid
+                    elif disk_map[key] != uid:
+                        _LOGGER.debug(
+                            "Disk mapping collision: key '%s' resolves to "
+                            "both %s and %s",
+                            key,
+                            disk_map[key],
+                            uid,
+                        )
         return disk_map
 
     async def _disk_temps_from_netdata(self) -> dict[str, float] | None:
@@ -1229,19 +1261,37 @@ class TrueNASState:
                 return name
         return ""
 
-    async def _fallback_disk_temperatures(self, missing_uids: list[Hashable]) -> None:
-        """Fetch temperatures for ``missing_uids`` via ``disk.temperatures``."""
+    async def _fallback_disk_temperatures(self, stale_uids: list[Hashable]) -> None:
+        """Fetch temperatures for ``stale_uids`` via ``disk.temperatures``.
+
+        Every ``stale_uids`` entry is a disk netdata did not refresh this
+        poll (see ``_update_disk_temperatures``), so a malformed response
+        here always leaves at least one disk's temperature stuck -- it is
+        warned about regardless of whether netdata covered other disks fine.
+        The warning only fires on the failing transition (and recovery is
+        logged at debug) so a persistent outage does not re-warn every poll.
+        """
         disk_names = [
             name
-            for uid in missing_uids
+            for uid in stale_uids
             if isinstance(name := self._ds["disk"].get(uid, {}).get("name"), str)
             and name != "unknown"
         ]
         temps = await self._client.call("disk.temperatures", [disk_names])
         if not isinstance(temps, dict):
+            if not self._disk_temp_fallback_failing:
+                _LOGGER.warning(
+                    "Failed to update disk temperatures from API "
+                    "'disk.temperatures': %s",
+                    temps,
+                )
+                self._disk_temp_fallback_failing = True
             return
+        if self._disk_temp_fallback_failing:
+            _LOGGER.debug("Disk temperatures from API 'disk.temperatures' recovered")
+            self._disk_temp_fallback_failing = False
 
-        for uid in missing_uids:
+        for uid in stale_uids:
             vals = self._ds["disk"][uid]
             candidates = (vals.get("identifier"), vals.get("devname"), vals.get("name"))
             matched = next(
@@ -1252,8 +1302,19 @@ class TrueNASState:
                 ),
                 None,
             )
-            if isinstance(matched, (int, float)) and not isinstance(matched, bool):
+            if matched is None:
+                _LOGGER.debug(
+                    "No matching temperature entry in 'disk.temperatures' "
+                    "for disk uid=%s (candidates: %s)",
+                    uid,
+                    [key for key in candidates if isinstance(key, str)],
+                )
+            elif isinstance(matched, (int, float)) and not isinstance(matched, bool):
                 vals["temperature"] = matched
+            else:
+                _LOGGER.debug(
+                    "Invalid temperature value %r for disk uid=%s", matched, uid
+                )
 
     async def get_systeminfo(self) -> _SystemInfoMap:
         """Refresh and return system info (``system.info``).
