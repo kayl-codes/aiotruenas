@@ -10,7 +10,7 @@ from typing import Any
 import pytest
 from fake_server import FakeTrueNASServer
 
-from aiotruenas import TrueNASClient, TrueNASState
+from aiotruenas import TrueNASClient, TrueNASError, TrueNASState
 
 API_KEY = "1-valid-key"
 
@@ -266,6 +266,45 @@ async def test_get_pool_keeps_previous_snapshot_on_unusable_pool_entries(
     assert result is previous_pool
     assert state.ds["dataset"] is previous_dataset
     assert state.ds["pool"] is previous_pool
+
+
+async def test_get_pool_logs_warning_when_pool_query_is_malformed(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """A malformed ``pool.query`` response must surface a warning and clear
+    it again once the endpoint recovers -- otherwise the pool snapshot can
+    silently go stale with no trace anywhere.
+    """
+    async with FakeTrueNASServer(
+        valid_api_key=API_KEY,
+        responses={
+            "pool.dataset.query": [_ROOT_DATASET],
+            "pool.query": [_POOL_TANK],
+            "boot.get_state": _BOOT_POOL,
+        },
+    ) as server:
+        async with make_client(server) as client:
+            await client.connect()
+            state = TrueNASState(client)
+            with caplog.at_level(logging.DEBUG, logger="aiotruenas.domain.state"):
+                await state.get_pool()
+
+                server.responses["pool.query"] = None
+                await state.get_pool()
+
+                server.responses["pool.query"] = [_POOL_TANK]
+                await state.get_pool()
+
+    state_records = [r for r in caplog.records if r.name == "aiotruenas.domain.state"]
+    warnings = [r for r in state_records if r.levelno == logging.WARNING]
+    recoveries = [
+        r
+        for r in state_records
+        if r.levelno == logging.DEBUG and "recovered" in r.getMessage()
+    ]
+    assert len(warnings) == 1
+    assert "pool.query" in warnings[0].getMessage()
+    assert len(recoveries) == 1
 
 
 async def test_get_pool_ignores_error_aggregation_for_unhashable_guid() -> None:
@@ -1279,6 +1318,93 @@ async def test_get_directoryservices_keeps_previous_status_on_invalid_status_val
     assert result[1]["healthy"] is True
 
 
+async def test_get_directoryservices_logs_warning_when_config_is_malformed(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """A malformed ``directoryservices.config`` response must surface a
+    warning and clear it again once the endpoint recovers.
+    """
+    async with FakeTrueNASServer(
+        valid_api_key=API_KEY,
+        responses={
+            "directoryservices.config": {
+                "id": 1,
+                "service_type": "LDAP",
+                "enable": True,
+            },
+            "directoryservices.status": {"status": "HEALTHY"},
+        },
+    ) as server:
+        async with make_client(server) as client:
+            await client.connect()
+            state = TrueNASState(client)
+            with caplog.at_level(logging.DEBUG, logger="aiotruenas.domain.state"):
+                await state.get_directoryservices()
+
+                server.responses["directoryservices.config"] = None
+                await state.get_directoryservices()
+
+                server.responses["directoryservices.config"] = {
+                    "id": 1,
+                    "service_type": "LDAP",
+                    "enable": True,
+                }
+                await state.get_directoryservices()
+
+    state_records = [r for r in caplog.records if r.name == "aiotruenas.domain.state"]
+    warnings = [r for r in state_records if r.levelno == logging.WARNING]
+    recoveries = [
+        r
+        for r in state_records
+        if r.levelno == logging.DEBUG and "recovered" in r.getMessage()
+    ]
+    assert len(warnings) == 1
+    assert "directoryservices.config" in warnings[0].getMessage()
+    assert len(recoveries) == 1
+
+
+async def test_get_directoryservices_logs_warning_when_status_is_malformed(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """A malformed ``directoryservices.status`` response must surface a
+    warning and clear it again once the endpoint recovers -- tracked
+    separately from ``directoryservices.config``'s own failing flag.
+    """
+    async with FakeTrueNASServer(
+        valid_api_key=API_KEY,
+        responses={
+            "directoryservices.config": {
+                "id": 1,
+                "service_type": "LDAP",
+                "enable": True,
+            },
+            "directoryservices.status": {"status": "HEALTHY"},
+        },
+    ) as server:
+        async with make_client(server) as client:
+            await client.connect()
+            state = TrueNASState(client)
+            with caplog.at_level(logging.DEBUG, logger="aiotruenas.domain.state"):
+                await state.get_directoryservices()
+
+                server.responses["directoryservices.status"] = None
+                await state.get_directoryservices()
+
+                server.responses["directoryservices.status"] = {"status": "HEALTHY"}
+                await state.get_directoryservices()
+
+    state_records = [r for r in caplog.records if r.name == "aiotruenas.domain.state"]
+    warnings = [r for r in state_records if r.levelno == logging.WARNING]
+    recoveries = [
+        r
+        for r in state_records
+        if r.levelno == logging.DEBUG and "recovered" in r.getMessage()
+    ]
+    assert len(warnings) == 1
+    assert "directoryservices.status" in warnings[0].getMessage()
+    assert len(recoveries) == 1
+
+
 async def test_get_alerts_excludes_dismissed_and_aggregates_by_level() -> None:
     raw_alerts = [
         {
@@ -1418,6 +1544,45 @@ async def test_get_alerts_keeps_previous_state_on_unusable_entries(
     assert state.ds["alerts"] is previous_alerts
 
 
+async def test_get_alerts_logs_warning_across_both_failure_modes(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """Both ``alert.list`` failure branches -- a non-list response and a
+    list with no usable entries -- share one failing/recovered key, so
+    switching between them must not double-warn, and a single recovery
+    must clear the flag regardless of which failure mode was active last.
+    """
+    async with FakeTrueNASServer(
+        valid_api_key=API_KEY,
+        responses={"alert.list": [{"uuid": "a1", "level": "CRITICAL"}]},
+    ) as server:
+        async with make_client(server) as client:
+            await client.connect()
+            state = TrueNASState(client)
+            with caplog.at_level(logging.DEBUG, logger="aiotruenas.domain.state"):
+                await state.get_alerts()
+
+                server.responses["alert.list"] = None
+                await state.get_alerts()
+
+                server.responses["alert.list"] = [{}]
+                await state.get_alerts()
+
+                server.responses["alert.list"] = [{"uuid": "a1", "level": "CRITICAL"}]
+                await state.get_alerts()
+
+    state_records = [r for r in caplog.records if r.name == "aiotruenas.domain.state"]
+    warnings = [r for r in state_records if r.levelno == logging.WARNING]
+    recoveries = [
+        r
+        for r in state_records
+        if r.levelno == logging.DEBUG and "recovered" in r.getMessage()
+    ]
+    assert len(warnings) == 1
+    assert "alert.list" in warnings[0].getMessage()
+    assert len(recoveries) == 1
+
+
 async def test_get_ups_keeps_previous_reading_when_discovery_raises() -> None:
     async with FakeTrueNASServer(
         valid_api_key=API_KEY,
@@ -1445,6 +1610,181 @@ async def test_get_ups_keeps_previous_reading_when_discovery_raises() -> None:
 
     assert result is previous_ups
     assert state.ds["ups"] is previous_ups
+
+
+async def test_get_ups_logs_warning_when_graph_discovery_raises(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """A raising ``reporting.netdata_graphs`` discovery call must surface a
+    warning and clear it again once the endpoint recovers.
+    """
+    async with FakeTrueNASServer(
+        valid_api_key=API_KEY,
+        responses={
+            "reporting.netdata_graphs": [{"name": "upscharge"}],
+            "reporting.netdata_graph": lambda params: [
+                {"aggregations": {"mean": {"ups1": 55.0}}}
+            ],
+        },
+    ) as server:
+        async with make_client(server) as client:
+            await client.connect()
+            state = TrueNASState(client)
+            with caplog.at_level(logging.DEBUG, logger="aiotruenas.domain.state"):
+                await state.get_ups()
+
+                server.responses["reporting.netdata_graphs"] = {
+                    "error": {
+                        "code": -32603,
+                        "message": "Internal error",
+                        "data": {"error": 1, "errname": "EFAULT", "reason": None},
+                    }
+                }
+                await state.get_ups()
+
+                server.responses["reporting.netdata_graphs"] = [{"name": "upscharge"}]
+                await state.get_ups()
+
+    state_records = [r for r in caplog.records if r.name == "aiotruenas.domain.state"]
+    warnings = [r for r in state_records if r.levelno == logging.WARNING]
+    recoveries = [
+        r
+        for r in state_records
+        if r.levelno == logging.DEBUG and "recovered" in r.getMessage()
+    ]
+    assert len(warnings) == 1
+    assert "UPS" in warnings[0].getMessage()
+    assert len(recoveries) == 1
+
+
+async def test_get_ups_logs_warning_when_graph_discovery_returns_malformed_response(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """A non-list (but non-raising) ``reporting.netdata_graphs`` response
+    must surface a warning and clear it again once the endpoint recovers,
+    just like a raised error -- regression test for the Pattern B bug where
+    ``get_ups()`` used to declare "recovered" before validating the
+    response's shape.
+    """
+    async with FakeTrueNASServer(
+        valid_api_key=API_KEY,
+        responses={
+            "reporting.netdata_graphs": [{"name": "upscharge"}],
+            "reporting.netdata_graph": lambda params: [
+                {"aggregations": {"mean": {"ups1": 55.0}}}
+            ],
+        },
+    ) as server:
+        async with make_client(server) as client:
+            await client.connect()
+            state = TrueNASState(client)
+            with caplog.at_level(logging.DEBUG, logger="aiotruenas.domain.state"):
+                await state.get_ups()
+
+                server.responses["reporting.netdata_graphs"] = {"not": "a list"}
+                await state.get_ups()
+
+                server.responses["reporting.netdata_graphs"] = [{"name": "upscharge"}]
+                await state.get_ups()
+
+    state_records = [r for r in caplog.records if r.name == "aiotruenas.domain.state"]
+    warnings = [r for r in state_records if r.levelno == logging.WARNING]
+    recoveries = [
+        r
+        for r in state_records
+        if r.levelno == logging.DEBUG and "recovered" in r.getMessage()
+    ]
+    assert len(warnings) == 1
+    assert "malformed" in warnings[0].getMessage().lower()
+    assert len(recoveries) == 1
+
+
+async def test_get_ups_keeps_other_readings_when_one_graph_query_raises() -> None:
+    """A raising per-graph ``reporting.netdata_graph`` call must not abort the
+    whole method -- the other, unaffected UPS graphs still resolve.
+
+    Regression test: this call used to be unguarded, unlike the discovery
+    call three lines above it and every other netdata-graph loop in this
+    module -- a ``TrueNASError`` here used to propagate out of ``get_ups()``.
+    """
+
+    def netdata_graph(params: list) -> Any:
+        if params[0] == "upscharge":
+            return {
+                "error": {
+                    "code": -32603,
+                    "message": "Internal error",
+                    "data": {"error": 1, "errname": "EFAULT", "reason": None},
+                }
+            }
+        return [{"aggregations": {"mean": {"ups1": 42.0}}}]
+
+    async with FakeTrueNASServer(
+        valid_api_key=API_KEY,
+        responses={
+            "reporting.netdata_graphs": [
+                {"name": "upscharge"},
+                {"name": "upsload"},
+            ],
+            "reporting.netdata_graph": netdata_graph,
+        },
+    ) as server:
+        async with make_client(server) as client:
+            await client.connect()
+            state = TrueNASState(client)
+            result = await state.get_ups()
+
+    assert result == {"load": 42.0}
+    assert "battery_charge" not in result
+
+
+async def test_get_ups_logs_warning_when_graph_query_raises(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """A raising per-graph ``reporting.netdata_graph`` call must surface a
+    warning and clear it again once that graph recovers.
+    """
+
+    def failing_netdata_graph(params: list) -> Any:
+        if params[0] == "upscharge":
+            return {
+                "error": {
+                    "code": -32603,
+                    "message": "Internal error",
+                    "data": {"error": 1, "errname": "EFAULT", "reason": None},
+                }
+            }
+        return [{"aggregations": {"mean": {"ups1": 42.0}}}]
+
+    def recovered_netdata_graph(params: list) -> Any:
+        return [{"aggregations": {"mean": {"ups1": 55.0}}}]
+
+    async with FakeTrueNASServer(
+        valid_api_key=API_KEY,
+        responses={
+            "reporting.netdata_graphs": [{"name": "upscharge"}],
+            "reporting.netdata_graph": failing_netdata_graph,
+        },
+    ) as server:
+        async with make_client(server) as client:
+            await client.connect()
+            state = TrueNASState(client)
+            with caplog.at_level(logging.DEBUG, logger="aiotruenas.domain.state"):
+                await state.get_ups()
+
+                server.responses["reporting.netdata_graph"] = recovered_netdata_graph
+                await state.get_ups()
+
+    state_records = [r for r in caplog.records if r.name == "aiotruenas.domain.state"]
+    warnings = [r for r in state_records if r.levelno == logging.WARNING]
+    recoveries = [
+        r
+        for r in state_records
+        if r.levelno == logging.DEBUG and "recovered" in r.getMessage()
+    ]
+    assert len(warnings) == 1
+    assert "upscharge" in warnings[0].getMessage()
+    assert len(recoveries) == 1
 
 
 async def test_get_interface_normalizes_and_derives_link_up() -> None:
@@ -1571,6 +1911,83 @@ async def test_get_smb_keeps_previous_count_when_query_raises() -> None:
             result = await state.get_smb()
 
     assert result == {"connections": 2}
+
+
+async def test_get_smb_logs_warning_when_status_query_raises(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """A raising ``smb.status`` call must surface a warning and clear it
+    again once the endpoint recovers.
+    """
+    async with FakeTrueNASServer(
+        valid_api_key=API_KEY,
+        responses={"smb.status": [{}, {}]},
+    ) as server:
+        async with make_client(server) as client:
+            await client.connect()
+            state = TrueNASState(client)
+            with caplog.at_level(logging.DEBUG, logger="aiotruenas.domain.state"):
+                await state.get_smb()
+
+                server.responses["smb.status"] = {
+                    "error": {
+                        "code": -32603,
+                        "message": "Internal error",
+                        "data": {"error": 1, "errname": "EFAULT", "reason": None},
+                    }
+                }
+                await state.get_smb()
+
+                server.responses["smb.status"] = [{}, {}]
+                await state.get_smb()
+
+    state_records = [r for r in caplog.records if r.name == "aiotruenas.domain.state"]
+    warnings = [r for r in state_records if r.levelno == logging.WARNING]
+    recoveries = [
+        r
+        for r in state_records
+        if r.levelno == logging.DEBUG and "recovered" in r.getMessage()
+    ]
+    assert len(warnings) == 1
+    assert "SMB" in warnings[0].getMessage()
+    assert len(recoveries) == 1
+
+
+async def test_get_smb_logs_warning_when_status_query_returns_malformed_response(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """A response matching neither accepted ``smb.status`` shape (a list, or
+    a dict with a ``sessions`` list) must surface a warning and clear it
+    again once the endpoint recovers, just like a raised error -- regression
+    test for the Pattern B bug where ``get_smb()`` used to declare
+    "recovered" before validating the response's shape.
+    """
+    async with FakeTrueNASServer(
+        valid_api_key=API_KEY,
+        responses={"smb.status": [{}, {}]},
+    ) as server:
+        async with make_client(server) as client:
+            await client.connect()
+            state = TrueNASState(client)
+            with caplog.at_level(logging.DEBUG, logger="aiotruenas.domain.state"):
+                await state.get_smb()
+
+                server.responses["smb.status"] = {"unexpected": "shape"}
+                await state.get_smb()
+
+                server.responses["smb.status"] = [{}, {}]
+                await state.get_smb()
+
+    state_records = [r for r in caplog.records if r.name == "aiotruenas.domain.state"]
+    warnings = [r for r in state_records if r.levelno == logging.WARNING]
+    recoveries = [
+        r
+        for r in state_records
+        if r.levelno == logging.DEBUG and "recovered" in r.getMessage()
+    ]
+    assert len(warnings) == 1
+    assert "malformed" in warnings[0].getMessage().lower()
+    assert len(recoveries) == 1
 
 
 async def test_get_update_reports_available_update_with_manifest_fields() -> None:
@@ -2032,6 +2449,48 @@ async def test_get_disk_warns_again_after_netdata_alone_clears_the_flag(
         if r.name == "aiotruenas.domain.state" and r.levelno == logging.WARNING
     ]
     assert len(warnings) == 2
+
+
+async def test_get_disk_logs_warning_when_temperature_update_raises_unexpectedly(
+    caplog: pytest.LogCaptureFixture,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """An unexpected exception from the disk temperature update step --
+    outside the fallback's own handled ``TrueNASError`` paths -- must still
+    surface a warning and clear it again once the step recovers, instead of
+    disappearing silently.
+    """
+    async with FakeTrueNASServer(
+        valid_api_key=API_KEY,
+        responses={"disk.query": [_DISK_SDA]},
+    ) as server:
+        async with make_client(server) as client:
+            await client.connect()
+            state = TrueNASState(client)
+
+            async def _raise_update() -> None:
+                raise TrueNASError("boom")
+
+            with caplog.at_level(logging.DEBUG, logger="aiotruenas.domain.state"):
+                monkeypatch.setattr(state, "_update_disk_temperatures", _raise_update)
+                await state.get_disk()
+
+                async def _noop_update() -> None:
+                    return None
+
+                monkeypatch.setattr(state, "_update_disk_temperatures", _noop_update)
+                await state.get_disk()
+
+    state_records = [r for r in caplog.records if r.name == "aiotruenas.domain.state"]
+    warnings = [r for r in state_records if r.levelno == logging.WARNING]
+    recoveries = [
+        r
+        for r in state_records
+        if r.levelno == logging.DEBUG and "recovered" in r.getMessage()
+    ]
+    assert len(warnings) == 1
+    assert "disk temperature" in warnings[0].getMessage().lower()
+    assert len(recoveries) == 1
 
 
 async def test_get_systeminfo_normalizes_and_derives_uptime_epoch() -> None:
@@ -2513,6 +2972,85 @@ async def test_get_systemstats_queries_graphs_when_virtual_detection_fails() -> 
     assert result["cpu_usage"] == 20.0
 
 
+async def test_get_systemstats_logs_warning_when_virtual_detection_raises(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """A raising ``system.info`` call during virtualization detection must
+    surface a warning and clear it again once the endpoint recovers -- even
+    though a failed detection is never cached (see ``_detect_virtual()``),
+    so every poll independently re-attempts it.
+    """
+    async with FakeTrueNASServer(
+        valid_api_key=API_KEY,
+        responses={
+            "system.info": {
+                "error": {
+                    "code": -32603,
+                    "message": "Internal error",
+                    "data": {"error": 1, "errname": "EFAULT", "reason": None},
+                }
+            },
+            "reporting.netdata_graph": _well_formed_netdata_graph,
+        },
+    ) as server:
+        async with make_client(server) as client:
+            await client.connect()
+            state = TrueNASState(client)
+            with caplog.at_level(logging.DEBUG, logger="aiotruenas.domain.state"):
+                await state.get_systemstats()
+
+                server.responses["system.info"] = {}
+                await state.get_systemstats()
+
+    state_records = [r for r in caplog.records if r.name == "aiotruenas.domain.state"]
+    warnings = [r for r in state_records if r.levelno == logging.WARNING]
+    recoveries = [
+        r
+        for r in state_records
+        if r.levelno == logging.DEBUG and "recovered" in r.getMessage()
+    ]
+    assert len(warnings) == 1
+    assert "virtualization" in warnings[0].getMessage().lower()
+    assert len(recoveries) == 1
+
+
+async def test_get_systemstats_logs_warning_when_virtual_detection_malformed(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """A non-dict (but non-raising) ``system.info`` response during
+    virtualization detection must surface a warning and clear it again once
+    the endpoint recovers, just like a raised error -- regression test for
+    the Pattern B bug where ``_detect_virtual()`` used to declare "recovered"
+    before validating the response's shape.
+    """
+    async with FakeTrueNASServer(
+        valid_api_key=API_KEY,
+        responses={
+            "system.info": ["not", "a", "dict"],
+            "reporting.netdata_graph": _well_formed_netdata_graph,
+        },
+    ) as server:
+        async with make_client(server) as client:
+            await client.connect()
+            state = TrueNASState(client)
+            with caplog.at_level(logging.DEBUG, logger="aiotruenas.domain.state"):
+                await state.get_systemstats()
+
+                server.responses["system.info"] = {}
+                await state.get_systemstats()
+
+    state_records = [r for r in caplog.records if r.name == "aiotruenas.domain.state"]
+    warnings = [r for r in state_records if r.levelno == logging.WARNING]
+    recoveries = [
+        r
+        for r in state_records
+        if r.levelno == logging.DEBUG and "recovered" in r.getMessage()
+    ]
+    assert len(warnings) == 1
+    assert "malformed" in warnings[0].getMessage().lower()
+    assert len(recoveries) == 1
+
+
 async def test_get_systemstats_fetches_graphs_concurrently() -> None:
     """Regression test for a sequential-fetch bug: all systemstats graphs
     must be requested concurrently (via ``asyncio.gather``), so one
@@ -2585,6 +3123,23 @@ def _well_formed_netdata_graph(params: list) -> Any:
     return [{"legend": ["cpu"], "aggregations": {"mean": {"cpu": 20.0}}}]
 
 
+def _netdata_graph_with_usable_interface_reading(params: list) -> Any:
+    """Like ``_well_formed_netdata_graph``, but with a genuinely parseable
+    "interface" reading for identifier "eno1" -- the shared fixture has no
+    "interface" branch by design (see its own docstring), so tests that need
+    a real interface-throughput recovery use this instead.
+    """
+    if params[0] == "interface":
+        return [
+            {
+                "identifier": "eno1",
+                "legend": ["received", "sent"],
+                "aggregations": {"mean": {"received": 100.0, "sent": 50.0}},
+            }
+        ]
+    return _well_formed_netdata_graph(params)
+
+
 async def test_systemstats_stale_graphs_empty_on_full_success() -> None:
     async with FakeTrueNASServer(
         valid_api_key=API_KEY,
@@ -2625,6 +3180,52 @@ async def test_systemstats_stale_graphs_reports_failed_graph() -> None:
     )
 
 
+async def test_get_systemstats_logs_warning_for_single_stale_systemstat_graph(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """Each systemstats graph tracks its own failing/recovered key (``f"systemstat:
+    {graph_name}"``), so a single failing graph must warn without affecting the
+    others, and its own recovery must not bleed into a different graph's key.
+    """
+
+    def netdata_graph(params: list) -> Any:
+        graph_name = params[0]
+        if graph_name == "cpu":
+            return {
+                "error": {
+                    "code": -32603,
+                    "message": "Internal error",
+                    "data": {"error": 1, "errname": "EFAULT", "reason": None},
+                }
+            }
+        return _well_formed_netdata_graph(params)
+
+    async with FakeTrueNASServer(
+        valid_api_key=API_KEY,
+        responses={"system.info": {}, "reporting.netdata_graph": netdata_graph},
+    ) as server:
+        async with make_client(server) as client:
+            await client.connect()
+            state = TrueNASState(client)
+            with caplog.at_level(logging.DEBUG, logger="aiotruenas.domain.state"):
+                await state.get_systemstats()
+
+                server.responses["reporting.netdata_graph"] = _well_formed_netdata_graph
+                await state.get_systemstats()
+
+    state_records = [r for r in caplog.records if r.name == "aiotruenas.domain.state"]
+    warnings = [r for r in state_records if r.levelno == logging.WARNING]
+    recoveries = [
+        r
+        for r in state_records
+        if r.levelno == logging.DEBUG and "recovered" in r.getMessage()
+    ]
+    assert len(warnings) == 1
+    assert "cpu" in warnings[0].getMessage()
+    assert len(recoveries) == 1
+    assert "cpu" in recoveries[0].getMessage()
+
+
 async def test_systemstats_stale_graphs_reports_failed_interface_graph() -> None:
     raw_interfaces = [
         {"id": "eno1", "name": "eno1", "state": {"link_state": "LINK_STATE_UP"}}
@@ -2656,6 +3257,117 @@ async def test_systemstats_stale_graphs_reports_failed_interface_graph() -> None
 
     assert "interface" in state.systemstats_stale_graphs
     assert "cpu" not in state.systemstats_stale_graphs
+
+
+async def test_get_systemstats_logs_warning_when_interface_throughput_raises(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """A raising interface-throughput netdata query must surface a warning
+    and clear it again once the endpoint recovers, tracked independently of
+    every other systemstats graph's own failing/recovered key.
+    """
+    raw_interfaces = [
+        {"id": "eno1", "name": "eno1", "state": {"link_state": "LINK_STATE_UP"}}
+    ]
+
+    def netdata_graph(params: list) -> Any:
+        if params[0] == "interface":
+            return {
+                "error": {
+                    "code": -32603,
+                    "message": "Internal error",
+                    "data": {"error": 1, "errname": "EFAULT", "reason": None},
+                }
+            }
+        return _well_formed_netdata_graph(params)
+
+    async with FakeTrueNASServer(
+        valid_api_key=API_KEY,
+        responses={
+            "system.info": {},
+            "interface.query": raw_interfaces,
+            "reporting.netdata_graph": netdata_graph,
+        },
+    ) as server:
+        async with make_client(server) as client:
+            await client.connect()
+            state = TrueNASState(client)
+            await state.get_interface()
+            with caplog.at_level(logging.DEBUG, logger="aiotruenas.domain.state"):
+                await state.get_systemstats()
+
+                server.responses["reporting.netdata_graph"] = (
+                    _netdata_graph_with_usable_interface_reading
+                )
+                await state.get_systemstats()
+
+    state_records = [r for r in caplog.records if r.name == "aiotruenas.domain.state"]
+    warnings = [r for r in state_records if r.levelno == logging.WARNING]
+    recoveries = [
+        r
+        for r in state_records
+        if r.levelno == logging.DEBUG and "recovered" in r.getMessage()
+    ]
+    assert len(warnings) == 1
+    assert "interface throughput" in warnings[0].getMessage().lower()
+    assert len(recoveries) == 1
+
+
+async def test_get_systemstats_logs_warning_when_interface_throughput_unusable(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """A non-raising ``interface`` netdata graph response that does not
+    resolve to any usable rx/tx reading (e.g. an identifier not matching any
+    known interface) must surface a warning, not a false "recovered" --
+    regression test for the Pattern B bug where
+    ``_refresh_interface_throughput()`` used to declare "recovered" before
+    checking whether a reading was actually applied.
+    """
+    raw_interfaces = [
+        {"id": "eno1", "name": "eno1", "state": {"link_state": "LINK_STATE_UP"}}
+    ]
+
+    def netdata_graph_with_unmatched_interface(params: list) -> Any:
+        if params[0] == "interface":
+            return [
+                {
+                    "identifier": "unknown0",
+                    "legend": ["received", "sent"],
+                    "aggregations": {"mean": {"received": 100.0, "sent": 50.0}},
+                }
+            ]
+        return _well_formed_netdata_graph(params)
+
+    async with FakeTrueNASServer(
+        valid_api_key=API_KEY,
+        responses={
+            "system.info": {},
+            "interface.query": raw_interfaces,
+            "reporting.netdata_graph": netdata_graph_with_unmatched_interface,
+        },
+    ) as server:
+        async with make_client(server) as client:
+            await client.connect()
+            state = TrueNASState(client)
+            await state.get_interface()
+            with caplog.at_level(logging.DEBUG, logger="aiotruenas.domain.state"):
+                await state.get_systemstats()
+
+                server.responses["reporting.netdata_graph"] = (
+                    _netdata_graph_with_usable_interface_reading
+                )
+                await state.get_systemstats()
+
+    state_records = [r for r in caplog.records if r.name == "aiotruenas.domain.state"]
+    warnings = [r for r in state_records if r.levelno == logging.WARNING]
+    recoveries = [
+        r
+        for r in state_records
+        if r.levelno == logging.DEBUG and "recovered" in r.getMessage()
+    ]
+    assert len(warnings) == 1
+    assert "no usable reading" in warnings[0].getMessage().lower()
+    assert len(recoveries) == 1
 
 
 async def test_systemstats_stale_graphs_reset_on_next_successful_call() -> None:
