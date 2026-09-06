@@ -1787,6 +1787,93 @@ async def test_get_ups_logs_warning_when_graph_query_raises(
     assert len(recoveries) == 1
 
 
+async def test_get_ups_treats_unusable_graph_as_failure_not_recovery() -> None:
+    """A *successful* ``reporting.netdata_graph`` call whose payload carries no
+    usable reading must be recorded as failing, not as recovered.
+
+    Regression test: the fix for the raising case above originally called
+    ``_note_fallback_outcome(..., failed=False, ...)`` unconditionally right
+    after the RPC call succeeded, before checking whether ``_ups_value()``
+    could actually extract a reading -- unlike ``_refresh_systemstat_graphs()``
+    and ``_refresh_interface_throughput()``, which both gate the failed/
+    recovered decision on the *parsed* result. A malformed-but-200-OK payload
+    used to silently clear a stuck failing flag and silently drop the
+    reading with no warning.
+    """
+
+    def netdata_graph(params: list) -> Any:
+        if params[0] == "upscharge":
+            return [{"aggregations": {}}]  # no "mean" -- unusable
+        return [{"aggregations": {"mean": {"ups1": 42.0}}}]
+
+    async with FakeTrueNASServer(
+        valid_api_key=API_KEY,
+        responses={
+            "reporting.netdata_graphs": [
+                {"name": "upscharge"},
+                {"name": "upsload"},
+            ],
+            "reporting.netdata_graph": netdata_graph,
+        },
+    ) as server:
+        async with make_client(server) as client:
+            await client.connect()
+            state = TrueNASState(client)
+            result = await state.get_ups()
+
+    assert result == {"load": 42.0}
+    assert "battery_charge" not in result
+    # The result dict alone can't distinguish "recorded as failing" from
+    # "recorded as recovered" -- both omit the unusable graph from `result`
+    # the same way. Assert the actual fallback-tracking state directly so
+    # this test would have caught the original bug (unconditional
+    # failed=False right after a successful RPC call, before the value was
+    # validated).
+    assert state._fallback_failing.get("ups_graph:upscharge") is True
+    assert "ups_graph:upsload" not in state._fallback_failing
+
+
+async def test_get_ups_logs_warning_when_graph_returns_no_usable_reading(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """A successful but unusable per-graph response must surface a warning
+    and clear it again once that graph starts returning a usable reading.
+    """
+
+    def unusable_netdata_graph(params: list) -> Any:
+        return [{"aggregations": {}}]
+
+    def recovered_netdata_graph(params: list) -> Any:
+        return [{"aggregations": {"mean": {"ups1": 55.0}}}]
+
+    async with FakeTrueNASServer(
+        valid_api_key=API_KEY,
+        responses={
+            "reporting.netdata_graphs": [{"name": "upscharge"}],
+            "reporting.netdata_graph": unusable_netdata_graph,
+        },
+    ) as server:
+        async with make_client(server) as client:
+            await client.connect()
+            state = TrueNASState(client)
+            with caplog.at_level(logging.DEBUG, logger="aiotruenas.domain.state"):
+                await state.get_ups()
+
+                server.responses["reporting.netdata_graph"] = recovered_netdata_graph
+                await state.get_ups()
+
+    state_records = [r for r in caplog.records if r.name == "aiotruenas.domain.state"]
+    warnings = [r for r in state_records if r.levelno == logging.WARNING]
+    recoveries = [
+        r
+        for r in state_records
+        if r.levelno == logging.DEBUG and "recovered" in r.getMessage()
+    ]
+    assert len(warnings) == 1
+    assert "upscharge" in warnings[0].getMessage()
+    assert len(recoveries) == 1
+
+
 async def test_get_interface_normalizes_and_derives_link_up() -> None:
     raw_interfaces = [
         {

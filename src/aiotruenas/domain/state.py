@@ -774,14 +774,29 @@ class TrueNASState:
                         reason=err,
                     )
                     continue
+                value = _ups_value(graph_data)
+                if value is None:
+                    # The RPC call itself succeeded, but the payload had no
+                    # usable reading -- same "successful call, unusable
+                    # result" case _refresh_systemstat_graphs() and
+                    # _refresh_interface_throughput() also treat as a
+                    # failure, not a silent recovery.
+                    self._note_fallback_outcome(
+                        key,
+                        failed=True,
+                        warning=(
+                            f"'{graph_name}' UPS netdata graph returned no "
+                            "usable reading: %s"
+                        ),
+                        reason=graph_data,
+                    )
+                    continue
                 self._note_fallback_outcome(
                     key,
                     failed=False,
                     recovered=f"'{graph_name}' UPS netdata graph query recovered",
                 )
-                value = _ups_value(graph_data)
-                if value is not None:
-                    ups[_UPS_GRAPHS[graph_name]] = value
+                ups[_UPS_GRAPHS[graph_name]] = value
             self._ds["ups"] = ups
             return ups
 
