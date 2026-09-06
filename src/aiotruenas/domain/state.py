@@ -30,6 +30,7 @@ from ._helpers import (
     _arc_value,
     _cpuset_size,
     _disk_temps_from_graph_data,
+    _find_disk_temp_graph_name,
     _first_ipv4,
     _is_finite_number,
     _is_virtual_machine,
@@ -184,6 +185,12 @@ _KEY_DISK_TEMP_NETDATA = "disk_temp_netdata"
 _KEY_DISK_TEMP_FALLBACK = "disk_temp_fallback"
 _KEY_DETECT_VIRTUAL = "detect_virtual"
 _KEY_INTERFACE_THROUGHPUT = "interface_throughput"
+# Prefix for get_ups()'s dynamic per-graph fallback keys (e.g.
+# "ups_graph:upscharge") -- a module-level constant rather than a fixed
+# _KEY_* value since the graph name is only known at runtime, but still
+# extracted so the prefix can't drift between where it's built and where
+# it's matched.
+_UPS_GRAPH_KEY_PREFIX = "ups_graph:"
 
 
 def _apply_cputemp_stat(raw: Any, info: dict[str, Any]) -> bool:
@@ -742,6 +749,22 @@ class TrueNASState:
                 if isinstance(graph, dict)
                 and (name := str(graph.get("name", ""))) in _UPS_GRAPHS
             }
+            # A UPS graph that no longer appears in this poll's discovery
+            # wasn't queried at all this time -- clear its failing flag
+            # instead of leaving it stuck forever (it would otherwise never
+            # warn again once the graph comes back and fails a second time),
+            # mirroring how the other cached-fallback paths in this module
+            # clear their key when that path wasn't consulted this poll.
+            current_graph_keys = {
+                f"{_UPS_GRAPH_KEY_PREFIX}{name}" for name in available
+            }
+            for stale_key in [
+                key
+                for key in self._fallback_failing
+                if key.startswith(_UPS_GRAPH_KEY_PREFIX)
+                and key not in current_graph_keys
+            ]:
+                self._fallback_failing.pop(stale_key, None)
             if not available:
                 self._ds["ups"] = {}
                 return self._ds["ups"]
@@ -758,7 +781,7 @@ class TrueNASState:
                 # "systemstat:{graph_name}") rather than a module-level
                 # constant -- the set of graphs is discovered at runtime, not
                 # fixed, so it cannot be enumerated ahead of time.
-                key = f"ups_graph:{graph_name}"
+                key = f"{_UPS_GRAPH_KEY_PREFIX}{graph_name}"
                 try:
                     graph_data = await self._client.call(
                         "reporting.netdata_graph", [graph_name, graph_query]
@@ -1360,9 +1383,10 @@ class TrueNASState:
         """Enrich ``self._ds["disk"]`` with temperatures.
 
         Caller must hold ``self._lock``. A failed netdata query is caught
-        locally (rather than left to propagate to ``get_disk()``'s own
-        try/except) so the ``disk.temperatures`` fallback below still runs
-        for every disk instead of being skipped entirely.
+        inside ``_disk_temps_from_netdata()`` (rather than left to propagate
+        to ``get_disk()``'s own try/except) so the ``disk.temperatures``
+        fallback below still runs for every disk instead of being skipped
+        entirely.
 
         Once netdata has produced a reading for a disk, that disk's
         ``temperature`` is never ``None`` again, so gating the fallback on
@@ -1374,22 +1398,7 @@ class TrueNASState:
         read did not actually refresh -- not just ones with no reading at
         all -- keeps the value moving in that case too.
         """
-        try:
-            netdata_temps = await self._disk_temps_from_netdata()
-        except TrueNASError as err:
-            netdata_temps = None
-            self._note_fallback_outcome(
-                _KEY_DISK_TEMP_NETDATA,
-                failed=True,
-                warning="Failed to update disk temperatures from netdata: %s",
-                reason=err,
-            )
-        else:
-            self._note_fallback_outcome(
-                _KEY_DISK_TEMP_NETDATA,
-                failed=False,
-                recovered="Disk temperatures from netdata recovered",
-            )
+        netdata_temps = await self._disk_temps_from_netdata()
 
         refreshed: set[Hashable] = set()
         if netdata_temps:
@@ -1430,45 +1439,99 @@ class TrueNASState:
         return disk_map
 
     async def _disk_temps_from_netdata(self) -> dict[str, float] | None:
-        """Return per-disk temperatures from the netdata disk-temp graph, if any."""
+        """Return per-disk temperatures from the netdata disk-temp graph, if any.
+
+        Returns ``None`` both when no disk-temp graph is configured at all
+        (legitimate -- nothing to *warn* about) and when graph discovery or
+        the graph query itself fails, or the query's payload turns out
+        unusable (a real failure). Both still resolve the failing/recovered
+        transition on ``_KEY_DISK_TEMP_NETDATA`` -- only the failure cases
+        warn, "no graph configured" just clears a stuck flag left over from
+        an earlier discovery error -- and a failed or malformed discovery
+        leaves ``self._disk_temp_graph`` at ``None`` so discovery is retried
+        on the next call instead of being cached as "no graph found" --
+        mirroring how ``get_ups()`` treats a failed/malformed discovery, and
+        "RPC succeeded but no usable reading", as failures rather than a
+        silent recovery. Either way, returning ``None`` here (never raising)
+        is what lets the caller, ``_update_disk_temperatures()``, still fall
+        back to ``disk.temperatures`` for every disk.
+        """
         if self._disk_temp_graph is None:
-            self._disk_temp_graph = await self._discover_disk_temp_graph()
+            try:
+                graphs = await self._client.call("reporting.netdata_graphs")
+            except TrueNASError as err:
+                self._note_fallback_outcome(
+                    _KEY_DISK_TEMP_NETDATA,
+                    failed=True,
+                    warning="Failed to discover disk-temp netdata graph: %s",
+                    reason=err,
+                )
+                return None
+            if not isinstance(graphs, list):
+                self._note_fallback_outcome(
+                    _KEY_DISK_TEMP_NETDATA,
+                    failed=True,
+                    warning="Malformed 'reporting.netdata_graphs' response: %s",
+                    reason=graphs,
+                )
+                return None
+            self._disk_temp_graph = _find_disk_temp_graph_name(graphs)
         if not self._disk_temp_graph:
+            # Legitimate "no disk-temp graph configured" -- not a failure,
+            # but still clears any failing flag left over from an earlier
+            # discovery error (idempotent once already cleared), so a stuck
+            # flag doesn't survive a discovery that has since succeeded.
+            self._note_fallback_outcome(
+                _KEY_DISK_TEMP_NETDATA,
+                failed=False,
+                recovered="Disk-temp netdata discovery recovered: no matching graph",
+            )
             return None
 
         report_epoch = int(datetime.now(UTC).replace(microsecond=0).timestamp())
-        graph_data = await self._client.call(
-            "reporting.netdata_graph",
-            [
-                self._disk_temp_graph,
-                {
-                    "start": report_epoch - 90,
-                    "end": report_epoch - 30,
-                    "aggregate": True,
-                },
-            ],
-        )
-        if not isinstance(graph_data, list):
+        try:
+            graph_data = await self._client.call(
+                "reporting.netdata_graph",
+                [
+                    self._disk_temp_graph,
+                    {
+                        "start": report_epoch - 90,
+                        "end": report_epoch - 30,
+                        "aggregate": True,
+                    },
+                ],
+            )
+        except TrueNASError as err:
+            self._note_fallback_outcome(
+                _KEY_DISK_TEMP_NETDATA,
+                failed=True,
+                warning="Failed to update disk temperatures from netdata: %s",
+                reason=err,
+            )
             return None
-        return _disk_temps_from_graph_data(graph_data) or None
-
-    async def _discover_disk_temp_graph(self) -> str:
-        """Find the netdata graph name that reports disk temperatures, if any."""
-        graphs = await self._client.call("reporting.netdata_graphs")
-        if not isinstance(graphs, list):
-            return ""
-
-        for graph in graphs:
-            if not isinstance(graph, dict):
-                continue
-            name = str(graph.get("name", ""))
-            title = str(graph.get("title", "")).lower()
-            vertical = str(graph.get("vertical_label", "")).lower()
-            if ("disk" in name or "disk" in title) and (
-                "temp" in name or "temp" in title or "celsius" in vertical
-            ):
-                return name
-        return ""
+        if not isinstance(graph_data, list):
+            self._note_fallback_outcome(
+                _KEY_DISK_TEMP_NETDATA,
+                failed=True,
+                warning="Malformed disk-temp netdata graph response: %s",
+                reason=graph_data,
+            )
+            return None
+        temps = _disk_temps_from_graph_data(graph_data)
+        if not temps:
+            self._note_fallback_outcome(
+                _KEY_DISK_TEMP_NETDATA,
+                failed=True,
+                warning="Disk-temp netdata graph returned no usable reading: %s",
+                reason=graph_data,
+            )
+            return None
+        self._note_fallback_outcome(
+            _KEY_DISK_TEMP_NETDATA,
+            failed=False,
+            recovered="Disk temperatures from netdata recovered",
+        )
+        return temps
 
     def _note_fallback_outcome(
         self,

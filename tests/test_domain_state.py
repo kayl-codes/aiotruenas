@@ -1874,6 +1874,51 @@ async def test_get_ups_logs_warning_when_graph_returns_no_usable_reading(
     assert len(recoveries) == 1
 
 
+async def test_get_ups_clears_stale_graph_flag_when_graph_disappears() -> None:
+    """A UPS graph that stops being discovered must have its failing flag
+    cleared, not left stuck -- it isn't queried at all once it's no longer
+    discovered, so nothing will ever call ``_note_fallback_outcome`` for it
+    again to clear it.
+
+    Regression test: without clearing, a graph that fails, then disappears
+    from discovery (UPS unplugged, or netdata briefly stops exposing it),
+    then reappears and fails again, would silently skip the second warning --
+    ``_note_fallback_outcome`` only warns on the failing *transition*, and
+    the stale ``True`` from before it disappeared would make that look like
+    an already-known failure.
+    """
+
+    def netdata_graph(params: list) -> Any:
+        return {
+            "error": {
+                "code": -32603,
+                "message": "Internal error",
+                "data": {"error": 1, "errname": "EFAULT", "reason": None},
+            }
+        }
+
+    async with FakeTrueNASServer(
+        valid_api_key=API_KEY,
+        responses={
+            "reporting.netdata_graphs": [{"name": "upscharge"}],
+            "reporting.netdata_graph": netdata_graph,
+        },
+    ) as server:
+        async with make_client(server) as client:
+            await client.connect()
+            state = TrueNASState(client)
+            await state.get_ups()
+            assert state._fallback_failing.get("ups_graph:upscharge") is True
+
+            # The UPS (or just this graph) is gone this poll -- discovery no
+            # longer reports it at all.
+            server.responses["reporting.netdata_graphs"] = []
+            result = await state.get_ups()
+
+    assert result == {}
+    assert "ups_graph:upscharge" not in state._fallback_failing
+
+
 async def test_get_interface_normalizes_and_derives_link_up() -> None:
     raw_interfaces = [
         {
@@ -2191,6 +2236,92 @@ async def test_get_disk_normalizes_and_applies_netdata_temperature() -> None:
     assert state.ds["disk"] == result
 
 
+async def test_get_disk_treats_empty_netdata_graph_reading_as_failure() -> None:
+    """A discovered disk-temp graph whose query succeeds but yields no usable
+    reading (e.g. an empty aggregation window) must be recorded as failing,
+    not silently as recovered -- otherwise a broken netdata source is
+    indistinguishable from "no graph configured at all" and never warns
+    (regression: ``_update_disk_temperatures()`` used to call
+    ``_note_fallback_outcome(..., failed=False, ...)`` unconditionally
+    whenever ``_disk_temps_from_netdata()`` didn't raise, even though that
+    helper also returns ``None`` for a successful-but-empty payload).
+    """
+    async with FakeTrueNASServer(
+        valid_api_key=API_KEY,
+        responses={
+            "disk.query": [_DISK_SDA],
+            "reporting.netdata_graphs": [
+                {
+                    "name": "disktemp",
+                    "title": "Disk Temperature",
+                    "vertical_label": "Celsius",
+                }
+            ],
+            "reporting.netdata_graph": [],
+            "disk.temperatures": {"sda": 42.5},
+        },
+    ) as server:
+        async with make_client(server) as client:
+            await client.connect()
+            state = TrueNASState(client)
+            result = await state.get_disk()
+
+    assert result["{serial}S1"]["temperature"] == 42.5
+    assert state._fallback_failing.get("disk_temp_netdata") is True
+
+
+async def test_get_disk_logs_warning_when_netdata_graph_returns_no_usable_reading(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """The netdata-side failure above must also surface its own warning and
+    clear it again once the graph starts returning a usable reading --
+    independently of the ``disk.temperatures`` fallback's own warning.
+    """
+    async with FakeTrueNASServer(
+        valid_api_key=API_KEY,
+        responses={
+            "disk.query": [_DISK_SDA],
+            "reporting.netdata_graphs": [
+                {
+                    "name": "disktemp",
+                    "title": "Disk Temperature",
+                    "vertical_label": "Celsius",
+                }
+            ],
+            "reporting.netdata_graph": [],
+            "disk.temperatures": {"sda": 42.5},
+        },
+    ) as server:
+        async with make_client(server) as client:
+            await client.connect()
+            state = TrueNASState(client)
+            with caplog.at_level(logging.DEBUG, logger="aiotruenas.domain.state"):
+                await state.get_disk()
+
+                server.responses["reporting.netdata_graph"] = [
+                    {
+                        "identifier": "{serial}S1",
+                        "aggregations": {"mean": {"sda": 35.0}},
+                    }
+                ]
+                await state.get_disk()
+
+    state_records = [r for r in caplog.records if r.name == "aiotruenas.domain.state"]
+    netdata_warnings = [
+        r
+        for r in state_records
+        if r.levelno == logging.WARNING and "netdata graph returned" in r.getMessage()
+    ]
+    netdata_recoveries = [
+        r
+        for r in state_records
+        if r.levelno == logging.DEBUG
+        and "Disk temperatures from netdata recovered" in r.getMessage()
+    ]
+    assert len(netdata_warnings) == 1
+    assert len(netdata_recoveries) == 1
+
+
 async def test_get_disk_falls_back_to_disk_temperatures_when_no_netdata_graph() -> None:
     async with FakeTrueNASServer(
         valid_api_key=API_KEY,
@@ -2244,6 +2375,12 @@ async def test_get_disk_falls_back_when_netdata_query_fails_after_graph_found() 
 
 
 async def test_get_disk_keeps_temperature_none_when_enrichment_fails() -> None:
+    """Both the netdata graph discovery and the ``disk.temperatures``
+    fallback fail (the latter is simply unconfigured on the fake server, so
+    it errors as method-not-found) -- the fallback must still have been
+    *attempted*, and the failure correctly attributed to the netdata
+    discovery path rather than a generic "unexpected error" bucket.
+    """
     async with FakeTrueNASServer(
         valid_api_key=API_KEY,
         responses={
@@ -2263,6 +2400,112 @@ async def test_get_disk_keeps_temperature_none_when_enrichment_fails() -> None:
             result = await state.get_disk()
 
     assert result["{serial}S1"]["temperature"] is None
+    assert state._fallback_failing.get("disk_temp_netdata") is True
+    assert "disk_temperature_update_unexpected" not in state._fallback_failing
+
+
+async def test_get_disk_falls_back_when_netdata_discovery_fails() -> None:
+    """Netdata graph *discovery* itself fails (not just the graph query).
+
+    The ``disk.temperatures`` fallback must still run for every disk instead
+    of the whole update being skipped because of the earlier discovery
+    failure (regression: the discovery call briefly went unwrapped after
+    moving the failing/recovered bookkeeping into
+    ``_disk_temps_from_netdata()``).
+    """
+    async with FakeTrueNASServer(
+        valid_api_key=API_KEY,
+        responses={
+            "disk.query": [_DISK_SDA],
+            "reporting.netdata_graphs": {
+                "error": {
+                    "code": -32603,
+                    "message": "Internal error",
+                    "data": {"error": 1, "errname": "EFAULT", "reason": None},
+                }
+            },
+            "disk.temperatures": {"sda": 42.5},
+        },
+    ) as server:
+        async with make_client(server) as client:
+            await client.connect()
+            state = TrueNASState(client)
+            result = await state.get_disk()
+
+    assert result["{serial}S1"]["temperature"] == 42.5
+    assert state._fallback_failing.get("disk_temp_netdata") is True
+
+
+async def test_get_disk_falls_back_when_netdata_graphs_response_is_malformed() -> None:
+    """``reporting.netdata_graphs`` succeeds but returns a non-list payload.
+
+    Must be treated as a real discovery failure (warned, ``disk.temperatures``
+    fallback still runs, and retried on the next poll) rather than being
+    silently cached as "no disk-temp graph configured" forever.
+    """
+    async with FakeTrueNASServer(
+        valid_api_key=API_KEY,
+        responses={
+            "disk.query": [_DISK_SDA],
+            "reporting.netdata_graphs": {"unexpected": "shape"},
+            "disk.temperatures": {"sda": 42.5},
+        },
+    ) as server:
+        async with make_client(server) as client:
+            await client.connect()
+            state = TrueNASState(client)
+            result = await state.get_disk()
+
+    assert result["{serial}S1"]["temperature"] == 42.5
+    assert state._fallback_failing.get("disk_temp_netdata") is True
+    assert state._disk_temp_graph is None
+
+
+async def test_get_disk_clears_netdata_flag_once_discovery_finds_no_graph() -> None:
+    """A prior discovery failure must not stay stuck once a later discovery
+    call succeeds and legitimately finds no disk-temp graph configured.
+
+    Regression test: ``_disk_temps_from_netdata()`` used to return early on
+    "no matching graph" without ever calling ``_note_fallback_outcome``,
+    so a flag set by an earlier discovery failure would stay ``True``
+    forever -- with no corresponding warning ever logged again, since
+    ``self._disk_temp_graph`` gets cached as ``""`` and discovery is never
+    retried, so nothing else could clear it either.
+    """
+    async with FakeTrueNASServer(
+        valid_api_key=API_KEY,
+        responses={
+            "disk.query": [_DISK_SDA],
+            "reporting.netdata_graphs": {
+                "error": {
+                    "code": -32603,
+                    "message": "Internal error",
+                    "data": {"error": 1, "errname": "EFAULT", "reason": None},
+                }
+            },
+            "disk.temperatures": {"sda": 42.5},
+        },
+    ) as server:
+        async with make_client(server) as client:
+            await client.connect()
+            state = TrueNASState(client)
+            await state.get_disk()
+            assert state._fallback_failing.get("disk_temp_netdata") is True
+
+            # Discovery now succeeds, but nothing it reports looks like a
+            # disk-temp graph -- a legitimate "no such graph" result.
+            server.responses["reporting.netdata_graphs"] = [
+                {
+                    "name": "unrelated",
+                    "title": "Something Else",
+                    "vertical_label": "Watts",
+                }
+            ]
+            result = await state.get_disk()
+
+    assert result["{serial}S1"]["temperature"] == 42.5
+    assert "disk_temp_netdata" not in state._fallback_failing
+    assert state._disk_temp_graph == ""
 
 
 async def test_get_disk_refreshes_temperature_once_netdata_stops_reporting_it() -> None:
@@ -2497,6 +2740,12 @@ async def test_get_disk_warns_again_after_netdata_alone_clears_the_flag(
     ``disk.temperatures`` fallback at all, so it must still clear a prior
     failing flag -- otherwise a *later*, independent fallback failure would
     stay permanently unwarned once the flag got stuck ``True``.
+
+    A malformed (non-list) ``reporting.netdata_graph`` response is itself a
+    netdata-side failure, distinct from the ``disk.temperatures`` fallback
+    failure it triggers -- both warn independently on their own failing
+    transition (kayl-codes/aiotruenas PR #29 review), so each failing poll
+    below carries two warnings, not one.
     """
     async with FakeTrueNASServer(
         valid_api_key=API_KEY,
@@ -2517,7 +2766,8 @@ async def test_get_disk_warns_again_after_netdata_alone_clears_the_flag(
             await client.connect()
             state = TrueNASState(client)
             with caplog.at_level(logging.DEBUG, logger="aiotruenas.domain.state"):
-                await state.get_disk()  # netdata reading fails -> fallback warns
+                # netdata reading malformed -> netdata warns + fallback warns
+                await state.get_disk()
 
                 server.responses["reporting.netdata_graph"] = [
                     {
@@ -2525,17 +2775,21 @@ async def test_get_disk_warns_again_after_netdata_alone_clears_the_flag(
                         "aggregations": {"mean": {"sda": 35.0}},
                     }
                 ]
-                await state.get_disk()  # netdata covers sda -> no fallback call
+                await state.get_disk()  # netdata covers sda -> both flags clear
 
                 server.responses["reporting.netdata_graph"] = None
-                await state.get_disk()  # netdata fails again -> must warn again
+                # netdata fails again -> both must warn again
+                await state.get_disk()
 
-    warnings = [
+    state_records = [r for r in caplog.records if r.name == "aiotruenas.domain.state"]
+    warnings = [r for r in state_records if r.levelno == logging.WARNING]
+    recoveries = [
         r
-        for r in caplog.records
-        if r.name == "aiotruenas.domain.state" and r.levelno == logging.WARNING
+        for r in state_records
+        if r.levelno == logging.DEBUG and "recovered" in r.getMessage()
     ]
-    assert len(warnings) == 2
+    assert len(warnings) == 4
+    assert len(recoveries) == 1
 
 
 async def test_get_disk_logs_warning_when_temperature_update_raises_unexpectedly(

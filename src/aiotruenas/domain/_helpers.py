@@ -193,6 +193,21 @@ def _first_ipv4(aliases: Any) -> str:
     return "unknown"
 
 
+def _find_disk_temp_graph_name(graphs: list[Any]) -> str:
+    """Return the netdata graph name that reports disk temperatures, if any."""
+    for graph in graphs:
+        if not isinstance(graph, dict):
+            continue
+        name = str(graph.get("name", ""))
+        title = str(graph.get("title", "")).lower()
+        vertical = str(graph.get("vertical_label", "")).lower()
+        if ("disk" in name or "disk" in title) and (
+            "temp" in name or "temp" in title or "celsius" in vertical
+        ):
+            return name
+    return ""
+
+
 def _disk_temps_from_graph_data(graph_data: list[Any]) -> dict[str, float]:
     """Extract a per-disk median temperature from a netdata disk-temp graph response.
 
