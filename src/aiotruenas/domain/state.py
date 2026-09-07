@@ -975,9 +975,10 @@ class TrueNASState:
         The version cannot change without a full appliance reboot, which
         drops the underlying WebSocket connection, so a single successful
         detection is reused for the lifetime of this ``TrueNASState``. A
-        malformed (non-dict) ``system.info`` response warns unconditionally,
-        under its own key shared with ``get_systeminfo()``'s identical guard
-        so the two call sites log the same message for the same condition.
+        malformed (non-dict) ``system.info`` response warns once on the
+        failing transition, under its own key shared with
+        ``get_systeminfo()``'s identical guard so the two call sites log the
+        same message for the same condition.
         A valid response with a missing/unparsable ``version`` field is not
         cached and is retried on the next call, warning once via a second,
         version-specific key also shared with ``get_systeminfo()``'s own
