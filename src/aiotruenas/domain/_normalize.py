@@ -11,6 +11,7 @@ logic can be unit-tested in isolation from any TrueNAS domain knowledge.
 
 from __future__ import annotations
 
+import copy
 from collections.abc import Hashable, Mapping
 from datetime import UTC, datetime
 from logging import getLogger
@@ -156,10 +157,16 @@ def from_entry_bool(
 #   _str_default / _bool_default / _spec_default
 # ---------------------------
 def _str_default(val: Mapping[str, Any]) -> Any:
-    """Return the default for a string-typed value spec."""
+    """Return the default for a string-typed value spec.
+
+    List/dict defaults are deep-copied so callers can't mutate the shared
+    spec-table object (e.g. ``{"default": []}``) across entries or polls.
+    """
     if "default_val" in val and val["default_val"] in val:
-        return val[val["default_val"]]
-    return val.get("default", "")
+        default = val[val["default_val"]]
+    else:
+        default = val.get("default", "")
+    return copy.deepcopy(default) if isinstance(default, (list, dict)) else default
 
 
 def _bool_default(val: Mapping[str, Any]) -> bool:

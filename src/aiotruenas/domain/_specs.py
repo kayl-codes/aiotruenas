@@ -251,6 +251,7 @@ _SERVICE_VALS: list[ApiValueSpec] = [
     {"name": "name", "default": ""},
     {"name": "enable", "type": "bool", "default": False},
     {"name": "state", "default": "unknown"},
+    {"name": "pids", "default": []},
 ]
 _SERVICE_ENSURE_VALS: list[ApiValueSpec] = [
     {"name": "running", "type": "bool", "default": False},
