@@ -446,10 +446,10 @@ class TrueNASState:
         returns the current (partially stale) ``ds["ups"]`` -- only that some
         of its fields may be outdated, e.g. because a netdata RPC failed
         transiently. When ``get_ups()`` returns early due to a failed or
-        malformed graph *discovery* call, every field still present in the
-        returned (unrefreshed) snapshot is reported as stale here, since
-        nothing was refreshed this poll -- not just the fields that were
-        already flagged stale before that call.
+        malformed graph *discovery* call, every graph whose field is still
+        present in the returned (unrefreshed) snapshot is reported as stale
+        here, since nothing was refreshed this poll -- not just the graphs
+        that were already flagged stale before that call.
 
         A graph that fails but has never once produced a reading is *not*
         listed here -- its field is absent from ``ds["ups"]`` entirely rather
@@ -854,7 +854,7 @@ class TrueNASState:
         (retried on the next call). A graph that is still discovered but
         fails, or returns an unusable reading, on this particular call also
         keeps its previous field value rather than dropping it -- see
-        ``ups_stale_graphs`` for which fields (if any) are stale this way.
+        ``ups_stale_graphs`` for which graphs (if any) are stale this way.
         """
         async with self._lock:
             try:
