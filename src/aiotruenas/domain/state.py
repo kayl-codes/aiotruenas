@@ -18,7 +18,7 @@ from __future__ import annotations
 
 import asyncio
 import copy
-from collections.abc import Callable, Hashable
+from collections.abc import Callable, Hashable, Mapping
 from datetime import UTC, datetime
 from logging import getLogger
 from typing import Any, TypedDict, cast
@@ -187,6 +187,15 @@ _KEY_DISK_TEMPERATURE_UPDATE_UNEXPECTED = "disk_temperature_update_unexpected"
 _KEY_DISK_TEMP_NETDATA = "disk_temp_netdata"
 _KEY_DISK_TEMP_FALLBACK = "disk_temp_fallback"
 _KEY_DETECT_VIRTUAL = "detect_virtual"
+# Shared between _detect_virtual() and get_systeminfo(), the two call sites
+# that populate self._is_virtual from the same 'system.info'
+# 'system_manufacturer'/'system_product' fields -- see _VERSION_DETECT_WARNING
+# below for why this is a shared constant rather than inline literals.
+_VIRTUAL_DETECT_WARNING = (
+    "'system.info' response missing or unusable manufacturer/product fields "
+    "needed to detect virtualization status: %s"
+)
+_VIRTUAL_DETECT_RECOVERED = "Virtualization status detection recovered"
 _KEY_DETECT_VERSION = "detect_version"
 _KEY_INTERFACE_THROUGHPUT = "interface_throughput"
 # Shared between _detect_version() and get_systeminfo(), the two call sites
@@ -1014,6 +1023,46 @@ class TrueNASState:
             )
         return version
 
+    def _apply_virtual_detection(self, raw: Mapping[str, Any]) -> None:
+        """Update the cached virtualization flag from a ``system.info`` payload.
+
+        Shared by ``get_systeminfo()`` and ``_detect_virtual()``. Reads
+        ``system_manufacturer``/``system_product`` straight from ``raw``, not
+        a ``parse_api()``-normalized dict: that would default an absent field
+        to the string "unknown", making "field absent" and "server reported
+        unknown" indistinguishable and risking a permanently wrong "not
+        virtual" default from an incomplete response. Requiring at least one
+        field to actually be a non-blank string (not just present) also
+        rejects a dmidecode-less container reporting null or "" for both.
+
+        Only warns while ``self._is_virtual`` is not yet cached -- an
+        already-cached value (from a prior successful poll, here or via the
+        other caller) stays valid and keeps gating ``get_systemstats()``
+        correctly, so a later poll's response lacking usable fields is not
+        actually the failure the warning text describes. A *good* response is
+        always safe to (re-)cache, since hardware/hypervisor identity cannot
+        actually change for the lifetime of a running system.
+        """
+        manufacturer = raw.get("system_manufacturer")
+        product = raw.get("system_product")
+        manufacturer_usable = isinstance(manufacturer, str) and manufacturer.strip()
+        product_usable = isinstance(product, str) and product.strip()
+        if manufacturer_usable or product_usable:
+            self._is_virtual = _is_virtual_machine(
+                manufacturer.strip() if manufacturer_usable else manufacturer,
+                product.strip() if product_usable else product,
+            )
+            self._note_fallback_outcome(
+                _KEY_DETECT_VIRTUAL, failed=False, recovered=_VIRTUAL_DETECT_RECOVERED
+            )
+        elif self._is_virtual is None:
+            self._note_fallback_outcome(
+                _KEY_DETECT_VIRTUAL,
+                failed=True,
+                warning=_VIRTUAL_DETECT_WARNING,
+                reason=(manufacturer, product),
+            )
+
     async def _detect_virtual(self) -> bool:
         """Return whether the system is virtualized, detecting it on first use.
 
@@ -1053,16 +1102,8 @@ class TrueNASState:
                 reason=raw,
             )
             return False
-        is_virtual = _is_virtual_machine(
-            raw.get("system_manufacturer"), raw.get("system_product")
-        )
-        self._is_virtual = is_virtual
-        self._note_fallback_outcome(
-            _KEY_DETECT_VIRTUAL,
-            failed=False,
-            recovered="Virtualization status detection recovered",
-        )
-        return is_virtual
+        self._apply_virtual_detection(raw)
+        return bool(self._is_virtual)
 
     async def get_container(self) -> _EndpointMap:
         """Refresh and return normalized containers.
@@ -1842,9 +1883,7 @@ class TrueNASState:
                     warning=_VERSION_DETECT_WARNING,
                     reason=raw.get("version"),
                 )
-            self._is_virtual = _is_virtual_machine(
-                info.get("system_manufacturer"), info.get("system_product")
-            )
+            self._apply_virtual_detection(raw)
 
             physmem = info.get("physmem")
             if _is_finite_number(physmem) and physmem > 0:
