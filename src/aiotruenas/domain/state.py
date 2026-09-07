@@ -18,7 +18,7 @@ from __future__ import annotations
 
 import asyncio
 import copy
-from collections.abc import Callable, Hashable
+from collections.abc import Callable, Hashable, Mapping
 from datetime import UTC, datetime
 from logging import getLogger
 from typing import Any, TypedDict, cast
@@ -1023,6 +1023,46 @@ class TrueNASState:
             )
         return version
 
+    def _apply_virtual_detection(self, raw: Mapping[str, Any]) -> None:
+        """Update the cached virtualization flag from a ``system.info`` payload.
+
+        Shared by ``get_systeminfo()`` and ``_detect_virtual()``. Reads
+        ``system_manufacturer``/``system_product`` straight from ``raw``, not
+        a ``parse_api()``-normalized dict: that would default an absent field
+        to the string "unknown", making "field absent" and "server reported
+        unknown" indistinguishable and risking a permanently wrong "not
+        virtual" default from an incomplete response. Requiring at least one
+        field to actually be a non-blank string (not just present) also
+        rejects a dmidecode-less container reporting null or "" for both.
+
+        Only warns while ``self._is_virtual`` is not yet cached -- an
+        already-cached value (from a prior successful poll, here or via the
+        other caller) stays valid and keeps gating ``get_systemstats()``
+        correctly, so a later poll's response lacking usable fields is not
+        actually the failure the warning text describes. A *good* response is
+        always safe to (re-)cache, since hardware/hypervisor identity cannot
+        actually change for the lifetime of a running system.
+        """
+        manufacturer = raw.get("system_manufacturer")
+        product = raw.get("system_product")
+        manufacturer_usable = isinstance(manufacturer, str) and manufacturer.strip()
+        product_usable = isinstance(product, str) and product.strip()
+        if manufacturer_usable or product_usable:
+            self._is_virtual = _is_virtual_machine(
+                manufacturer.strip() if manufacturer_usable else manufacturer,
+                product.strip() if product_usable else product,
+            )
+            self._note_fallback_outcome(
+                _KEY_DETECT_VIRTUAL, failed=False, recovered=_VIRTUAL_DETECT_RECOVERED
+            )
+        elif self._is_virtual is None:
+            self._note_fallback_outcome(
+                _KEY_DETECT_VIRTUAL,
+                failed=True,
+                warning=_VIRTUAL_DETECT_WARNING,
+                reason=(manufacturer, product),
+            )
+
     async def _detect_virtual(self) -> bool:
         """Return whether the system is virtualized, detecting it on first use.
 
@@ -1062,36 +1102,8 @@ class TrueNASState:
                 reason=raw,
             )
             return False
-        manufacturer = raw.get("system_manufacturer")
-        product = raw.get("system_product")
-        manufacturer_usable = isinstance(manufacturer, str) and manufacturer.strip()
-        product_usable = isinstance(product, str) and product.strip()
-        if not manufacturer_usable and not product_usable:
-            # Neither field carries usable detection evidence -- absent,
-            # explicitly None, empty/blank (a known dmidecode "not set"
-            # sentinel), or another malformed non-string value (e.g. a
-            # dmidecode-less container reporting null for both). Caching the
-            # "not virtual" default here would risk permanently
-            # misclassifying a VM/container as physical. Leave
-            # self._is_virtual at None so a later poll (from here or
-            # get_systeminfo()) gets another chance; the caller's
-            # "not virtual" fallback for this one poll is self-correcting.
-            self._note_fallback_outcome(
-                _KEY_DETECT_VIRTUAL,
-                failed=True,
-                warning=_VIRTUAL_DETECT_WARNING,
-                reason=(manufacturer, product),
-            )
-            return False
-        is_virtual = _is_virtual_machine(
-            manufacturer.strip() if manufacturer_usable else manufacturer,
-            product.strip() if product_usable else product,
-        )
-        self._is_virtual = is_virtual
-        self._note_fallback_outcome(
-            _KEY_DETECT_VIRTUAL, failed=False, recovered=_VIRTUAL_DETECT_RECOVERED
-        )
-        return is_virtual
+        self._apply_virtual_detection(raw)
+        return bool(self._is_virtual)
 
     async def get_container(self) -> _EndpointMap:
         """Refresh and return normalized containers.
@@ -1871,47 +1883,7 @@ class TrueNASState:
                     warning=_VERSION_DETECT_WARNING,
                     reason=raw.get("version"),
                 )
-            manufacturer = raw.get("system_manufacturer")
-            product = raw.get("system_product")
-            manufacturer_usable = isinstance(manufacturer, str) and manufacturer.strip()
-            product_usable = isinstance(product, str) and product.strip()
-            if manufacturer_usable or product_usable:
-                # Read from raw, not the parse_api()-normalized info dict:
-                # parse_api() defaults an absent field to the string
-                # "unknown", which would make "field absent" and "server
-                # reported unknown" indistinguishable and risk permanently
-                # caching a wrong "not virtual" default from an incomplete
-                # response. Requiring at least one field to actually be a
-                # non-blank string (not just present) also rejects a
-                # dmidecode-less container reporting null or "" for both, or
-                # another malformed non-string value, as usable evidence.
-                # Re-detecting on every poll (rather than only once) is
-                # intentional here -- unlike the same-key check for unusable
-                # fields below, a *good* response is always safe to
-                # (re-)cache, since hardware/hypervisor identity cannot
-                # actually change for the lifetime of a running system.
-                self._is_virtual = _is_virtual_machine(
-                    manufacturer.strip() if manufacturer_usable else manufacturer,
-                    product.strip() if product_usable else product,
-                )
-                self._note_fallback_outcome(
-                    _KEY_DETECT_VIRTUAL,
-                    failed=False,
-                    recovered=_VIRTUAL_DETECT_RECOVERED,
-                )
-            elif self._is_virtual is None:
-                # Only warn while nothing is cached yet -- an already-cached
-                # value (from a prior successful poll here or via
-                # _detect_virtual()) stays valid and keeps gating
-                # get_systemstats() correctly, so a later poll's response
-                # lacking usable fields here is not actually the failure the
-                # warning text describes.
-                self._note_fallback_outcome(
-                    _KEY_DETECT_VIRTUAL,
-                    failed=True,
-                    warning=_VIRTUAL_DETECT_WARNING,
-                    reason=(manufacturer, product),
-                )
+            self._apply_virtual_detection(raw)
 
             physmem = info.get("physmem")
             if _is_finite_number(physmem) and physmem > 0:
