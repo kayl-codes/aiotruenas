@@ -294,6 +294,15 @@ _CONTAINER_ENSURE_VALS: list[ApiValueSpec] = [
 # carries no memory, image or IP information and its status is nested
 # (status/state); ensure_vals fills in the same keys as the legacy Incus
 # path so the resulting record shape is unchanged either way.
+#
+# Confirmed against a real TrueNAS 26 instance on 2026-09-07: the raw
+# container.query response (with and without "extra" query options) and the
+# method's own returned JSON schema (core.get_methods) both list only id,
+# uuid, name, description, devices, cpuset, autostart, time,
+# shutdown_timeout, dataset, init*, idmap, capabilities_*, default_network
+# and status{state,pid,domain_state} -- no memory, image or IP field exists
+# anywhere, including nested under devices (a NIC device only carries
+# dtype/type/nic_attach/mac, never an address).
 _CONTAINER_V26_VALS: list[ApiValueSpec] = [
     {"name": "id", "default": "unknown"},
     {"name": "name", "default": "unknown"},

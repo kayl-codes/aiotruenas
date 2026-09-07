@@ -998,6 +998,92 @@ async def test_get_container_v26_uses_container_query_and_caches_version() -> No
     assert result["lxc1"]["running"] is True
 
 
+async def test_get_container_v26_matches_real_payload_shape() -> None:
+    """Regression test for the full real container.query() shape.
+
+    Verified against a real TrueNAS 26 instance on 2026-09-07 (see the
+    comment above ``_CONTAINER_V26_VALS`` in ``_specs.py``): the API's own
+    JSON schema and a live query both confirm the entry never carries
+    memory, image or IP information anywhere, including nested under
+    ``devices`` or ``status`` -- a NIC device carries only
+    dtype/type/nic_attach/mac, never an address. This fixture freezes that
+    full observed shape (minus identifying values), including a NIC device,
+    and the key-set assertion below pins the current output shape against
+    accidental changes to ``_CONTAINER_V26_VALS`` / ``_CONTAINER_V26_ENSURE_VALS``.
+
+    Note this only guards ``image`` against a future payload that actually
+    populates it (it is read from ``description`` and defaults to
+    "unknown" only when that is falsy). ``memory``, ``aliases`` and
+    ``ip_address`` are unconditionally overwritten with their constants in
+    ``_compute_container_v26`` -- by design, since no such fields exist to
+    read -- so this test cannot detect a future TrueNAS release that starts
+    populating those; that would require changing ``_compute_container_v26``
+    itself to read them.
+    """
+    raw_containers = [
+        {
+            "id": 1,
+            "uuid": "11111111-2222-3333-4444-555555555555",
+            "name": "test-linux",
+            "description": "",
+            "devices": [
+                {
+                    "dtype": "NIC",
+                    "type": "NIC",
+                    "nic_attach": "br0",
+                    "mac": "00:00:00:00:00:00",
+                },
+            ],
+            "cpuset": "1",
+            "autostart": True,
+            "time": "LOCAL",
+            "shutdown_timeout": 90,
+            "dataset": "tank/.truenas_containers/containers/test-linux",
+            "init": "/sbin/init",
+            "initdir": None,
+            "initenv": {},
+            "inituser": None,
+            "initgroup": None,
+            "idmap": {"type": "DEFAULT"},
+            "capabilities_policy": "DEFAULT",
+            "capabilities_state": {},
+            "default_network": "br0",
+            "status": {"state": "RUNNING", "pid": 7463, "domain_state": "RUNNING"},
+        }
+    ]
+    async with FakeTrueNASServer(
+        valid_api_key=API_KEY,
+        responses={
+            "system.info": {"version": "TrueNAS-26.0.0"},
+            "container.query": raw_containers,
+        },
+    ) as server:
+        async with make_client(server) as client:
+            await client.connect()
+            state = TrueNASState(client)
+            result = await state.get_container()
+
+    assert set(result[1]) == {
+        "id",
+        "name",
+        "type",
+        "cpu",
+        "memory",
+        "image",
+        "status",
+        "autostart",
+        "aliases",
+        "running",
+        "ip_address",
+    }
+    assert result[1]["type"] == "CONTAINER"
+    assert result[1]["cpu"] == 1
+    assert result[1]["memory"] == 0
+    assert result[1]["image"] == "unknown"
+    assert result[1]["ip_address"] == "unknown"
+    assert result[1]["running"] is True
+
+
 async def test_get_container_defaults_to_legacy_api_when_version_undetectable() -> None:
     async with FakeTrueNASServer(
         valid_api_key=API_KEY,
