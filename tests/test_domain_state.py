@@ -1100,6 +1100,83 @@ async def test_get_container_defaults_to_legacy_api_when_version_undetectable() 
     assert result == {}
 
 
+async def test_detect_version_logs_warning_and_retries_on_non_dict_system_info(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """The ``_detect_version()`` half of the malformed-``system.info`` warning
+    (reached via ``get_container()``, mirroring ``get_systeminfo()``'s own
+    non-dict handling) must also warn once and recover once a valid response
+    follows -- this is the symmetric call site the local code-reviewer pass
+    flagged as unverified by any log assertion.
+    """
+    async with FakeTrueNASServer(
+        valid_api_key=API_KEY,
+        responses={
+            "system.info": None,
+            "virt.instance.query": [],
+            "container.query": [],
+        },
+    ) as server:
+        async with make_client(server) as client:
+            await client.connect()
+            state = TrueNASState(client)
+            with caplog.at_level(logging.DEBUG, logger="aiotruenas.domain.state"):
+                await state.get_container()
+
+                server.responses["system.info"] = {"version": "TrueNAS-26.0.0"}
+                await state.get_container()
+
+    state_records = [r for r in caplog.records if r.name == "aiotruenas.domain.state"]
+    warnings = [r for r in state_records if r.levelno == logging.WARNING]
+    recoveries = [
+        r
+        for r in state_records
+        if r.levelno == logging.DEBUG and "recovered" in r.getMessage()
+    ]
+    assert len(warnings) == 1
+    assert "malformed" in warnings[0].getMessage().lower()
+    assert len(recoveries) == 1
+
+
+async def test_detect_version_logs_warning_and_retries_on_unparsable_version(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """An unparsable ``version`` field in ``system.info`` must warn once
+    (not silently cache (0, 0)) and retry detection on the next call, logging
+    recovery once the field becomes parsable. Regression test for a
+    previously fully silent fallback to (0, 0) that left version-gated
+    endpoints like ``get_container()`` on legacy behavior with no signal.
+    """
+    async with FakeTrueNASServer(
+        valid_api_key=API_KEY,
+        responses={
+            "system.info": {"version": "not-a-version"},
+            "virt.instance.query": [],
+            "container.query": [],
+        },
+    ) as server:
+        async with make_client(server) as client:
+            await client.connect()
+            state = TrueNASState(client)
+            with caplog.at_level(logging.DEBUG, logger="aiotruenas.domain.state"):
+                await state.get_container()
+
+                server.responses["system.info"] = {"version": "TrueNAS-26.0.0"}
+                await state.get_container()
+
+    state_records = [r for r in caplog.records if r.name == "aiotruenas.domain.state"]
+    warnings = [r for r in state_records if r.levelno == logging.WARNING]
+    recoveries = [
+        r
+        for r in state_records
+        if r.levelno == logging.DEBUG and "recovered" in r.getMessage()
+    ]
+    assert len(warnings) == 1
+    assert "version" in warnings[0].getMessage().lower()
+    assert "not-a-version" in warnings[0].getMessage()
+    assert len(recoveries) == 1
+
+
 async def test_get_app_derives_running_and_catalog_update_available() -> None:
     raw_apps = [
         {
@@ -3132,6 +3209,178 @@ async def test_get_systeminfo_normalizes_and_derives_uptime_epoch() -> None:
     assert isinstance(result["uptimeEpoch"], int)
     assert result["uptimeEpoch"] > 0
     assert state.ds["system_info"] == result
+
+
+async def test_get_systeminfo_logs_warning_on_unparsable_version(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """``get_systeminfo()``'s own, independent parse of the same ``version``
+    field (shared cached state with ``_detect_version()``, but a separate
+    code path) must warn once on an unparsable value and log recovery once a
+    subsequent call succeeds -- mirroring ``_detect_version()``'s behavior
+    for the same underlying fallback risk.
+    """
+    async with FakeTrueNASServer(
+        valid_api_key=API_KEY,
+        responses={"system.info": {"version": "garbage"}},
+    ) as server:
+        async with make_client(server) as client:
+            await client.connect()
+            state = TrueNASState(client)
+            with caplog.at_level(logging.DEBUG, logger="aiotruenas.domain.state"):
+                await state.get_systeminfo()
+
+                server.responses["system.info"] = {"version": "TrueNAS-25.10.0"}
+                await state.get_systeminfo()
+
+    state_records = [r for r in caplog.records if r.name == "aiotruenas.domain.state"]
+    warnings = [r for r in state_records if r.levelno == logging.WARNING]
+    recoveries = [
+        r
+        for r in state_records
+        if r.levelno == logging.DEBUG and "recovered" in r.getMessage()
+    ]
+    assert len(warnings) == 1
+    assert "version" in warnings[0].getMessage().lower()
+    assert "garbage" in warnings[0].getMessage()
+    assert len(recoveries) == 1
+
+
+async def test_systeminfo_and_detect_version_agree_on_missing_version_reason(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """When the ``version`` key is absent outright (not just unparsable),
+    ``get_systeminfo()`` and ``_detect_version()`` (via ``get_container()``)
+    must log the same ``reason=`` text for their shared warning, even though
+    ``get_systeminfo()`` reads through ``parse_api()``-normalized data (which
+    defaults a missing key to the string ``"unknown"``) while
+    ``_detect_version()`` reads the raw response directly (where a missing
+    key is ``None``). Regression test for a gap the local silent-failure-
+    hunter review found: before this fix, ``get_systeminfo()`` logged
+    ``reason="unknown"`` and ``_detect_version()`` logged ``reason=None`` for
+    the identical underlying failure under the identical shared warning key.
+    """
+    async with FakeTrueNASServer(
+        valid_api_key=API_KEY,
+        responses={"system.info": {}, "virt.instance.query": []},
+    ) as server:
+        async with make_client(server) as client:
+            await client.connect()
+            state = TrueNASState(client)
+            with caplog.at_level(logging.DEBUG, logger="aiotruenas.domain.state"):
+                await state.get_systeminfo()
+            systeminfo_warning = next(
+                r
+                for r in caplog.records
+                if r.name == "aiotruenas.domain.state" and r.levelno == logging.WARNING
+            )
+            caplog.clear()
+
+            state = TrueNASState(client)
+            with caplog.at_level(logging.DEBUG, logger="aiotruenas.domain.state"):
+                await state.get_container()
+            detect_version_warning = next(
+                r
+                for r in caplog.records
+                if r.name == "aiotruenas.domain.state" and r.levelno == logging.WARNING
+            )
+
+    assert systeminfo_warning.getMessage() == detect_version_warning.getMessage()
+
+
+async def test_get_systeminfo_does_not_warn_when_version_already_cached(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """A later poll's unparsable ``version`` field must not warn -- or
+    imply that ``get_container()`` will fall back to legacy behavior -- once
+    a version has already been cached from a prior successful poll, since
+    that cached value stays valid and continues to gate correctly.
+    """
+    async with FakeTrueNASServer(
+        valid_api_key=API_KEY,
+        responses={"system.info": {"version": "TrueNAS-26.0.0"}},
+    ) as server:
+        async with make_client(server) as client:
+            await client.connect()
+            state = TrueNASState(client)
+            with caplog.at_level(logging.DEBUG, logger="aiotruenas.domain.state"):
+                await state.get_systeminfo()
+
+                server.responses["system.info"] = {"version": "garbage"}
+                await state.get_systeminfo()
+
+    state_records = [r for r in caplog.records if r.name == "aiotruenas.domain.state"]
+    warnings = [r for r in state_records if r.levelno == logging.WARNING]
+    assert not warnings
+    assert state._version == (26, 0)
+
+
+async def test_get_systeminfo_logs_warning_on_non_dict_system_info(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """A malformed (non-dict) ``system.info`` response must also warn once,
+    not just an unparsable ``version`` field within an otherwise-valid dict --
+    otherwise a caller that only ever polls via ``get_systeminfo()`` (never
+    ``_detect_version()``/``get_container()``) gets no signal at all that
+    ``system.info`` itself is stuck returning a malformed response.
+    """
+    async with FakeTrueNASServer(
+        valid_api_key=API_KEY,
+        responses={"system.info": None},
+    ) as server:
+        async with make_client(server) as client:
+            await client.connect()
+            state = TrueNASState(client)
+            with caplog.at_level(logging.DEBUG, logger="aiotruenas.domain.state"):
+                await state.get_systeminfo()
+
+                server.responses["system.info"] = {"version": "TrueNAS-25.10.0"}
+                await state.get_systeminfo()
+
+    state_records = [r for r in caplog.records if r.name == "aiotruenas.domain.state"]
+    warnings = [r for r in state_records if r.levelno == logging.WARNING]
+    recoveries = [
+        r
+        for r in state_records
+        if r.levelno == logging.DEBUG and "recovered" in r.getMessage()
+    ]
+    assert len(warnings) == 1
+    assert "malformed" in warnings[0].getMessage().lower()
+    assert len(recoveries) == 1
+
+
+async def test_get_systeminfo_warns_on_non_dict_even_with_version_already_cached(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """Unlike an unparsable ``version`` field, a malformed (non-dict)
+    ``system.info`` response must warn on this failing transition even once
+    a version is already cached -- since it also freezes every *other*
+    ``system_info`` field (uptime, memory, hostname, ...) on stale data, not
+    just version detection. Regression test for a gap the local
+    silent-failure-hunter review found: the first fix gated this warning on
+    ``self._version is None``, matching the version-field case but silencing
+    the far more common in-lifetime failure (version detected once, then
+    ``system.info`` starts returning garbage on a later poll).
+    """
+    async with FakeTrueNASServer(
+        valid_api_key=API_KEY,
+        responses={"system.info": {"version": "TrueNAS-26.0.0"}},
+    ) as server:
+        async with make_client(server) as client:
+            await client.connect()
+            state = TrueNASState(client)
+            with caplog.at_level(logging.DEBUG, logger="aiotruenas.domain.state"):
+                await state.get_systeminfo()
+                assert state._version == (26, 0)
+
+                server.responses["system.info"] = None
+                await state.get_systeminfo()
+
+    state_records = [r for r in caplog.records if r.name == "aiotruenas.domain.state"]
+    warnings = [r for r in state_records if r.levelno == logging.WARNING]
+    assert len(warnings) == 1
+    assert "malformed" in warnings[0].getMessage().lower()
+    assert state._version == (26, 0)
 
 
 async def test_get_systeminfo_keeps_previous_total_memory_on_bogus_physmem() -> None:
