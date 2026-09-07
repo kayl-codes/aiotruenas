@@ -171,6 +171,12 @@ _SYSTEMSTATS_GRAPHS: tuple[str, ...] = ("load", "cpu", "cputemp", "memory", "arc
 # duplicated-literal finding (SonarQube S1192) across those three call sites.
 _SYSTEM_INFO_METHOD = "system.info"
 
+# RPC method used to fetch a single netdata graph's data points, queried by
+# get_arc(), _query_ups_graph(), and the disk-temperature/interface-throughput
+# refresh paths -- a shared constant avoids the duplicated-literal finding
+# (SonarQube S1192) across those five call sites.
+_NETDATA_GRAPH_METHOD = "reporting.netdata_graph"
+
 # _note_fallback_outcome() keys, one per cached-fallback code path. Extracted
 # as constants (rather than inline literals at each call site) to avoid the
 # duplicated-literal finding (SonarQube S1192) -- several of these keys are
@@ -758,7 +764,7 @@ class TrueNASState:
             arc: dict[str, float | None] = {}
             for graph_name, field_name in _ARC_GRAPHS.items():
                 graph_data = await self._client.call(
-                    "reporting.netdata_graph", [graph_name, graph_query]
+                    _NETDATA_GRAPH_METHOD, [graph_name, graph_query]
                 )
                 arc[field_name] = _arc_value(graph_data)
             self._ds["arc"] = arc
@@ -791,7 +797,7 @@ class TrueNASState:
         key = f"{_UPS_GRAPH_KEY_PREFIX}{graph_name}"
         try:
             graph_data = await self._client.call(
-                "reporting.netdata_graph", [graph_name, graph_query]
+                _NETDATA_GRAPH_METHOD, [graph_name, graph_query]
             )
         except TrueNASError as err:
             self._note_fallback_outcome(
@@ -1658,7 +1664,7 @@ class TrueNASState:
         report_epoch = int(datetime.now(UTC).replace(microsecond=0).timestamp())
         try:
             graph_data = await self._client.call(
-                "reporting.netdata_graph",
+                _NETDATA_GRAPH_METHOD,
                 [
                     self._disk_temp_graph,
                     {
@@ -1965,7 +1971,7 @@ class TrueNASState:
         ]
         results = await asyncio.gather(
             *(
-                self._client.call("reporting.netdata_graph", [graph_name, graph_query])
+                self._client.call(_NETDATA_GRAPH_METHOD, [graph_name, graph_query])
                 for graph_name in graph_names
             ),
             return_exceptions=True,
@@ -2021,7 +2027,7 @@ class TrueNASState:
             return set()
         try:
             raw_interface = await self._client.call(
-                "reporting.netdata_graph", ["interface", graph_query]
+                _NETDATA_GRAPH_METHOD, ["interface", graph_query]
             )
         except TrueNASError as err:
             self._note_fallback_outcome(

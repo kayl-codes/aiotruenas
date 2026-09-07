@@ -838,6 +838,7 @@ async def test_get_service_derives_running_and_known_display_name() -> None:
             "name": "unknown",
             "enable": True,
             "state": "RUNNING",
+            "pids": [1234],
         },
         {
             "id": 2,
@@ -858,8 +859,41 @@ async def test_get_service_derives_running_and_known_display_name() -> None:
 
     assert result[1]["running"] is True
     assert result[1]["display_name"] == "SMB"
+    assert result[1]["pids"] == [1234]
     assert result[2]["running"] is False
     assert result[2]["display_name"] == "Secure Shell"
+    assert result[2]["pids"] == []
+
+
+async def test_get_service_pids_default_is_not_shared_across_entries() -> None:
+    raw_services = [
+        {
+            "id": 1,
+            "service": "cifs",
+            "name": "unknown",
+            "enable": True,
+            "state": "RUNNING",
+        },
+        {
+            "id": 2,
+            "service": "ssh",
+            "name": "Secure Shell",
+            "enable": False,
+            "state": "STOPPED",
+        },
+    ]
+    async with FakeTrueNASServer(
+        valid_api_key=API_KEY,
+        responses={"service.query": raw_services},
+    ) as server:
+        async with make_client(server) as client:
+            await client.connect()
+            state = TrueNASState(client)
+            result = await state.get_service()
+
+    assert result[1]["pids"] is not result[2]["pids"]
+    result[1]["pids"].append(999)
+    assert result[2]["pids"] == []
 
 
 async def test_get_service_falls_back_to_service_id_for_unknown_service() -> None:
