@@ -2302,6 +2302,49 @@ async def test_get_ups_clears_stale_graph_flag_when_graph_disappears() -> None:
     assert state.ups_stale_graphs == frozenset()
 
 
+async def test_get_ups_fetches_graphs_concurrently() -> None:
+    """Regression test mirroring
+    ``test_get_systemstats_fetches_graphs_concurrently()``: all UPS netdata
+    graphs must be requested concurrently (via ``asyncio.gather``), so one
+    slow/unresponsive graph does not delay the others from even starting.
+    """
+    expected_graphs = {
+        "upscharge",
+        "upsruntime",
+        "upsload",
+        "upsvoltage",
+        "upscurrent",
+        "upsfrequency",
+        "upstemperature",
+    }
+    started: set[str] = set()
+    all_started = asyncio.Event()
+
+    async def fake_call(method: str, params: Any = None, **kwargs: Any) -> Any:
+        if method == "reporting.netdata_graphs":
+            return [{"name": name} for name in expected_graphs]
+        assert method == "reporting.netdata_graph"
+        started.add(params[0])
+        if started == expected_graphs:
+            all_started.set()
+        else:
+            # If graphs were fetched one at a time, this call would already
+            # hold the (implicit) turn while the others haven't started
+            # yet, so waiting here for the rest to start would deadlock and
+            # fail the test on timeout instead of hanging forever.
+            await asyncio.wait_for(all_started.wait(), timeout=2)
+        return [{"aggregations": {"mean": {params[0]: 1.0}}}]
+
+    async with FakeTrueNASServer(valid_api_key=API_KEY) as server:
+        async with make_client(server) as client:
+            await client.connect()
+            state = TrueNASState(client)
+            client.call = fake_call  # type: ignore[method-assign]
+            await state.get_ups()
+
+    assert started == expected_graphs
+
+
 async def test_get_interface_normalizes_and_derives_link_up() -> None:
     raw_interfaces = [
         {
