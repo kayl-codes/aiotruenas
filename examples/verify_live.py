@@ -143,6 +143,15 @@ async def _check_domain_state(client: TrueNASClient) -> None:
         ("get_systemstats", state.get_systemstats),
     ]
 
+    # Methods that expose a *_stale_graphs property signaling a partially
+    # stale (not failed) result -- see get_systemstats()/get_ups()'s
+    # docstrings. Checked generically so a future method with the same
+    # pattern doesn't need another special case here.
+    stale_graphs_properties = {
+        "get_systemstats": "systemstats_stale_graphs",
+        "get_ups": "ups_stale_graphs",
+    }
+
     print("\nTrueNASState (domain normalization layer):")
     failed = []
     for name, call in calls:
@@ -152,10 +161,14 @@ async def _check_domain_state(client: TrueNASClient) -> None:
             failed.append(name)
             print(f"  {name}(): FAILED ({type(exc).__name__}): {exc}")
         else:
-            if name == "get_systemstats" and state.systemstats_stale_graphs:
-                stale = ", ".join(sorted(state.systemstats_stale_graphs))
+            stale_attr = stale_graphs_properties.get(name)
+            stale = getattr(state, stale_attr) if stale_attr else None
+            if stale:
                 summary = _summarize(result)
-                print(f"  {name}(): OK (partially stale: {stale}) -> {summary}")
+                print(
+                    f"  {name}(): OK (partially stale: {', '.join(sorted(stale))}) "
+                    f"-> {summary}"
+                )
             else:
                 print(f"  {name}(): OK -> {_summarize(result)}")
 

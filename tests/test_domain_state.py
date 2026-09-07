@@ -10,7 +10,7 @@ from typing import Any
 import pytest
 from fake_server import FakeTrueNASServer
 
-from aiotruenas import TrueNASClient, TrueNASState
+from aiotruenas import TrueNASClient, TrueNASError, TrueNASState
 
 API_KEY = "1-valid-key"
 
@@ -266,6 +266,45 @@ async def test_get_pool_keeps_previous_snapshot_on_unusable_pool_entries(
     assert result is previous_pool
     assert state.ds["dataset"] is previous_dataset
     assert state.ds["pool"] is previous_pool
+
+
+async def test_get_pool_logs_warning_when_pool_query_is_malformed(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """A malformed ``pool.query`` response must surface a warning and clear
+    it again once the endpoint recovers -- otherwise the pool snapshot can
+    silently go stale with no trace anywhere.
+    """
+    async with FakeTrueNASServer(
+        valid_api_key=API_KEY,
+        responses={
+            "pool.dataset.query": [_ROOT_DATASET],
+            "pool.query": [_POOL_TANK],
+            "boot.get_state": _BOOT_POOL,
+        },
+    ) as server:
+        async with make_client(server) as client:
+            await client.connect()
+            state = TrueNASState(client)
+            with caplog.at_level(logging.DEBUG, logger="aiotruenas.domain.state"):
+                await state.get_pool()
+
+                server.responses["pool.query"] = None
+                await state.get_pool()
+
+                server.responses["pool.query"] = [_POOL_TANK]
+                await state.get_pool()
+
+    state_records = [r for r in caplog.records if r.name == "aiotruenas.domain.state"]
+    warnings = [r for r in state_records if r.levelno == logging.WARNING]
+    recoveries = [
+        r
+        for r in state_records
+        if r.levelno == logging.DEBUG and "recovered" in r.getMessage()
+    ]
+    assert len(warnings) == 1
+    assert "pool.query" in warnings[0].getMessage()
+    assert len(recoveries) == 1
 
 
 async def test_get_pool_ignores_error_aggregation_for_unhashable_guid() -> None:
@@ -759,9 +798,36 @@ async def test_get_ups_keeps_previous_reading_on_failed_discovery() -> None:
 
             server.responses["reporting.netdata_graphs"] = None
             result = await state.get_ups()
+            stale = state.ups_stale_graphs
 
     assert result is previous_ups
     assert state.ds["ups"] is previous_ups
+    # Discovery itself failed, so nothing was refreshed this poll -- every
+    # field still in the (unrefreshed) snapshot is stale, not just left
+    # unchanged from before.
+    assert stale == frozenset({"upscharge"})
+
+
+async def test_get_ups_reports_no_stale_graphs_on_first_ever_discovery_failure() -> (
+    None
+):
+    """A failed discovery call on the very first ``get_ups()`` call ever must
+    not report any graph as stale -- ``ds["ups"]`` is empty at that point, so
+    there is nothing to be stale, unlike the case above where a previous
+    snapshot already exists.
+    """
+    async with FakeTrueNASServer(
+        valid_api_key=API_KEY,
+        responses={"reporting.netdata_graphs": None},
+    ) as server:
+        async with make_client(server) as client:
+            await client.connect()
+            state = TrueNASState(client)
+            result = await state.get_ups()
+            stale = state.ups_stale_graphs
+
+    assert result == {}
+    assert stale == frozenset()
 
 
 async def test_get_service_derives_running_and_known_display_name() -> None:
@@ -1279,6 +1345,93 @@ async def test_get_directoryservices_keeps_previous_status_on_invalid_status_val
     assert result[1]["healthy"] is True
 
 
+async def test_get_directoryservices_logs_warning_when_config_is_malformed(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """A malformed ``directoryservices.config`` response must surface a
+    warning and clear it again once the endpoint recovers.
+    """
+    async with FakeTrueNASServer(
+        valid_api_key=API_KEY,
+        responses={
+            "directoryservices.config": {
+                "id": 1,
+                "service_type": "LDAP",
+                "enable": True,
+            },
+            "directoryservices.status": {"status": "HEALTHY"},
+        },
+    ) as server:
+        async with make_client(server) as client:
+            await client.connect()
+            state = TrueNASState(client)
+            with caplog.at_level(logging.DEBUG, logger="aiotruenas.domain.state"):
+                await state.get_directoryservices()
+
+                server.responses["directoryservices.config"] = None
+                await state.get_directoryservices()
+
+                server.responses["directoryservices.config"] = {
+                    "id": 1,
+                    "service_type": "LDAP",
+                    "enable": True,
+                }
+                await state.get_directoryservices()
+
+    state_records = [r for r in caplog.records if r.name == "aiotruenas.domain.state"]
+    warnings = [r for r in state_records if r.levelno == logging.WARNING]
+    recoveries = [
+        r
+        for r in state_records
+        if r.levelno == logging.DEBUG and "recovered" in r.getMessage()
+    ]
+    assert len(warnings) == 1
+    assert "directoryservices.config" in warnings[0].getMessage()
+    assert len(recoveries) == 1
+
+
+async def test_get_directoryservices_logs_warning_when_status_is_malformed(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """A malformed ``directoryservices.status`` response must surface a
+    warning and clear it again once the endpoint recovers -- tracked
+    separately from ``directoryservices.config``'s own failing flag.
+    """
+    async with FakeTrueNASServer(
+        valid_api_key=API_KEY,
+        responses={
+            "directoryservices.config": {
+                "id": 1,
+                "service_type": "LDAP",
+                "enable": True,
+            },
+            "directoryservices.status": {"status": "HEALTHY"},
+        },
+    ) as server:
+        async with make_client(server) as client:
+            await client.connect()
+            state = TrueNASState(client)
+            with caplog.at_level(logging.DEBUG, logger="aiotruenas.domain.state"):
+                await state.get_directoryservices()
+
+                server.responses["directoryservices.status"] = None
+                await state.get_directoryservices()
+
+                server.responses["directoryservices.status"] = {"status": "HEALTHY"}
+                await state.get_directoryservices()
+
+    state_records = [r for r in caplog.records if r.name == "aiotruenas.domain.state"]
+    warnings = [r for r in state_records if r.levelno == logging.WARNING]
+    recoveries = [
+        r
+        for r in state_records
+        if r.levelno == logging.DEBUG and "recovered" in r.getMessage()
+    ]
+    assert len(warnings) == 1
+    assert "directoryservices.status" in warnings[0].getMessage()
+    assert len(recoveries) == 1
+
+
 async def test_get_alerts_excludes_dismissed_and_aggregates_by_level() -> None:
     raw_alerts = [
         {
@@ -1418,6 +1571,45 @@ async def test_get_alerts_keeps_previous_state_on_unusable_entries(
     assert state.ds["alerts"] is previous_alerts
 
 
+async def test_get_alerts_logs_warning_across_both_failure_modes(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """Both ``alert.list`` failure branches -- a non-list response and a
+    list with no usable entries -- share one failing/recovered key, so
+    switching between them must not double-warn, and a single recovery
+    must clear the flag regardless of which failure mode was active last.
+    """
+    async with FakeTrueNASServer(
+        valid_api_key=API_KEY,
+        responses={"alert.list": [{"uuid": "a1", "level": "CRITICAL"}]},
+    ) as server:
+        async with make_client(server) as client:
+            await client.connect()
+            state = TrueNASState(client)
+            with caplog.at_level(logging.DEBUG, logger="aiotruenas.domain.state"):
+                await state.get_alerts()
+
+                server.responses["alert.list"] = None
+                await state.get_alerts()
+
+                server.responses["alert.list"] = [{}]
+                await state.get_alerts()
+
+                server.responses["alert.list"] = [{"uuid": "a1", "level": "CRITICAL"}]
+                await state.get_alerts()
+
+    state_records = [r for r in caplog.records if r.name == "aiotruenas.domain.state"]
+    warnings = [r for r in state_records if r.levelno == logging.WARNING]
+    recoveries = [
+        r
+        for r in state_records
+        if r.levelno == logging.DEBUG and "recovered" in r.getMessage()
+    ]
+    assert len(warnings) == 1
+    assert "alert.list" in warnings[0].getMessage()
+    assert len(recoveries) == 1
+
+
 async def test_get_ups_keeps_previous_reading_when_discovery_raises() -> None:
     async with FakeTrueNASServer(
         valid_api_key=API_KEY,
@@ -1442,9 +1634,475 @@ async def test_get_ups_keeps_previous_reading_when_discovery_raises() -> None:
                 }
             }
             result = await state.get_ups()
+            stale = state.ups_stale_graphs
 
     assert result is previous_ups
     assert state.ds["ups"] is previous_ups
+    # Discovery itself failed, so nothing was refreshed this poll -- every
+    # field still in the (unrefreshed) snapshot is stale, not just left
+    # unchanged from before.
+    assert stale == frozenset({"upscharge"})
+
+
+async def test_get_ups_logs_warning_when_graph_discovery_raises(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """A raising ``reporting.netdata_graphs`` discovery call must surface a
+    warning and clear it again once the endpoint recovers.
+    """
+    async with FakeTrueNASServer(
+        valid_api_key=API_KEY,
+        responses={
+            "reporting.netdata_graphs": [{"name": "upscharge"}],
+            "reporting.netdata_graph": lambda params: [
+                {"aggregations": {"mean": {"ups1": 55.0}}}
+            ],
+        },
+    ) as server:
+        async with make_client(server) as client:
+            await client.connect()
+            state = TrueNASState(client)
+            with caplog.at_level(logging.DEBUG, logger="aiotruenas.domain.state"):
+                await state.get_ups()
+
+                server.responses["reporting.netdata_graphs"] = {
+                    "error": {
+                        "code": -32603,
+                        "message": "Internal error",
+                        "data": {"error": 1, "errname": "EFAULT", "reason": None},
+                    }
+                }
+                await state.get_ups()
+
+                server.responses["reporting.netdata_graphs"] = [{"name": "upscharge"}]
+                await state.get_ups()
+
+    state_records = [r for r in caplog.records if r.name == "aiotruenas.domain.state"]
+    warnings = [r for r in state_records if r.levelno == logging.WARNING]
+    recoveries = [
+        r
+        for r in state_records
+        if r.levelno == logging.DEBUG and "recovered" in r.getMessage()
+    ]
+    assert len(warnings) == 1
+    assert "UPS" in warnings[0].getMessage()
+    assert len(recoveries) == 1
+
+
+async def test_get_ups_logs_warning_when_graph_discovery_returns_malformed_response(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """A non-list (but non-raising) ``reporting.netdata_graphs`` response
+    must surface a warning and clear it again once the endpoint recovers,
+    just like a raised error -- regression test for the Pattern B bug where
+    ``get_ups()`` used to declare "recovered" before validating the
+    response's shape.
+    """
+    async with FakeTrueNASServer(
+        valid_api_key=API_KEY,
+        responses={
+            "reporting.netdata_graphs": [{"name": "upscharge"}],
+            "reporting.netdata_graph": lambda params: [
+                {"aggregations": {"mean": {"ups1": 55.0}}}
+            ],
+        },
+    ) as server:
+        async with make_client(server) as client:
+            await client.connect()
+            state = TrueNASState(client)
+            with caplog.at_level(logging.DEBUG, logger="aiotruenas.domain.state"):
+                await state.get_ups()
+
+                server.responses["reporting.netdata_graphs"] = {"not": "a list"}
+                await state.get_ups()
+
+                server.responses["reporting.netdata_graphs"] = [{"name": "upscharge"}]
+                await state.get_ups()
+
+    state_records = [r for r in caplog.records if r.name == "aiotruenas.domain.state"]
+    warnings = [r for r in state_records if r.levelno == logging.WARNING]
+    recoveries = [
+        r
+        for r in state_records
+        if r.levelno == logging.DEBUG and "recovered" in r.getMessage()
+    ]
+    assert len(warnings) == 1
+    assert "malformed" in warnings[0].getMessage().lower()
+    assert len(recoveries) == 1
+
+
+async def test_get_ups_keeps_other_readings_when_one_graph_query_raises() -> None:
+    """A raising per-graph ``reporting.netdata_graph`` call must not abort the
+    whole method -- the other, unaffected UPS graphs still resolve.
+
+    Regression test: this call used to be unguarded, unlike the discovery
+    call three lines above it and every other netdata-graph loop in this
+    module -- a ``TrueNASError`` here used to propagate out of ``get_ups()``.
+    """
+
+    def netdata_graph(params: list) -> Any:
+        if params[0] == "upscharge":
+            return {
+                "error": {
+                    "code": -32603,
+                    "message": "Internal error",
+                    "data": {"error": 1, "errname": "EFAULT", "reason": None},
+                }
+            }
+        return [{"aggregations": {"mean": {"ups1": 42.0}}}]
+
+    async with FakeTrueNASServer(
+        valid_api_key=API_KEY,
+        responses={
+            "reporting.netdata_graphs": [
+                {"name": "upscharge"},
+                {"name": "upsload"},
+            ],
+            "reporting.netdata_graph": netdata_graph,
+        },
+    ) as server:
+        async with make_client(server) as client:
+            await client.connect()
+            state = TrueNASState(client)
+            result = await state.get_ups()
+
+    assert result == {"load": 42.0}
+    assert "battery_charge" not in result
+    # First-ever call: upscharge's field never had a prior value, so it must
+    # not be reported as stale either -- it's absent, not outdated.
+    assert state.ups_stale_graphs == frozenset()
+
+
+async def test_get_ups_logs_warning_when_graph_query_raises(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """A raising per-graph ``reporting.netdata_graph`` call must surface a
+    warning and clear it again once that graph recovers.
+    """
+
+    def failing_netdata_graph(params: list) -> Any:
+        if params[0] == "upscharge":
+            return {
+                "error": {
+                    "code": -32603,
+                    "message": "Internal error",
+                    "data": {"error": 1, "errname": "EFAULT", "reason": None},
+                }
+            }
+        return [{"aggregations": {"mean": {"ups1": 42.0}}}]
+
+    def recovered_netdata_graph(params: list) -> Any:
+        return [{"aggregations": {"mean": {"ups1": 55.0}}}]
+
+    async with FakeTrueNASServer(
+        valid_api_key=API_KEY,
+        responses={
+            "reporting.netdata_graphs": [{"name": "upscharge"}],
+            "reporting.netdata_graph": failing_netdata_graph,
+        },
+    ) as server:
+        async with make_client(server) as client:
+            await client.connect()
+            state = TrueNASState(client)
+            with caplog.at_level(logging.DEBUG, logger="aiotruenas.domain.state"):
+                await state.get_ups()
+
+                server.responses["reporting.netdata_graph"] = recovered_netdata_graph
+                await state.get_ups()
+
+    state_records = [r for r in caplog.records if r.name == "aiotruenas.domain.state"]
+    warnings = [r for r in state_records if r.levelno == logging.WARNING]
+    recoveries = [
+        r
+        for r in state_records
+        if r.levelno == logging.DEBUG and "recovered" in r.getMessage()
+    ]
+    assert len(warnings) == 1
+    assert "upscharge" in warnings[0].getMessage()
+    assert len(recoveries) == 1
+
+
+async def test_get_ups_treats_unusable_graph_as_failure_not_recovery() -> None:
+    """A *successful* ``reporting.netdata_graph`` call whose payload carries no
+    usable reading must be recorded as failing, not as recovered.
+
+    Regression test: the fix for the raising case above originally called
+    ``_note_fallback_outcome(..., failed=False, ...)`` unconditionally right
+    after the RPC call succeeded, before checking whether ``_ups_value()``
+    could actually extract a reading -- unlike ``_refresh_systemstat_graphs()``
+    and ``_refresh_interface_throughput()``, which both gate the failed/
+    recovered decision on the *parsed* result. A malformed-but-200-OK payload
+    used to silently clear a stuck failing flag and silently drop the
+    reading with no warning.
+    """
+
+    def netdata_graph(params: list) -> Any:
+        if params[0] == "upscharge":
+            return [{"aggregations": {}}]  # no "mean" -- unusable
+        return [{"aggregations": {"mean": {"ups1": 42.0}}}]
+
+    async with FakeTrueNASServer(
+        valid_api_key=API_KEY,
+        responses={
+            "reporting.netdata_graphs": [
+                {"name": "upscharge"},
+                {"name": "upsload"},
+            ],
+            "reporting.netdata_graph": netdata_graph,
+        },
+    ) as server:
+        async with make_client(server) as client:
+            await client.connect()
+            state = TrueNASState(client)
+            result = await state.get_ups()
+
+    assert result == {"load": 42.0}
+    assert "battery_charge" not in result
+    # The result dict alone can't distinguish "recorded as failing" from
+    # "recorded as recovered" -- both omit the unusable graph from `result`
+    # the same way. Assert the actual fallback-tracking state directly so
+    # this test would have caught the original bug (unconditional
+    # failed=False right after a successful RPC call, before the value was
+    # validated).
+    assert state._fallback_failing.get("ups_graph:upscharge") is True
+    assert "ups_graph:upsload" not in state._fallback_failing
+    # This is the very first get_ups() call ever, so upscharge's field never
+    # had a prior value to be stale -- ups_stale_graphs must NOT name it, or
+    # it would name a field that's entirely absent from `result`/`ds["ups"]`
+    # rather than merely outdated (see the analogous raising-branch test
+    # above for the same guarantee on the other failure path).
+    assert state.ups_stale_graphs == frozenset()
+
+
+async def test_get_ups_keeps_previous_graph_reading_when_it_later_fails() -> None:
+    """A UPS graph that succeeded on a prior poll but fails outright, or
+    returns an unusable reading, on a later one must keep its previous
+    value, not have it wiped from the result -- and both cases must be
+    reported via ``ups_stale_graphs``.
+
+    Regression test (Sourcery, PR #29): ``get_ups()`` used to build the
+    ``ups`` dict from scratch each call and unconditionally overwrite
+    ``self._ds["ups"]`` with it -- a graph omitted this poll (RPC failure or
+    an unusable payload) silently erased its previously cached reading,
+    unlike every sibling netdata-graph loop in this module, which leaves a
+    failed field at its previous value.
+
+    Also covers two related ``ups_stale_graphs`` guarantees documented on
+    the property itself: a subsequent failed *discovery* call widens the
+    stale set to every field still present in the snapshot -- not just the
+    ones already flagged stale before that call -- and a fully successful
+    poll afterwards resets the stale set back to empty.
+    """
+
+    def working_netdata_graph(params: list) -> Any:
+        return [{"aggregations": {"mean": {"ups1": 42.0}}}]
+
+    def upscharge_fails_upsload_unusable(params: list) -> Any:
+        if params[0] == "upscharge":
+            return {
+                "error": {
+                    "code": -32603,
+                    "message": "Internal error",
+                    "data": {"error": 1, "errname": "EFAULT", "reason": None},
+                }
+            }
+        if params[0] == "upsload":
+            return [{"aggregations": {}}]
+        return [{"aggregations": {"mean": {"ups1": 55.0}}}]
+
+    async with FakeTrueNASServer(
+        valid_api_key=API_KEY,
+        responses={
+            "reporting.netdata_graphs": [
+                {"name": "upscharge"},
+                {"name": "upsload"},
+                {"name": "upsvoltage"},
+            ],
+            "reporting.netdata_graph": working_netdata_graph,
+        },
+    ) as server:
+        async with make_client(server) as client:
+            await client.connect()
+            state = TrueNASState(client)
+            first = await state.get_ups()
+            assert first == {
+                "battery_charge": 42.0,
+                "load": 42.0,
+                "voltage": 42.0,
+            }
+            assert state.ups_stale_graphs == frozenset()
+
+            server.responses["reporting.netdata_graph"] = (
+                upscharge_fails_upsload_unusable
+            )
+            second = await state.get_ups()
+            second_stale = state.ups_stale_graphs
+            assert second == {
+                "battery_charge": 42.0,
+                "load": 42.0,
+                "voltage": 55.0,
+            }
+            assert second_stale == frozenset({"upscharge", "upsload"})
+
+            # Discovery itself fails next -- every field still in the
+            # (unrefreshed) snapshot must become stale, not just upscharge
+            # and upsload, which were already flagged before this call.
+            server.responses["reporting.netdata_graphs"] = None
+            third = await state.get_ups()
+            third_stale = state.ups_stale_graphs
+            assert third == second
+            assert third_stale == frozenset({"upscharge", "upsload", "upsvoltage"})
+
+            # A fully successful poll afterwards must reset the stale set
+            # back to empty, not leave any graph stuck as stale forever.
+            server.responses["reporting.netdata_graphs"] = [
+                {"name": "upscharge"},
+                {"name": "upsload"},
+                {"name": "upsvoltage"},
+            ]
+            server.responses["reporting.netdata_graph"] = working_netdata_graph
+            fourth = await state.get_ups()
+            fourth_stale = state.ups_stale_graphs
+
+    assert fourth == {
+        "battery_charge": 42.0,
+        "load": 42.0,
+        "voltage": 42.0,
+    }
+    assert fourth_stale == frozenset()
+
+
+async def test_get_ups_drops_reading_when_graph_no_longer_discovered() -> None:
+    """A UPS graph that succeeded on a prior poll but is no longer discovered
+    at all on a later one must be dropped from the result, not kept forever.
+
+    Regression test: the seeding step that restores previous values in
+    ``get_ups()`` is restricted to graphs still present in this poll's
+    ``available`` set specifically so a removed UPS (or a graph it stops
+    exposing) doesn't leave a stale reading around indefinitely -- unlike a
+    graph that merely fails while still discovered (see
+    ``test_get_ups_keeps_previous_graph_reading_when_it_later_fails``), which
+    does keep its previous value.
+    """
+
+    def working_netdata_graph(params: list) -> Any:
+        return [{"aggregations": {"mean": {"ups1": 42.0}}}]
+
+    async with FakeTrueNASServer(
+        valid_api_key=API_KEY,
+        responses={
+            "reporting.netdata_graphs": [
+                {"name": "upscharge"},
+                {"name": "upsload"},
+            ],
+            "reporting.netdata_graph": working_netdata_graph,
+        },
+    ) as server:
+        async with make_client(server) as client:
+            await client.connect()
+            state = TrueNASState(client)
+            first = await state.get_ups()
+            assert first == {"battery_charge": 42.0, "load": 42.0}
+
+            # upsload is no longer exposed at all this poll (UPS unplugged,
+            # or netdata briefly stops reporting it) -- unlike a graph that
+            # is still discovered but fails to query.
+            server.responses["reporting.netdata_graphs"] = [{"name": "upscharge"}]
+            second = await state.get_ups()
+            second_stale = state.ups_stale_graphs
+
+    assert second == {"battery_charge": 42.0}
+    # upscharge is the only graph still discovered and it succeeded, so
+    # nothing is stale -- upsload's disappearance drops it outright rather
+    # than reporting it as a stale field that no longer exists.
+    assert second_stale == frozenset()
+
+
+async def test_get_ups_logs_warning_when_graph_returns_no_usable_reading(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """A successful but unusable per-graph response must surface a warning
+    and clear it again once that graph starts returning a usable reading.
+    """
+
+    def unusable_netdata_graph(params: list) -> Any:
+        return [{"aggregations": {}}]
+
+    def recovered_netdata_graph(params: list) -> Any:
+        return [{"aggregations": {"mean": {"ups1": 55.0}}}]
+
+    async with FakeTrueNASServer(
+        valid_api_key=API_KEY,
+        responses={
+            "reporting.netdata_graphs": [{"name": "upscharge"}],
+            "reporting.netdata_graph": unusable_netdata_graph,
+        },
+    ) as server:
+        async with make_client(server) as client:
+            await client.connect()
+            state = TrueNASState(client)
+            with caplog.at_level(logging.DEBUG, logger="aiotruenas.domain.state"):
+                await state.get_ups()
+
+                server.responses["reporting.netdata_graph"] = recovered_netdata_graph
+                await state.get_ups()
+
+    state_records = [r for r in caplog.records if r.name == "aiotruenas.domain.state"]
+    warnings = [r for r in state_records if r.levelno == logging.WARNING]
+    recoveries = [
+        r
+        for r in state_records
+        if r.levelno == logging.DEBUG and "recovered" in r.getMessage()
+    ]
+    assert len(warnings) == 1
+    assert "upscharge" in warnings[0].getMessage()
+    assert len(recoveries) == 1
+
+
+async def test_get_ups_clears_stale_graph_flag_when_graph_disappears() -> None:
+    """A UPS graph that stops being discovered must have its failing flag
+    cleared, not left stuck -- it isn't queried at all once it's no longer
+    discovered, so nothing will ever call ``_note_fallback_outcome`` for it
+    again to clear it.
+
+    Regression test: without clearing, a graph that fails, then disappears
+    from discovery (UPS unplugged, or netdata briefly stops exposing it),
+    then reappears and fails again, would silently skip the second warning --
+    ``_note_fallback_outcome`` only warns on the failing *transition*, and
+    the stale ``True`` from before it disappeared would make that look like
+    an already-known failure.
+    """
+
+    def netdata_graph(params: list) -> Any:
+        return {
+            "error": {
+                "code": -32603,
+                "message": "Internal error",
+                "data": {"error": 1, "errname": "EFAULT", "reason": None},
+            }
+        }
+
+    async with FakeTrueNASServer(
+        valid_api_key=API_KEY,
+        responses={
+            "reporting.netdata_graphs": [{"name": "upscharge"}],
+            "reporting.netdata_graph": netdata_graph,
+        },
+    ) as server:
+        async with make_client(server) as client:
+            await client.connect()
+            state = TrueNASState(client)
+            await state.get_ups()
+            assert state._fallback_failing.get("ups_graph:upscharge") is True
+
+            # The UPS (or just this graph) is gone this poll -- discovery no
+            # longer reports it at all.
+            server.responses["reporting.netdata_graphs"] = []
+            result = await state.get_ups()
+
+    assert result == {}
+    assert "ups_graph:upscharge" not in state._fallback_failing
+    assert state.ups_stale_graphs == frozenset()
 
 
 async def test_get_interface_normalizes_and_derives_link_up() -> None:
@@ -1573,6 +2231,83 @@ async def test_get_smb_keeps_previous_count_when_query_raises() -> None:
     assert result == {"connections": 2}
 
 
+async def test_get_smb_logs_warning_when_status_query_raises(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """A raising ``smb.status`` call must surface a warning and clear it
+    again once the endpoint recovers.
+    """
+    async with FakeTrueNASServer(
+        valid_api_key=API_KEY,
+        responses={"smb.status": [{}, {}]},
+    ) as server:
+        async with make_client(server) as client:
+            await client.connect()
+            state = TrueNASState(client)
+            with caplog.at_level(logging.DEBUG, logger="aiotruenas.domain.state"):
+                await state.get_smb()
+
+                server.responses["smb.status"] = {
+                    "error": {
+                        "code": -32603,
+                        "message": "Internal error",
+                        "data": {"error": 1, "errname": "EFAULT", "reason": None},
+                    }
+                }
+                await state.get_smb()
+
+                server.responses["smb.status"] = [{}, {}]
+                await state.get_smb()
+
+    state_records = [r for r in caplog.records if r.name == "aiotruenas.domain.state"]
+    warnings = [r for r in state_records if r.levelno == logging.WARNING]
+    recoveries = [
+        r
+        for r in state_records
+        if r.levelno == logging.DEBUG and "recovered" in r.getMessage()
+    ]
+    assert len(warnings) == 1
+    assert "SMB" in warnings[0].getMessage()
+    assert len(recoveries) == 1
+
+
+async def test_get_smb_logs_warning_when_status_query_returns_malformed_response(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """A response matching neither accepted ``smb.status`` shape (a list, or
+    a dict with a ``sessions`` list) must surface a warning and clear it
+    again once the endpoint recovers, just like a raised error -- regression
+    test for the Pattern B bug where ``get_smb()`` used to declare
+    "recovered" before validating the response's shape.
+    """
+    async with FakeTrueNASServer(
+        valid_api_key=API_KEY,
+        responses={"smb.status": [{}, {}]},
+    ) as server:
+        async with make_client(server) as client:
+            await client.connect()
+            state = TrueNASState(client)
+            with caplog.at_level(logging.DEBUG, logger="aiotruenas.domain.state"):
+                await state.get_smb()
+
+                server.responses["smb.status"] = {"unexpected": "shape"}
+                await state.get_smb()
+
+                server.responses["smb.status"] = [{}, {}]
+                await state.get_smb()
+
+    state_records = [r for r in caplog.records if r.name == "aiotruenas.domain.state"]
+    warnings = [r for r in state_records if r.levelno == logging.WARNING]
+    recoveries = [
+        r
+        for r in state_records
+        if r.levelno == logging.DEBUG and "recovered" in r.getMessage()
+    ]
+    assert len(warnings) == 1
+    assert "malformed" in warnings[0].getMessage().lower()
+    assert len(recoveries) == 1
+
+
 async def test_get_update_reports_available_update_with_manifest_fields() -> None:
     raw_status = {
         "status": {
@@ -1687,6 +2422,92 @@ async def test_get_disk_normalizes_and_applies_netdata_temperature() -> None:
     assert state.ds["disk"] == result
 
 
+async def test_get_disk_treats_empty_netdata_graph_reading_as_failure() -> None:
+    """A discovered disk-temp graph whose query succeeds but yields no usable
+    reading (e.g. an empty aggregation window) must be recorded as failing,
+    not silently as recovered -- otherwise a broken netdata source is
+    indistinguishable from "no graph configured at all" and never warns
+    (regression: ``_update_disk_temperatures()`` used to call
+    ``_note_fallback_outcome(..., failed=False, ...)`` unconditionally
+    whenever ``_disk_temps_from_netdata()`` didn't raise, even though that
+    helper also returns ``None`` for a successful-but-empty payload).
+    """
+    async with FakeTrueNASServer(
+        valid_api_key=API_KEY,
+        responses={
+            "disk.query": [_DISK_SDA],
+            "reporting.netdata_graphs": [
+                {
+                    "name": "disktemp",
+                    "title": "Disk Temperature",
+                    "vertical_label": "Celsius",
+                }
+            ],
+            "reporting.netdata_graph": [],
+            "disk.temperatures": {"sda": 42.5},
+        },
+    ) as server:
+        async with make_client(server) as client:
+            await client.connect()
+            state = TrueNASState(client)
+            result = await state.get_disk()
+
+    assert result["{serial}S1"]["temperature"] == 42.5
+    assert state._fallback_failing.get("disk_temp_netdata") is True
+
+
+async def test_get_disk_logs_warning_when_netdata_graph_returns_no_usable_reading(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """The netdata-side failure above must also surface its own warning and
+    clear it again once the graph starts returning a usable reading --
+    independently of the ``disk.temperatures`` fallback's own warning.
+    """
+    async with FakeTrueNASServer(
+        valid_api_key=API_KEY,
+        responses={
+            "disk.query": [_DISK_SDA],
+            "reporting.netdata_graphs": [
+                {
+                    "name": "disktemp",
+                    "title": "Disk Temperature",
+                    "vertical_label": "Celsius",
+                }
+            ],
+            "reporting.netdata_graph": [],
+            "disk.temperatures": {"sda": 42.5},
+        },
+    ) as server:
+        async with make_client(server) as client:
+            await client.connect()
+            state = TrueNASState(client)
+            with caplog.at_level(logging.DEBUG, logger="aiotruenas.domain.state"):
+                await state.get_disk()
+
+                server.responses["reporting.netdata_graph"] = [
+                    {
+                        "identifier": "{serial}S1",
+                        "aggregations": {"mean": {"sda": 35.0}},
+                    }
+                ]
+                await state.get_disk()
+
+    state_records = [r for r in caplog.records if r.name == "aiotruenas.domain.state"]
+    netdata_warnings = [
+        r
+        for r in state_records
+        if r.levelno == logging.WARNING and "netdata graph returned" in r.getMessage()
+    ]
+    netdata_recoveries = [
+        r
+        for r in state_records
+        if r.levelno == logging.DEBUG
+        and "Disk temperatures from netdata recovered" in r.getMessage()
+    ]
+    assert len(netdata_warnings) == 1
+    assert len(netdata_recoveries) == 1
+
+
 async def test_get_disk_falls_back_to_disk_temperatures_when_no_netdata_graph() -> None:
     async with FakeTrueNASServer(
         valid_api_key=API_KEY,
@@ -1740,6 +2561,12 @@ async def test_get_disk_falls_back_when_netdata_query_fails_after_graph_found() 
 
 
 async def test_get_disk_keeps_temperature_none_when_enrichment_fails() -> None:
+    """Both the netdata graph discovery and the ``disk.temperatures``
+    fallback fail (the latter is simply unconfigured on the fake server, so
+    it errors as method-not-found) -- the fallback must still have been
+    *attempted*, and the failure correctly attributed to the netdata
+    discovery path rather than a generic "unexpected error" bucket.
+    """
     async with FakeTrueNASServer(
         valid_api_key=API_KEY,
         responses={
@@ -1759,6 +2586,112 @@ async def test_get_disk_keeps_temperature_none_when_enrichment_fails() -> None:
             result = await state.get_disk()
 
     assert result["{serial}S1"]["temperature"] is None
+    assert state._fallback_failing.get("disk_temp_netdata") is True
+    assert "disk_temperature_update_unexpected" not in state._fallback_failing
+
+
+async def test_get_disk_falls_back_when_netdata_discovery_fails() -> None:
+    """Netdata graph *discovery* itself fails (not just the graph query).
+
+    The ``disk.temperatures`` fallback must still run for every disk instead
+    of the whole update being skipped because of the earlier discovery
+    failure (regression: the discovery call briefly went unwrapped after
+    moving the failing/recovered bookkeeping into
+    ``_disk_temps_from_netdata()``).
+    """
+    async with FakeTrueNASServer(
+        valid_api_key=API_KEY,
+        responses={
+            "disk.query": [_DISK_SDA],
+            "reporting.netdata_graphs": {
+                "error": {
+                    "code": -32603,
+                    "message": "Internal error",
+                    "data": {"error": 1, "errname": "EFAULT", "reason": None},
+                }
+            },
+            "disk.temperatures": {"sda": 42.5},
+        },
+    ) as server:
+        async with make_client(server) as client:
+            await client.connect()
+            state = TrueNASState(client)
+            result = await state.get_disk()
+
+    assert result["{serial}S1"]["temperature"] == 42.5
+    assert state._fallback_failing.get("disk_temp_netdata") is True
+
+
+async def test_get_disk_falls_back_when_netdata_graphs_response_is_malformed() -> None:
+    """``reporting.netdata_graphs`` succeeds but returns a non-list payload.
+
+    Must be treated as a real discovery failure (warned, ``disk.temperatures``
+    fallback still runs, and retried on the next poll) rather than being
+    silently cached as "no disk-temp graph configured" forever.
+    """
+    async with FakeTrueNASServer(
+        valid_api_key=API_KEY,
+        responses={
+            "disk.query": [_DISK_SDA],
+            "reporting.netdata_graphs": {"unexpected": "shape"},
+            "disk.temperatures": {"sda": 42.5},
+        },
+    ) as server:
+        async with make_client(server) as client:
+            await client.connect()
+            state = TrueNASState(client)
+            result = await state.get_disk()
+
+    assert result["{serial}S1"]["temperature"] == 42.5
+    assert state._fallback_failing.get("disk_temp_netdata") is True
+    assert state._disk_temp_graph is None
+
+
+async def test_get_disk_clears_netdata_flag_once_discovery_finds_no_graph() -> None:
+    """A prior discovery failure must not stay stuck once a later discovery
+    call succeeds and legitimately finds no disk-temp graph configured.
+
+    Regression test: ``_disk_temps_from_netdata()`` used to return early on
+    "no matching graph" without ever calling ``_note_fallback_outcome``,
+    so a flag set by an earlier discovery failure would stay ``True``
+    forever -- with no corresponding warning ever logged again, since
+    ``self._disk_temp_graph`` gets cached as ``""`` and discovery is never
+    retried, so nothing else could clear it either.
+    """
+    async with FakeTrueNASServer(
+        valid_api_key=API_KEY,
+        responses={
+            "disk.query": [_DISK_SDA],
+            "reporting.netdata_graphs": {
+                "error": {
+                    "code": -32603,
+                    "message": "Internal error",
+                    "data": {"error": 1, "errname": "EFAULT", "reason": None},
+                }
+            },
+            "disk.temperatures": {"sda": 42.5},
+        },
+    ) as server:
+        async with make_client(server) as client:
+            await client.connect()
+            state = TrueNASState(client)
+            await state.get_disk()
+            assert state._fallback_failing.get("disk_temp_netdata") is True
+
+            # Discovery now succeeds, but nothing it reports looks like a
+            # disk-temp graph -- a legitimate "no such graph" result.
+            server.responses["reporting.netdata_graphs"] = [
+                {
+                    "name": "unrelated",
+                    "title": "Something Else",
+                    "vertical_label": "Watts",
+                }
+            ]
+            result = await state.get_disk()
+
+    assert result["{serial}S1"]["temperature"] == 42.5
+    assert "disk_temp_netdata" not in state._fallback_failing
+    assert state._disk_temp_graph == ""
 
 
 async def test_get_disk_refreshes_temperature_once_netdata_stops_reporting_it() -> None:
@@ -1993,6 +2926,12 @@ async def test_get_disk_warns_again_after_netdata_alone_clears_the_flag(
     ``disk.temperatures`` fallback at all, so it must still clear a prior
     failing flag -- otherwise a *later*, independent fallback failure would
     stay permanently unwarned once the flag got stuck ``True``.
+
+    A malformed (non-list) ``reporting.netdata_graph`` response is itself a
+    netdata-side failure, distinct from the ``disk.temperatures`` fallback
+    failure it triggers -- both warn independently on their own failing
+    transition (kayl-codes/aiotruenas PR #29 review), so each failing poll
+    below carries two warnings, not one.
     """
     async with FakeTrueNASServer(
         valid_api_key=API_KEY,
@@ -2013,7 +2952,8 @@ async def test_get_disk_warns_again_after_netdata_alone_clears_the_flag(
             await client.connect()
             state = TrueNASState(client)
             with caplog.at_level(logging.DEBUG, logger="aiotruenas.domain.state"):
-                await state.get_disk()  # netdata reading fails -> fallback warns
+                # netdata reading malformed -> netdata warns + fallback warns
+                await state.get_disk()
 
                 server.responses["reporting.netdata_graph"] = [
                     {
@@ -2021,17 +2961,63 @@ async def test_get_disk_warns_again_after_netdata_alone_clears_the_flag(
                         "aggregations": {"mean": {"sda": 35.0}},
                     }
                 ]
-                await state.get_disk()  # netdata covers sda -> no fallback call
+                await state.get_disk()  # netdata covers sda -> both flags clear
 
                 server.responses["reporting.netdata_graph"] = None
-                await state.get_disk()  # netdata fails again -> must warn again
+                # netdata fails again -> both must warn again
+                await state.get_disk()
 
-    warnings = [
+    state_records = [r for r in caplog.records if r.name == "aiotruenas.domain.state"]
+    warnings = [r for r in state_records if r.levelno == logging.WARNING]
+    recoveries = [
         r
-        for r in caplog.records
-        if r.name == "aiotruenas.domain.state" and r.levelno == logging.WARNING
+        for r in state_records
+        if r.levelno == logging.DEBUG and "recovered" in r.getMessage()
     ]
-    assert len(warnings) == 2
+    assert len(warnings) == 4
+    assert len(recoveries) == 1
+
+
+async def test_get_disk_logs_warning_when_temperature_update_raises_unexpectedly(
+    caplog: pytest.LogCaptureFixture,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """An unexpected exception from the disk temperature update step --
+    outside the fallback's own handled ``TrueNASError`` paths -- must still
+    surface a warning and clear it again once the step recovers, instead of
+    disappearing silently.
+    """
+    async with FakeTrueNASServer(
+        valid_api_key=API_KEY,
+        responses={"disk.query": [_DISK_SDA]},
+    ) as server:
+        async with make_client(server) as client:
+            await client.connect()
+            state = TrueNASState(client)
+
+            async def _raise_update() -> None:
+                raise TrueNASError("boom")
+
+            with caplog.at_level(logging.DEBUG, logger="aiotruenas.domain.state"):
+                monkeypatch.setattr(state, "_update_disk_temperatures", _raise_update)
+                await state.get_disk()
+
+                async def _noop_update() -> None:
+                    return None
+
+                monkeypatch.setattr(state, "_update_disk_temperatures", _noop_update)
+                await state.get_disk()
+
+    state_records = [r for r in caplog.records if r.name == "aiotruenas.domain.state"]
+    warnings = [r for r in state_records if r.levelno == logging.WARNING]
+    recoveries = [
+        r
+        for r in state_records
+        if r.levelno == logging.DEBUG and "recovered" in r.getMessage()
+    ]
+    assert len(warnings) == 1
+    assert "disk temperature" in warnings[0].getMessage().lower()
+    assert len(recoveries) == 1
 
 
 async def test_get_systeminfo_normalizes_and_derives_uptime_epoch() -> None:
@@ -2513,6 +3499,85 @@ async def test_get_systemstats_queries_graphs_when_virtual_detection_fails() -> 
     assert result["cpu_usage"] == 20.0
 
 
+async def test_get_systemstats_logs_warning_when_virtual_detection_raises(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """A raising ``system.info`` call during virtualization detection must
+    surface a warning and clear it again once the endpoint recovers -- even
+    though a failed detection is never cached (see ``_detect_virtual()``),
+    so every poll independently re-attempts it.
+    """
+    async with FakeTrueNASServer(
+        valid_api_key=API_KEY,
+        responses={
+            "system.info": {
+                "error": {
+                    "code": -32603,
+                    "message": "Internal error",
+                    "data": {"error": 1, "errname": "EFAULT", "reason": None},
+                }
+            },
+            "reporting.netdata_graph": _well_formed_netdata_graph,
+        },
+    ) as server:
+        async with make_client(server) as client:
+            await client.connect()
+            state = TrueNASState(client)
+            with caplog.at_level(logging.DEBUG, logger="aiotruenas.domain.state"):
+                await state.get_systemstats()
+
+                server.responses["system.info"] = {}
+                await state.get_systemstats()
+
+    state_records = [r for r in caplog.records if r.name == "aiotruenas.domain.state"]
+    warnings = [r for r in state_records if r.levelno == logging.WARNING]
+    recoveries = [
+        r
+        for r in state_records
+        if r.levelno == logging.DEBUG and "recovered" in r.getMessage()
+    ]
+    assert len(warnings) == 1
+    assert "virtualization" in warnings[0].getMessage().lower()
+    assert len(recoveries) == 1
+
+
+async def test_get_systemstats_logs_warning_when_virtual_detection_malformed(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """A non-dict (but non-raising) ``system.info`` response during
+    virtualization detection must surface a warning and clear it again once
+    the endpoint recovers, just like a raised error -- regression test for
+    the Pattern B bug where ``_detect_virtual()`` used to declare "recovered"
+    before validating the response's shape.
+    """
+    async with FakeTrueNASServer(
+        valid_api_key=API_KEY,
+        responses={
+            "system.info": ["not", "a", "dict"],
+            "reporting.netdata_graph": _well_formed_netdata_graph,
+        },
+    ) as server:
+        async with make_client(server) as client:
+            await client.connect()
+            state = TrueNASState(client)
+            with caplog.at_level(logging.DEBUG, logger="aiotruenas.domain.state"):
+                await state.get_systemstats()
+
+                server.responses["system.info"] = {}
+                await state.get_systemstats()
+
+    state_records = [r for r in caplog.records if r.name == "aiotruenas.domain.state"]
+    warnings = [r for r in state_records if r.levelno == logging.WARNING]
+    recoveries = [
+        r
+        for r in state_records
+        if r.levelno == logging.DEBUG and "recovered" in r.getMessage()
+    ]
+    assert len(warnings) == 1
+    assert "malformed" in warnings[0].getMessage().lower()
+    assert len(recoveries) == 1
+
+
 async def test_get_systemstats_fetches_graphs_concurrently() -> None:
     """Regression test for a sequential-fetch bug: all systemstats graphs
     must be requested concurrently (via ``asyncio.gather``), so one
@@ -2558,6 +3623,15 @@ async def test_systemstats_stale_graphs_empty_before_first_call() -> None:
     assert state.systemstats_stale_graphs == frozenset()
 
 
+async def test_ups_stale_graphs_empty_before_first_call() -> None:
+    async with FakeTrueNASServer(valid_api_key=API_KEY) as server:
+        async with make_client(server) as client:
+            await client.connect()
+            state = TrueNASState(client)
+
+    assert state.ups_stale_graphs == frozenset()
+
+
 def _well_formed_netdata_graph(params: list) -> Any:
     """Return a realistic, correctly-shaped response for every systemstats
     graph -- unlike a single shared fixture value, this lets a "full
@@ -2583,6 +3657,23 @@ def _well_formed_netdata_graph(params: list) -> Any:
     if graph_name == "arcsize":
         return [{"legend": ["size"], "aggregations": {"mean": {"size": 1500.0}}}]
     return [{"legend": ["cpu"], "aggregations": {"mean": {"cpu": 20.0}}}]
+
+
+def _netdata_graph_with_usable_interface_reading(params: list) -> Any:
+    """Like ``_well_formed_netdata_graph``, but with a genuinely parseable
+    "interface" reading for identifier "eno1" -- the shared fixture has no
+    "interface" branch by design (see its own docstring), so tests that need
+    a real interface-throughput recovery use this instead.
+    """
+    if params[0] == "interface":
+        return [
+            {
+                "identifier": "eno1",
+                "legend": ["received", "sent"],
+                "aggregations": {"mean": {"received": 100.0, "sent": 50.0}},
+            }
+        ]
+    return _well_formed_netdata_graph(params)
 
 
 async def test_systemstats_stale_graphs_empty_on_full_success() -> None:
@@ -2625,6 +3716,52 @@ async def test_systemstats_stale_graphs_reports_failed_graph() -> None:
     )
 
 
+async def test_get_systemstats_logs_warning_for_single_stale_systemstat_graph(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """Each systemstats graph tracks its own failing/recovered key (``f"systemstat:
+    {graph_name}"``), so a single failing graph must warn without affecting the
+    others, and its own recovery must not bleed into a different graph's key.
+    """
+
+    def netdata_graph(params: list) -> Any:
+        graph_name = params[0]
+        if graph_name == "cpu":
+            return {
+                "error": {
+                    "code": -32603,
+                    "message": "Internal error",
+                    "data": {"error": 1, "errname": "EFAULT", "reason": None},
+                }
+            }
+        return _well_formed_netdata_graph(params)
+
+    async with FakeTrueNASServer(
+        valid_api_key=API_KEY,
+        responses={"system.info": {}, "reporting.netdata_graph": netdata_graph},
+    ) as server:
+        async with make_client(server) as client:
+            await client.connect()
+            state = TrueNASState(client)
+            with caplog.at_level(logging.DEBUG, logger="aiotruenas.domain.state"):
+                await state.get_systemstats()
+
+                server.responses["reporting.netdata_graph"] = _well_formed_netdata_graph
+                await state.get_systemstats()
+
+    state_records = [r for r in caplog.records if r.name == "aiotruenas.domain.state"]
+    warnings = [r for r in state_records if r.levelno == logging.WARNING]
+    recoveries = [
+        r
+        for r in state_records
+        if r.levelno == logging.DEBUG and "recovered" in r.getMessage()
+    ]
+    assert len(warnings) == 1
+    assert "cpu" in warnings[0].getMessage()
+    assert len(recoveries) == 1
+    assert "cpu" in recoveries[0].getMessage()
+
+
 async def test_systemstats_stale_graphs_reports_failed_interface_graph() -> None:
     raw_interfaces = [
         {"id": "eno1", "name": "eno1", "state": {"link_state": "LINK_STATE_UP"}}
@@ -2656,6 +3793,117 @@ async def test_systemstats_stale_graphs_reports_failed_interface_graph() -> None
 
     assert "interface" in state.systemstats_stale_graphs
     assert "cpu" not in state.systemstats_stale_graphs
+
+
+async def test_get_systemstats_logs_warning_when_interface_throughput_raises(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """A raising interface-throughput netdata query must surface a warning
+    and clear it again once the endpoint recovers, tracked independently of
+    every other systemstats graph's own failing/recovered key.
+    """
+    raw_interfaces = [
+        {"id": "eno1", "name": "eno1", "state": {"link_state": "LINK_STATE_UP"}}
+    ]
+
+    def netdata_graph(params: list) -> Any:
+        if params[0] == "interface":
+            return {
+                "error": {
+                    "code": -32603,
+                    "message": "Internal error",
+                    "data": {"error": 1, "errname": "EFAULT", "reason": None},
+                }
+            }
+        return _well_formed_netdata_graph(params)
+
+    async with FakeTrueNASServer(
+        valid_api_key=API_KEY,
+        responses={
+            "system.info": {},
+            "interface.query": raw_interfaces,
+            "reporting.netdata_graph": netdata_graph,
+        },
+    ) as server:
+        async with make_client(server) as client:
+            await client.connect()
+            state = TrueNASState(client)
+            await state.get_interface()
+            with caplog.at_level(logging.DEBUG, logger="aiotruenas.domain.state"):
+                await state.get_systemstats()
+
+                server.responses["reporting.netdata_graph"] = (
+                    _netdata_graph_with_usable_interface_reading
+                )
+                await state.get_systemstats()
+
+    state_records = [r for r in caplog.records if r.name == "aiotruenas.domain.state"]
+    warnings = [r for r in state_records if r.levelno == logging.WARNING]
+    recoveries = [
+        r
+        for r in state_records
+        if r.levelno == logging.DEBUG and "recovered" in r.getMessage()
+    ]
+    assert len(warnings) == 1
+    assert "interface throughput" in warnings[0].getMessage().lower()
+    assert len(recoveries) == 1
+
+
+async def test_get_systemstats_logs_warning_when_interface_throughput_unusable(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """A non-raising ``interface`` netdata graph response that does not
+    resolve to any usable rx/tx reading (e.g. an identifier not matching any
+    known interface) must surface a warning, not a false "recovered" --
+    regression test for the Pattern B bug where
+    ``_refresh_interface_throughput()`` used to declare "recovered" before
+    checking whether a reading was actually applied.
+    """
+    raw_interfaces = [
+        {"id": "eno1", "name": "eno1", "state": {"link_state": "LINK_STATE_UP"}}
+    ]
+
+    def netdata_graph_with_unmatched_interface(params: list) -> Any:
+        if params[0] == "interface":
+            return [
+                {
+                    "identifier": "unknown0",
+                    "legend": ["received", "sent"],
+                    "aggregations": {"mean": {"received": 100.0, "sent": 50.0}},
+                }
+            ]
+        return _well_formed_netdata_graph(params)
+
+    async with FakeTrueNASServer(
+        valid_api_key=API_KEY,
+        responses={
+            "system.info": {},
+            "interface.query": raw_interfaces,
+            "reporting.netdata_graph": netdata_graph_with_unmatched_interface,
+        },
+    ) as server:
+        async with make_client(server) as client:
+            await client.connect()
+            state = TrueNASState(client)
+            await state.get_interface()
+            with caplog.at_level(logging.DEBUG, logger="aiotruenas.domain.state"):
+                await state.get_systemstats()
+
+                server.responses["reporting.netdata_graph"] = (
+                    _netdata_graph_with_usable_interface_reading
+                )
+                await state.get_systemstats()
+
+    state_records = [r for r in caplog.records if r.name == "aiotruenas.domain.state"]
+    warnings = [r for r in state_records if r.levelno == logging.WARNING]
+    recoveries = [
+        r
+        for r in state_records
+        if r.levelno == logging.DEBUG and "recovered" in r.getMessage()
+    ]
+    assert len(warnings) == 1
+    assert "no usable reading" in warnings[0].getMessage().lower()
+    assert len(recoveries) == 1
 
 
 async def test_systemstats_stale_graphs_reset_on_next_successful_call() -> None:

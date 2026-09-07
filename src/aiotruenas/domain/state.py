@@ -30,6 +30,7 @@ from ._helpers import (
     _arc_value,
     _cpuset_size,
     _disk_temps_from_graph_data,
+    _find_disk_temp_graph_name,
     _first_ipv4,
     _is_finite_number,
     _is_virtual_machine,
@@ -79,8 +80,11 @@ _LOGGER = getLogger(__name__)
 _EndpointMap = dict[Hashable, dict[str, Any]]
 #: get_arc() shape: one entry per known metric, None where currently unavailable.
 _ArcMap = dict[str, float | None]
-#: get_ups() shape: only metrics currently reporting a value (never None --
-#: missing/no-UPS metrics are omitted rather than included as None).
+#: get_ups() shape: one entry per currently-discovered UPS graph. A graph
+#: that fails or returns an unusable reading keeps its previous value here
+#: (see ups_stale_graphs) rather than being omitted; a graph no longer
+#: discovered at all is dropped. Never None -- a metric with no prior
+#: reading and a failing/unusable current one is simply absent.
 _UpsMap = dict[str, float]
 #: get_alerts() shape: aggregated counters/messages, no natural object id.
 _AlertsMap = dict[str, Any]
@@ -166,6 +170,30 @@ _SYSTEMSTATS_GRAPHS: tuple[str, ...] = ("load", "cpu", "cputemp", "memory", "arc
 # _detect_version()/_detect_virtual() -- a shared constant avoids the
 # duplicated-literal finding (SonarQube S1192) across those three call sites.
 _SYSTEM_INFO_METHOD = "system.info"
+
+# _note_fallback_outcome() keys, one per cached-fallback code path. Extracted
+# as constants (rather than inline literals at each call site) to avoid the
+# duplicated-literal finding (SonarQube S1192) -- several of these keys are
+# already referenced 3+ times per file -- and because a typo in a duplicated
+# literal would silently misroute a failing/recovered pair to a dead key that
+# is never checked, defeating the point of the fallback-tracking mechanism.
+_KEY_POOL_QUERY = "pool_query"
+_KEY_UPS_NETDATA_GRAPHS = "ups_netdata_graphs"
+_KEY_DIRECTORYSERVICES_CONFIG = "directoryservices_config"
+_KEY_DIRECTORYSERVICES_STATUS = "directoryservices_status"
+_KEY_ALERT_LIST = "alert_list"
+_KEY_SMB_STATUS = "smb_status"
+_KEY_DISK_TEMPERATURE_UPDATE_UNEXPECTED = "disk_temperature_update_unexpected"
+_KEY_DISK_TEMP_NETDATA = "disk_temp_netdata"
+_KEY_DISK_TEMP_FALLBACK = "disk_temp_fallback"
+_KEY_DETECT_VIRTUAL = "detect_virtual"
+_KEY_INTERFACE_THROUGHPUT = "interface_throughput"
+# Prefix for get_ups()'s dynamic per-graph fallback keys (e.g.
+# "ups_graph:upscharge") -- a module-level constant rather than a fixed
+# _KEY_* value since the graph name is only known at runtime, but still
+# extracted so the prefix can't drift between where it's built and where
+# it's matched.
+_UPS_GRAPH_KEY_PREFIX = "ups_graph:"
 
 
 def _apply_cputemp_stat(raw: Any, info: dict[str, Any]) -> bool:
@@ -326,12 +354,13 @@ class TrueNASState:
         # get_disk(); "" once discovery has run but found none, None until
         # discovery has run at all (see _disk_temps_from_netdata()).
         self._disk_temp_graph: str | None = None
-        # Whether the last ``disk.temperatures`` fallback call raised an RPC
-        # error or got a malformed (non-dict) response -- lets
-        # _fallback_disk_temperatures() warn once on the failing transition
-        # and once on recovery instead of every poll for the duration of an
-        # outage.
-        self._disk_temp_fallback_failing = False
+        # Per-fallback-path failing state, keyed by an arbitrary identifier
+        # (e.g. "disk_temp_fallback", "ups_netdata_graphs") -- lets
+        # _note_fallback_outcome() warn once on a path's failing transition
+        # and once on its recovery instead of every poll for the duration of
+        # an outage. A key absent (or False) means that path is not
+        # currently failing.
+        self._fallback_failing: dict[str, bool] = {}
         # Whether the connected system is virtualized; used by
         # get_systemstats() to skip the CPU-temperature graph, which has no
         # physical sensor on a VM. Populated by get_systeminfo(), or lazily
@@ -343,6 +372,10 @@ class TrueNASState:
         # recent call, leaving their field(s) at the previous value instead
         # of a fresh reading -- see systemstats_stale_graphs.
         self._systemstats_stale_graphs: frozenset[str] = frozenset()
+        # Names of get_ups()'s netdata graphs that failed on the most recent
+        # call, leaving their field at the previous value instead of a fresh
+        # reading -- see ups_stale_graphs.
+        self._ups_stale_graphs: frozenset[str] = frozenset()
 
     @property
     def ds(self) -> _PublicStateMap:
@@ -371,6 +404,31 @@ class TrueNASState:
         RPC failed transiently or the connection dropped mid-refresh.
         """
         return self._systemstats_stale_graphs
+
+    @property
+    def ups_stale_graphs(self) -> frozenset[str]:
+        """Names of ``get_ups()``'s netdata graphs that failed on the most
+        recent call, leaving their field at the previous value instead of a
+        fresh reading. Empty after a fully fresh refresh, when no UPS graphs
+        are discovered at all, and before ``get_ups()`` has ever been called.
+
+        A non-empty result does not mean ``get_ups()`` failed -- it still
+        returns the current (partially stale) ``ds["ups"]`` -- only that some
+        of its fields may be outdated, e.g. because a netdata RPC failed
+        transiently. When ``get_ups()`` returns early due to a failed or
+        malformed graph *discovery* call, every field still present in the
+        returned (unrefreshed) snapshot is reported as stale here, since
+        nothing was refreshed this poll -- not just the fields that were
+        already flagged stale before that call.
+
+        A graph that fails but has never once produced a reading is *not*
+        listed here -- its field is absent from ``ds["ups"]`` entirely rather
+        than outdated, so there is no stale value to warn about. An empty
+        result therefore means "no field is outdated", not "nothing failed"
+        -- unlike ``systemstats_stale_graphs``, whose fields are all seeded at
+        construction time and so are always present to begin with.
+        """
+        return self._ups_stale_graphs
 
     async def get_dataset(self) -> _EndpointMap:
         """Refresh and return normalized ZFS datasets (``pool.dataset.query``)."""
@@ -427,7 +485,16 @@ class TrueNASState:
                 # a freshly refreshed dataset map from this same call. A
                 # genuinely empty list ([]) is not malformed -- it means
                 # there are no pools left -- so it falls through normally.
+                self._note_fallback_outcome(
+                    _KEY_POOL_QUERY,
+                    failed=True,
+                    warning="Malformed 'pool.query' response: %s",
+                    reason=raw_pools,
+                )
                 return self._ds["pool"]
+            self._note_fallback_outcome(
+                _KEY_POOL_QUERY, failed=False, recovered="'pool.query' recovered"
+            )
 
             pools = parse_api(
                 data=copy.deepcopy(self._ds["pool"]),
@@ -673,6 +740,61 @@ class TrueNASState:
             self._ds["arc"] = arc
             return arc
 
+    def _all_cached_ups_graphs(self) -> frozenset[str]:
+        """Names of every UPS graph whose field is currently present in
+        ``ds["ups"]``, regardless of ``get_ups()``'s per-poll discovery.
+
+        Used by ``get_ups()``'s discovery-failure paths: when discovery
+        itself fails, nothing was refreshed this poll, so every graph
+        backing a field still in the (unrefreshed) snapshot must be reported
+        as stale -- not just the ones already flagged stale before that
+        call. ``_UPS_GRAPHS`` is injective (each graph maps to a distinct
+        field), so this reverse lookup is unambiguous.
+        """
+        return frozenset(
+            name for name, field in _UPS_GRAPHS.items() if field in self._ds["ups"]
+        )
+
+    async def _query_ups_graph(
+        self, graph_name: str, graph_query: dict[str, Any]
+    ) -> float | None:
+        """Query one UPS netdata graph; ``None`` on failure or an unusable payload.
+
+        Both cases are already recorded via ``_note_fallback_outcome()`` before
+        returning, so the caller only needs to decide what ``None`` means for
+        ``ups_stale_graphs`` (see ``get_ups()``).
+        """
+        key = f"{_UPS_GRAPH_KEY_PREFIX}{graph_name}"
+        try:
+            graph_data = await self._client.call(
+                "reporting.netdata_graph", [graph_name, graph_query]
+            )
+        except TrueNASError as err:
+            self._note_fallback_outcome(
+                key,
+                failed=True,
+                warning=f"Failed to query '{graph_name}' UPS netdata graph: %s",
+                reason=err,
+            )
+            return None
+        value = _ups_value(graph_data)
+        if value is None:
+            self._note_fallback_outcome(
+                key,
+                failed=True,
+                warning=(
+                    f"'{graph_name}' UPS netdata graph returned no usable reading: %s"
+                ),
+                reason=graph_data,
+            )
+            return None
+        self._note_fallback_outcome(
+            key,
+            failed=False,
+            recovered=f"'{graph_name}' UPS netdata graph query recovered",
+        )
+        return value
+
     async def get_ups(self) -> dict[str, float]:
         """Refresh and return UPS readings from netdata graphs, if a UPS is present.
 
@@ -681,15 +803,42 @@ class TrueNASState:
         result, so a UPS attached or removed at runtime is picked up without
         needing a restart. Returns an empty dict when no UPS graphs exist; on
         a failed discovery call, the previous reading is preserved instead
-        (retried on the next call).
+        (retried on the next call). A graph that is still discovered but
+        fails, or returns an unusable reading, on this particular call also
+        keeps its previous field value rather than dropping it -- see
+        ``ups_stale_graphs`` for which fields (if any) are stale this way.
         """
         async with self._lock:
             try:
                 graphs = await self._client.call("reporting.netdata_graphs")
-            except TrueNASError:
+            except TrueNASError as err:
+                self._note_fallback_outcome(
+                    _KEY_UPS_NETDATA_GRAPHS,
+                    failed=True,
+                    warning="Failed to discover UPS netdata graphs: %s",
+                    reason=err,
+                )
+                # Nothing was refreshed this poll -- every field currently in
+                # the returned snapshot is stale, not just the previously
+                # tracked ones, or a caller would see a full (but frozen)
+                # snapshot alongside an empty ups_stale_graphs and mistake it
+                # for a fresh one.
+                self._ups_stale_graphs = self._all_cached_ups_graphs()
                 return self._ds["ups"]
             if not isinstance(graphs, list):
+                self._note_fallback_outcome(
+                    _KEY_UPS_NETDATA_GRAPHS,
+                    failed=True,
+                    warning="Malformed 'reporting.netdata_graphs' response: %s",
+                    reason=graphs,
+                )
+                self._ups_stale_graphs = self._all_cached_ups_graphs()
                 return self._ds["ups"]
+            self._note_fallback_outcome(
+                _KEY_UPS_NETDATA_GRAPHS,
+                failed=False,
+                recovered="UPS netdata graph discovery recovered",
+            )
 
             available = {
                 name
@@ -697,8 +846,25 @@ class TrueNASState:
                 if isinstance(graph, dict)
                 and (name := str(graph.get("name", ""))) in _UPS_GRAPHS
             }
+            # A UPS graph that no longer appears in this poll's discovery
+            # wasn't queried at all this time -- clear its failing flag
+            # instead of leaving it stuck forever (it would otherwise never
+            # warn again once the graph comes back and fails a second time),
+            # mirroring how the other cached-fallback paths in this module
+            # clear their key when that path wasn't consulted this poll.
+            current_graph_keys = {
+                f"{_UPS_GRAPH_KEY_PREFIX}{name}" for name in available
+            }
+            for stale_key in [
+                key
+                for key in self._fallback_failing
+                if key.startswith(_UPS_GRAPH_KEY_PREFIX)
+                and key not in current_graph_keys
+            ]:
+                self._fallback_failing.pop(stale_key, None)
             if not available:
                 self._ds["ups"] = {}
+                self._ups_stale_graphs = frozenset()
                 return self._ds["ups"]
 
             report_epoch = int(datetime.now(UTC).replace(microsecond=0).timestamp())
@@ -707,15 +873,38 @@ class TrueNASState:
                 "end": report_epoch - 30,
                 "aggregate": True,
             }
-            ups: dict[str, float] = {}
+            # Seed from the previous snapshot (restricted to graphs still
+            # discovered this poll) rather than starting empty -- a graph
+            # that fails or returns an unusable reading below should leave
+            # its field at the previous value, matching
+            # _refresh_systemstat_graphs()/_refresh_interface_throughput(),
+            # not silently drop it from the result.
+            ups: dict[str, float] = {
+                field: self._ds["ups"][field]
+                for graph_name in available
+                if (field := _UPS_GRAPHS[graph_name]) in self._ds["ups"]
+            }
+            stale: set[str] = set()
             for graph_name in available:
-                graph_data = await self._client.call(
-                    "reporting.netdata_graph", [graph_name, graph_query]
-                )
-                value = _ups_value(graph_data)
-                if value is not None:
-                    ups[_UPS_GRAPHS[graph_name]] = value
+                field = _UPS_GRAPHS[graph_name]
+                value = await self._query_ups_graph(graph_name, graph_query)
+                if value is None:
+                    # One graph failing (or returning an unusable reading)
+                    # shouldn't drop the others -- keep querying the rest and
+                    # leave this graph's field at its previous (seeded)
+                    # value, same as _refresh_systemstat_graphs()/
+                    # _refresh_interface_throughput() do for the analogous
+                    # case. Only report it as stale if a previous value
+                    # actually exists to be stale -- a graph that has never
+                    # once succeeded has no field in `ups` at all, so
+                    # flagging it here would make ups_stale_graphs name a
+                    # field that is entirely absent from the result.
+                    if field in ups:
+                        stale.add(graph_name)
+                    continue
+                ups[field] = value
             self._ds["ups"] = ups
+            self._ups_stale_graphs = frozenset(stale)
             return ups
 
     async def get_service(self) -> _EndpointMap:
@@ -789,15 +978,49 @@ class TrueNASState:
         Mirrors ``_detect_version()``'s lazy, cached-on-first-use pattern, so
         ``get_systemstats()`` correctly skips the ``cputemp`` graph even when
         called before ``get_systeminfo()`` has ever populated
-        ``self._is_virtual``.
+        ``self._is_virtual``. Like ``_detect_version()``, a malformed
+        (non-dict) response is not cached -- caching the resulting "not
+        virtual" default from missing manufacturer/product fields would
+        otherwise permanently and silently misremember a virtualized system
+        as physical for the lifetime of this ``TrueNASState``.
+
+        Owns its own ``_note_fallback_outcome`` tracking (rather than leaving
+        it to ``get_systemstats()``) so both a raised error and a malformed
+        response are warned about -- not just the former.
         """
         if self._is_virtual is not None:
             return self._is_virtual
-        raw = await self._client.call(_SYSTEM_INFO_METHOD)
-        manufacturer = raw.get("system_manufacturer") if isinstance(raw, dict) else None
-        product = raw.get("system_product") if isinstance(raw, dict) else None
-        self._is_virtual = _is_virtual_machine(manufacturer, product)
-        return self._is_virtual
+        try:
+            raw = await self._client.call(_SYSTEM_INFO_METHOD)
+        except TrueNASError as err:
+            self._note_fallback_outcome(
+                _KEY_DETECT_VIRTUAL,
+                failed=True,
+                warning="Failed to detect virtualization status: %s",
+                reason=err,
+            )
+            return False
+        if not isinstance(raw, dict):
+            self._note_fallback_outcome(
+                _KEY_DETECT_VIRTUAL,
+                failed=True,
+                warning=(
+                    "Malformed 'system.info' response while detecting "
+                    "virtualization: %s"
+                ),
+                reason=raw,
+            )
+            return False
+        is_virtual = _is_virtual_machine(
+            raw.get("system_manufacturer"), raw.get("system_product")
+        )
+        self._is_virtual = is_virtual
+        self._note_fallback_outcome(
+            _KEY_DETECT_VIRTUAL,
+            failed=False,
+            recovered="Virtualization status detection recovered",
+        )
+        return is_virtual
 
     async def get_container(self) -> _EndpointMap:
         """Refresh and return normalized containers.
@@ -953,9 +1176,26 @@ class TrueNASState:
                 # Malformed/failed config refresh: keep the last known
                 # snapshot instead of dropping it like a legitimate
                 # disabled/unconfigured service would.
+                self._note_fallback_outcome(
+                    _KEY_DIRECTORYSERVICES_CONFIG,
+                    failed=True,
+                    warning="Malformed 'directoryservices.config' response: %s",
+                    reason=config,
+                )
                 return self._ds["directoryservices"]
+            self._note_fallback_outcome(
+                _KEY_DIRECTORYSERVICES_CONFIG,
+                failed=False,
+                recovered="'directoryservices.config' recovered",
+            )
             if not config.get("service_type") or not config.get("enable"):
                 self._ds["directoryservices"] = {}
+                # The status endpoint wasn't consulted this poll (service
+                # disabled/unconfigured) -- clear a stuck failing flag rather
+                # than leaving it stuck True forever, or a later status
+                # failure would stay silently unwarned. Silent: nothing ran
+                # this poll, so there is nothing to report as "recovered".
+                self._fallback_failing.pop(_KEY_DIRECTORYSERVICES_STATUS, None)
                 return self._ds["directoryservices"]
 
             raw_status = await self._client.call("directoryservices.status")
@@ -965,6 +1205,11 @@ class TrueNASState:
             if isinstance(status_field, str) and status_field:
                 status_val = status_field
                 status_msg = raw_status.get("status_msg")
+                self._note_fallback_outcome(
+                    _KEY_DIRECTORYSERVICES_STATUS,
+                    failed=False,
+                    recovered="'directoryservices.status' recovered",
+                )
             else:
                 # Malformed/failed status refresh (non-dict, missing
                 # "status", or a non-string/empty value): keep the last
@@ -973,6 +1218,12 @@ class TrueNASState:
                 previous = self._ds["directoryservices"].get(1, {})
                 status_val = previous.get("status", "unknown")
                 status_msg = previous.get("status_msg")
+                self._note_fallback_outcome(
+                    _KEY_DIRECTORYSERVICES_STATUS,
+                    failed=True,
+                    warning="Malformed 'directoryservices.status' response: %s",
+                    reason=raw_status,
+                )
 
             merged = dict(config)
             merged["id"] = 1
@@ -1003,6 +1254,12 @@ class TrueNASState:
         async with self._lock:
             raw = await self._client.call("alert.list")
             if not isinstance(raw, list):
+                self._note_fallback_outcome(
+                    _KEY_ALERT_LIST,
+                    failed=True,
+                    warning="Malformed 'alert.list' response: %s",
+                    reason=raw,
+                )
                 return self._ds["alerts"]
 
             usable = [
@@ -1014,7 +1271,16 @@ class TrueNASState:
                 # keep the previous snapshot instead of publishing a false
                 # "0 alerts" result. An empty list is exempt: that
                 # legitimately means "no alerts left".
+                self._note_fallback_outcome(
+                    _KEY_ALERT_LIST,
+                    failed=True,
+                    warning="'alert.list' response had no usable entries: %s",
+                    reason=raw,
+                )
                 return self._ds["alerts"]
+            self._note_fallback_outcome(
+                _KEY_ALERT_LIST, failed=False, recovered="'alert.list' recovered"
+            )
 
             active = [alert for alert in usable if not alert.get("dismissed", False)]
 
@@ -1081,12 +1347,29 @@ class TrueNASState:
         async with self._lock:
             try:
                 raw = await self._client.call("smb.status")
-            except TrueNASError:
+            except TrueNASError as err:
+                self._note_fallback_outcome(
+                    _KEY_SMB_STATUS,
+                    failed=True,
+                    warning="Failed to update SMB connection count: %s",
+                    reason=err,
+                )
                 return self._ds["smb"]
             if isinstance(raw, list):
                 self._ds["smb"] = {"connections": len(raw)}
             elif isinstance(raw, dict) and isinstance(raw.get("sessions"), list):
                 self._ds["smb"] = {"connections": len(raw["sessions"])}
+            else:
+                self._note_fallback_outcome(
+                    _KEY_SMB_STATUS,
+                    failed=True,
+                    warning="Malformed 'smb.status' response: %s",
+                    reason=raw,
+                )
+                return self._ds["smb"]
+            self._note_fallback_outcome(
+                _KEY_SMB_STATUS, failed=False, recovered="SMB status recovered"
+            )
             return self._ds["smb"]
 
     @staticmethod
@@ -1159,17 +1442,35 @@ class TrueNASState:
             )
             try:
                 await self._update_disk_temperatures()
-            except TrueNASError:
-                pass
+            except TrueNASError as err:
+                # Both inner enrichment paths (netdata and the
+                # disk.temperatures fallback) already catch their own
+                # TrueNASError internally, so reaching here means something
+                # unexpected slipped through -- worth a warning even though
+                # disk.query itself (the primary, required result) is
+                # unaffected.
+                self._note_fallback_outcome(
+                    _KEY_DISK_TEMPERATURE_UPDATE_UNEXPECTED,
+                    failed=True,
+                    warning="Unexpected error updating disk temperatures: %s",
+                    reason=err,
+                )
+            else:
+                self._note_fallback_outcome(
+                    _KEY_DISK_TEMPERATURE_UPDATE_UNEXPECTED,
+                    failed=False,
+                    recovered="Disk temperature update recovered",
+                )
             return self._ds["disk"]
 
     async def _update_disk_temperatures(self) -> None:
         """Enrich ``self._ds["disk"]`` with temperatures.
 
         Caller must hold ``self._lock``. A failed netdata query is caught
-        locally (rather than left to propagate to ``get_disk()``'s own
-        try/except) so the ``disk.temperatures`` fallback below still runs
-        for every disk instead of being skipped entirely.
+        inside ``_disk_temps_from_netdata()`` (rather than left to propagate
+        to ``get_disk()``'s own try/except) so the ``disk.temperatures``
+        fallback below still runs for every disk instead of being skipped
+        entirely.
 
         Once netdata has produced a reading for a disk, that disk's
         ``temperature`` is never ``None`` again, so gating the fallback on
@@ -1181,10 +1482,7 @@ class TrueNASState:
         read did not actually refresh -- not just ones with no reading at
         all -- keeps the value moving in that case too.
         """
-        try:
-            netdata_temps = await self._disk_temps_from_netdata()
-        except TrueNASError:
-            netdata_temps = None
+        netdata_temps = await self._disk_temps_from_netdata()
 
         refreshed: set[Hashable] = set()
         if netdata_temps:
@@ -1200,8 +1498,11 @@ class TrueNASState:
             # netdata alone covered every disk this poll -- the fallback
             # wasn't even consulted, so a prior failure can no longer be
             # confirmed. Clear it rather than leaving it stuck True forever,
-            # or a later fallback failure would stay silently unwarned.
-            self._disk_temp_fallback_failing = False
+            # or a later fallback failure would stay silently unwarned. This
+            # reset is intentionally silent (no recovery log) -- the fallback
+            # itself never ran this poll, so there is nothing to report it
+            # having recovered from.
+            self._fallback_failing.pop(_KEY_DISK_TEMP_FALLBACK, None)
 
     def _build_disk_name_map(self) -> dict[str, Hashable]:
         """Map each disk's identifier/devname/name to its ``self._ds["disk"]`` uid."""
@@ -1222,69 +1523,145 @@ class TrueNASState:
         return disk_map
 
     async def _disk_temps_from_netdata(self) -> dict[str, float] | None:
-        """Return per-disk temperatures from the netdata disk-temp graph, if any."""
+        """Return per-disk temperatures from the netdata disk-temp graph, if any.
+
+        Returns ``None`` both when no disk-temp graph is configured at all
+        (legitimate -- nothing to *warn* about) and when graph discovery or
+        the graph query itself fails, or the query's payload turns out
+        unusable (a real failure). Both still resolve the failing/recovered
+        transition on ``_KEY_DISK_TEMP_NETDATA`` -- only the failure cases
+        warn, "no graph configured" just clears a stuck flag left over from
+        an earlier discovery error -- and a failed or malformed discovery
+        leaves ``self._disk_temp_graph`` at ``None`` so discovery is retried
+        on the next call instead of being cached as "no graph found" --
+        mirroring how ``get_ups()`` treats a failed/malformed discovery, and
+        "RPC succeeded but no usable reading", as failures rather than a
+        silent recovery. Either way, returning ``None`` here (never raising)
+        is what lets the caller, ``_update_disk_temperatures()``, still fall
+        back to ``disk.temperatures`` for every disk.
+        """
         if self._disk_temp_graph is None:
-            self._disk_temp_graph = await self._discover_disk_temp_graph()
+            try:
+                graphs = await self._client.call("reporting.netdata_graphs")
+            except TrueNASError as err:
+                self._note_fallback_outcome(
+                    _KEY_DISK_TEMP_NETDATA,
+                    failed=True,
+                    warning="Failed to discover disk-temp netdata graph: %s",
+                    reason=err,
+                )
+                return None
+            if not isinstance(graphs, list):
+                self._note_fallback_outcome(
+                    _KEY_DISK_TEMP_NETDATA,
+                    failed=True,
+                    warning="Malformed 'reporting.netdata_graphs' response: %s",
+                    reason=graphs,
+                )
+                return None
+            self._disk_temp_graph = _find_disk_temp_graph_name(graphs)
         if not self._disk_temp_graph:
+            # Legitimate "no disk-temp graph configured" -- not a failure,
+            # but still clears any failing flag left over from an earlier
+            # discovery error (idempotent once already cleared), so a stuck
+            # flag doesn't survive a discovery that has since succeeded.
+            self._note_fallback_outcome(
+                _KEY_DISK_TEMP_NETDATA,
+                failed=False,
+                recovered="Disk-temp netdata discovery recovered: no matching graph",
+            )
             return None
 
         report_epoch = int(datetime.now(UTC).replace(microsecond=0).timestamp())
-        graph_data = await self._client.call(
-            "reporting.netdata_graph",
-            [
-                self._disk_temp_graph,
-                {
-                    "start": report_epoch - 90,
-                    "end": report_epoch - 30,
-                    "aggregate": True,
-                },
-            ],
-        )
-        if not isinstance(graph_data, list):
+        try:
+            graph_data = await self._client.call(
+                "reporting.netdata_graph",
+                [
+                    self._disk_temp_graph,
+                    {
+                        "start": report_epoch - 90,
+                        "end": report_epoch - 30,
+                        "aggregate": True,
+                    },
+                ],
+            )
+        except TrueNASError as err:
+            self._note_fallback_outcome(
+                _KEY_DISK_TEMP_NETDATA,
+                failed=True,
+                warning="Failed to update disk temperatures from netdata: %s",
+                reason=err,
+            )
             return None
-        return _disk_temps_from_graph_data(graph_data) or None
+        if not isinstance(graph_data, list):
+            self._note_fallback_outcome(
+                _KEY_DISK_TEMP_NETDATA,
+                failed=True,
+                warning="Malformed disk-temp netdata graph response: %s",
+                reason=graph_data,
+            )
+            return None
+        temps = _disk_temps_from_graph_data(graph_data)
+        if not temps:
+            self._note_fallback_outcome(
+                _KEY_DISK_TEMP_NETDATA,
+                failed=True,
+                warning="Disk-temp netdata graph returned no usable reading: %s",
+                reason=graph_data,
+            )
+            return None
+        self._note_fallback_outcome(
+            _KEY_DISK_TEMP_NETDATA,
+            failed=False,
+            recovered="Disk temperatures from netdata recovered",
+        )
+        return temps
 
-    async def _discover_disk_temp_graph(self) -> str:
-        """Find the netdata graph name that reports disk temperatures, if any."""
-        graphs = await self._client.call("reporting.netdata_graphs")
-        if not isinstance(graphs, list):
-            return ""
-
-        for graph in graphs:
-            if not isinstance(graph, dict):
-                continue
-            name = str(graph.get("name", ""))
-            title = str(graph.get("title", "")).lower()
-            vertical = str(graph.get("vertical_label", "")).lower()
-            if ("disk" in name or "disk" in title) and (
-                "temp" in name or "temp" in title or "celsius" in vertical
-            ):
-                return name
-        return ""
-
-    def _note_disk_temp_fallback_outcome(
-        self, *, failed: bool, reason: object = None
+    def _note_fallback_outcome(
+        self,
+        key: str,
+        *,
+        failed: bool,
+        warning: str = "",
+        recovered: str = "",
+        reason: object = None,
     ) -> None:
-        """Track the ``disk.temperatures`` fallback's failing/recovered state.
+        """Track a cached-fallback code path's failing/recovered state.
 
-        ``failed`` decides the transition explicitly -- it is not inferred
-        from ``reason``, since a legitimate ``disk.temperatures`` response of
-        ``None`` would otherwise be indistinguishable from "no failure".
-        Warns only on the failing transition and logs recovery at debug, so
-        a persistent outage does not re-warn every poll (see
-        ``_fallback_disk_temperatures``).
+        ``key`` identifies the path in ``self._fallback_failing`` (e.g.
+        "disk_temp_fallback", "ups_netdata_graphs") -- each path tracks its
+        own transition independently. ``failed`` decides the transition
+        explicitly -- it is not inferred from ``reason``, since a legitimate
+        falsy/None result can be indistinguishable from "no failure" for some
+        callers. Warns only on the failing transition and logs recovery at
+        debug, so a persistent outage does not re-warn every poll.
+
+        Originally introduced for the ``disk.temperatures`` fallback
+        (kayl-codes/homeassistant-truenas#131); generalized to cover every
+        other cached-fallback code path in this module so a stuck cached
+        value is never silently unwarned, regardless of endpoint.
+
+        ``warning``/``recovered`` default to "" so a caller can omit whichever
+        of the two never applies to it (a ``failed=True`` site has no use for
+        ``recovered``, and vice versa) -- but a caller that forgets the one
+        that *does* apply must not end up formatting "" against ``reason``
+        via ``%``, which raises ``TypeError`` deep inside logging's deferred
+        formatting and is silently swallowed by ``Handler.handleError()``.
+        Falling back to a generic message keyed by ``key`` keeps that
+        mistake visible instead of silently dropping the log line.
         """
         if failed:
-            if not self._disk_temp_fallback_failing:
-                _LOGGER.warning(
-                    "Failed to update disk temperatures from API "
-                    "'disk.temperatures': %s",
-                    reason,
-                )
-                self._disk_temp_fallback_failing = True
-        elif self._disk_temp_fallback_failing:
-            _LOGGER.debug("Disk temperatures from API 'disk.temperatures' recovered")
-            self._disk_temp_fallback_failing = False
+            if not self._fallback_failing.get(key, False):
+                if warning:
+                    _LOGGER.warning(warning, reason)
+                else:
+                    _LOGGER.warning("Fallback path '%s' failed: %s", key, reason)
+                self._fallback_failing[key] = True
+        elif self._fallback_failing.pop(key, False):
+            if recovered:
+                _LOGGER.debug(recovered)
+            else:
+                _LOGGER.debug("Fallback path '%s' recovered", key)
 
     async def _fallback_disk_temperatures(self, stale_uids: list[Hashable]) -> None:
         """Fetch temperatures for ``stale_uids`` via ``disk.temperatures``.
@@ -1303,15 +1680,23 @@ class TrueNASState:
             if isinstance(name := self._ds["disk"].get(uid, {}).get("name"), str)
             and name != "unknown"
         ]
+        warning = "Failed to update disk temperatures from API 'disk.temperatures': %s"
+        recovered = "Disk temperatures from API 'disk.temperatures' recovered"
         try:
             temps = await self._client.call("disk.temperatures", [disk_names])
         except TrueNASError as err:
-            self._note_disk_temp_fallback_outcome(failed=True, reason=err)
+            self._note_fallback_outcome(
+                _KEY_DISK_TEMP_FALLBACK, failed=True, warning=warning, reason=err
+            )
             return
         if not isinstance(temps, dict):
-            self._note_disk_temp_fallback_outcome(failed=True, reason=temps)
+            self._note_fallback_outcome(
+                _KEY_DISK_TEMP_FALLBACK, failed=True, warning=warning, reason=temps
+            )
             return
-        self._note_disk_temp_fallback_outcome(failed=False)
+        self._note_fallback_outcome(
+            _KEY_DISK_TEMP_FALLBACK, failed=False, recovered=recovered
+        )
 
         for uid in stale_uids:
             vals = self._ds["disk"][uid]
@@ -1430,10 +1815,11 @@ class TrueNASState:
                 "aggregate": True,
             }
             info = self._ds["system_info"]
-            try:
-                is_virtual = await self._detect_virtual()
-            except TrueNASError:
-                is_virtual = False
+            # _detect_virtual() owns its own failing/recovered tracking (both
+            # a raised error and a malformed response), so a failure here is
+            # already warned about -- just treat it as non-virtual so it does
+            # not abort the graph queries below.
+            is_virtual = await self._detect_virtual()
 
             stale = await self._refresh_systemstat_graphs(
                 graph_query, info, is_virtual=is_virtual
@@ -1467,13 +1853,35 @@ class TrueNASState:
         )
         stale: set[str] = set()
         for graph_name, result in zip(graph_names, results, strict=True):
+            key = f"systemstat:{graph_name}"
             if isinstance(result, TrueNASError):
                 stale.add(graph_name)
+                self._note_fallback_outcome(
+                    key,
+                    failed=True,
+                    warning=f"Failed to update '{graph_name}' systemstat graph: %s",
+                    reason=result,
+                )
                 continue
             if isinstance(result, BaseException):
                 raise result
-            if not self._apply_systemstat(graph_name, result, info):
+            if self._apply_systemstat(graph_name, result, info):
+                self._note_fallback_outcome(
+                    key,
+                    failed=False,
+                    recovered=f"'{graph_name}' systemstat graph recovered",
+                )
+            else:
                 stale.add(graph_name)
+                self._note_fallback_outcome(
+                    key,
+                    failed=True,
+                    warning=(
+                        f"'{graph_name}' systemstat graph returned no usable "
+                        "reading: %s"
+                    ),
+                    reason=result,
+                )
         return stale
 
     async def _refresh_interface_throughput(
@@ -1485,20 +1893,45 @@ class TrueNASState:
         reading, an empty set otherwise -- see ``get_systemstats()``.
         """
         if not self._ds["interface"]:
+            # The throughput graph wasn't consulted this poll (no interfaces
+            # populated yet) -- clear a stuck failing flag rather than
+            # leaving it stuck True forever, or a later throughput failure
+            # would stay silently unwarned. Silent: nothing ran this poll,
+            # so there is nothing to report as "recovered".
+            self._fallback_failing.pop(_KEY_INTERFACE_THROUGHPUT, None)
             return set()
         try:
             raw_interface = await self._client.call(
                 "reporting.netdata_graph", ["interface", graph_query]
             )
-        except TrueNASError:
-            raw_interface = None
+        except TrueNASError as err:
+            self._note_fallback_outcome(
+                _KEY_INTERFACE_THROUGHPUT,
+                failed=True,
+                warning="Failed to update interface throughput: %s",
+                reason=err,
+            )
+            return {"interface"}
         throughput_by_id = _netdata_interface_throughput(raw_interface)
         applied = False
         for identifier, throughput in throughput_by_id.items():
             if identifier in self._ds["interface"] and throughput:
                 self._ds["interface"][identifier].update(throughput)
                 applied = True
-        return set() if applied else {"interface"}
+        if applied:
+            self._note_fallback_outcome(
+                _KEY_INTERFACE_THROUGHPUT,
+                failed=False,
+                recovered="Interface throughput recovered",
+            )
+            return set()
+        self._note_fallback_outcome(
+            _KEY_INTERFACE_THROUGHPUT,
+            failed=True,
+            warning="'interface' netdata graph returned no usable reading: %s",
+            reason=raw_interface,
+        )
+        return {"interface"}
 
     def _apply_systemstat(
         self, graph_name: str, raw: Any, info: dict[str, Any]
