@@ -3875,6 +3875,30 @@ async def test_get_systemstats_does_not_cache_is_virtual_fields_blank() -> None:
     assert "cputemp" not in called_graphs
 
 
+async def test_get_systeminfo_detects_virtual_with_whitespace_padded_fields() -> None:
+    """A known VM manufacturer/product padded with surrounding whitespace
+    (e.g. ``"  QEMU  "``) must still be detected as virtual: the usability
+    guard strips before checking for blankness, but the *stripped* value must
+    also be what's passed to the exact-match detector -- passing the raw,
+    unstripped value would fail the membership check and wrongly cache the
+    host as physical.
+    """
+    async with FakeTrueNASServer(
+        valid_api_key=API_KEY,
+        responses={
+            "system.info": {
+                "system_manufacturer": "  QEMU  ",
+                "system_product": "",
+            }
+        },
+    ) as server:
+        async with make_client(server) as client:
+            await client.connect()
+            state = TrueNASState(client)
+            await state.get_systeminfo()
+            assert state._is_virtual is True
+
+
 async def test_get_systeminfo_logs_warning_when_is_virtual_fields_missing(
     caplog: pytest.LogCaptureFixture,
 ) -> None:

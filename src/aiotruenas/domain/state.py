@@ -1083,7 +1083,10 @@ class TrueNASState:
                 reason=(manufacturer, product),
             )
             return False
-        is_virtual = _is_virtual_machine(manufacturer, product)
+        is_virtual = _is_virtual_machine(
+            manufacturer.strip() if manufacturer_usable else manufacturer,
+            product.strip() if product_usable else product,
+        )
         self._is_virtual = is_virtual
         self._note_fallback_outcome(
             _KEY_DETECT_VIRTUAL, failed=False, recovered=_VIRTUAL_DETECT_RECOVERED
@@ -1887,7 +1890,10 @@ class TrueNASState:
                 # fields below, a *good* response is always safe to
                 # (re-)cache, since hardware/hypervisor identity cannot
                 # actually change for the lifetime of a running system.
-                self._is_virtual = _is_virtual_machine(manufacturer, product)
+                self._is_virtual = _is_virtual_machine(
+                    manufacturer.strip() if manufacturer_usable else manufacturer,
+                    product.strip() if product_usable else product,
+                )
                 self._note_fallback_outcome(
                     _KEY_DETECT_VIRTUAL,
                     failed=False,
