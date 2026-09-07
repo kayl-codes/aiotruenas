@@ -172,7 +172,7 @@ _SYSTEMSTATS_GRAPHS: tuple[str, ...] = ("load", "cpu", "cputemp", "memory", "arc
 _SYSTEM_INFO_METHOD = "system.info"
 
 # RPC method used to fetch a single netdata graph's data points, queried by
-# get_arc(), _query_ups_graph(), and the disk-temperature/interface-throughput
+# get_arc(), _query_ups_graphs(), and the disk-temperature/interface-throughput
 # refresh paths -- a shared constant avoids the duplicated-literal finding
 # (SonarQube S1192) across those five call sites.
 _NETDATA_GRAPH_METHOD = "reporting.netdata_graph"
@@ -785,29 +785,26 @@ class TrueNASState:
             name for name, field in _UPS_GRAPHS.items() if field in self._ds["ups"]
         )
 
-    async def _query_ups_graph(
-        self, graph_name: str, graph_query: dict[str, Any]
-    ) -> float | None:
-        """Query one UPS netdata graph; ``None`` on failure or an unusable payload.
+    def _apply_ups_graph_result(self, graph_name: str, result: Any) -> float | None:
+        """Turn one UPS netdata graph's ``asyncio.gather`` result into a value.
 
-        Both cases are already recorded via ``_note_fallback_outcome()`` before
-        returning, so the caller only needs to decide what ``None`` means for
+        ``None`` on failure or an unusable payload; both cases are already
+        recorded via ``_note_fallback_outcome()`` before returning, so the
+        caller only needs to decide what ``None`` means for
         ``ups_stale_graphs`` (see ``get_ups()``).
         """
         key = f"{_UPS_GRAPH_KEY_PREFIX}{graph_name}"
-        try:
-            graph_data = await self._client.call(
-                _NETDATA_GRAPH_METHOD, [graph_name, graph_query]
-            )
-        except TrueNASError as err:
+        if isinstance(result, TrueNASError):
             self._note_fallback_outcome(
                 key,
                 failed=True,
                 warning=f"Failed to query '{graph_name}' UPS netdata graph: %s",
-                reason=err,
+                reason=result,
             )
             return None
-        value = _ups_value(graph_data)
+        if isinstance(result, BaseException):
+            raise result
+        value = _ups_value(result)
         if value is None:
             self._note_fallback_outcome(
                 key,
@@ -815,7 +812,7 @@ class TrueNASState:
                 warning=(
                     f"'{graph_name}' UPS netdata graph returned no usable reading: %s"
                 ),
-                reason=graph_data,
+                reason=result,
             )
             return None
         self._note_fallback_outcome(
@@ -824,6 +821,27 @@ class TrueNASState:
             recovered=f"'{graph_name}' UPS netdata graph query recovered",
         )
         return value
+
+    async def _query_ups_graphs(
+        self, graph_names: list[str], graph_query: dict[str, Any]
+    ) -> dict[str, float | None]:
+        """Query all given UPS netdata graphs concurrently.
+
+        Mirrors ``_refresh_systemstat_graphs()``'s concurrent-fetch pattern so
+        one slow/unresponsive UPS graph cannot delay the others. Maps each
+        graph name to ``_apply_ups_graph_result()``'s outcome.
+        """
+        results = await asyncio.gather(
+            *(
+                self._client.call(_NETDATA_GRAPH_METHOD, [graph_name, graph_query])
+                for graph_name in graph_names
+            ),
+            return_exceptions=True,
+        )
+        return {
+            graph_name: self._apply_ups_graph_result(graph_name, result)
+            for graph_name, result in zip(graph_names, results, strict=True)
+        }
 
     async def get_ups(self) -> dict[str, float]:
         """Refresh and return UPS readings from netdata graphs, if a UPS is present.
@@ -915,20 +933,20 @@ class TrueNASState:
                 if (field := _UPS_GRAPHS[graph_name]) in self._ds["ups"]
             }
             stale: set[str] = set()
-            for graph_name in available:
+            graph_values = await self._query_ups_graphs(list(available), graph_query)
+            for graph_name, value in graph_values.items():
                 field = _UPS_GRAPHS[graph_name]
-                value = await self._query_ups_graph(graph_name, graph_query)
                 if value is None:
                     # One graph failing (or returning an unusable reading)
-                    # shouldn't drop the others -- keep querying the rest and
-                    # leave this graph's field at its previous (seeded)
-                    # value, same as _refresh_systemstat_graphs()/
-                    # _refresh_interface_throughput() do for the analogous
-                    # case. Only report it as stale if a previous value
-                    # actually exists to be stale -- a graph that has never
-                    # once succeeded has no field in `ups` at all, so
-                    # flagging it here would make ups_stale_graphs name a
-                    # field that is entirely absent from the result.
+                    # shouldn't drop the others -- leave this graph's field
+                    # at its previous (seeded) value, same as
+                    # _refresh_systemstat_graphs()/_refresh_interface_
+                    # throughput() do for the analogous case. Only report it
+                    # as stale if a previous value actually exists to be
+                    # stale -- a graph that has never once succeeded has no
+                    # field in `ups` at all, so flagging it here would make
+                    # ups_stale_graphs name a field that is entirely absent
+                    # from the result.
                     if field in ups:
                         stale.add(graph_name)
                     continue
