@@ -187,7 +187,22 @@ _KEY_DISK_TEMPERATURE_UPDATE_UNEXPECTED = "disk_temperature_update_unexpected"
 _KEY_DISK_TEMP_NETDATA = "disk_temp_netdata"
 _KEY_DISK_TEMP_FALLBACK = "disk_temp_fallback"
 _KEY_DETECT_VIRTUAL = "detect_virtual"
+_KEY_DETECT_VERSION = "detect_version"
 _KEY_INTERFACE_THROUGHPUT = "interface_throughput"
+# Shared between _detect_version() and get_systeminfo(), the two call sites
+# that populate self._version from the same 'system.info' 'version' field --
+# a shared constant avoids the duplicated-literal finding (SonarQube S1192)
+# and keeps the warning text consistent regardless of which site first
+# observes a missing/unparsable version string.
+_VERSION_DETECT_WARNING = (
+    "Failed to detect TrueNAS version from 'system.info' (missing/"
+    "unparsable 'version' field: %s); version-gated endpoints (e.g. "
+    "get_container()) will use legacy behavior until this recovers"
+)
+_VERSION_DETECT_RECOVERED = "TrueNAS version detection recovered"
+_KEY_SYSTEM_INFO = "system_info"
+_SYSTEM_INFO_MALFORMED_WARNING = "Malformed 'system.info' response: %s"
+_SYSTEM_INFO_RECOVERED = "'system.info' response recovered"
 # Prefix for get_ups()'s dynamic per-graph fallback keys (e.g.
 # "ups_graph:upscharge") -- a module-level constant rather than a fixed
 # _KEY_* value since the graph name is only known at runtime, but still
@@ -960,16 +975,42 @@ class TrueNASState:
         The version cannot change without a full appliance reboot, which
         drops the underlying WebSocket connection, so a single successful
         detection is reused for the lifetime of this ``TrueNASState``. A
-        failed/unparsable detection is not cached and is retried on the next
-        call.
+        malformed (non-dict) ``system.info`` response warns unconditionally,
+        under its own key shared with ``get_systeminfo()``'s identical guard
+        so the two call sites log the same message for the same condition.
+        A valid response with a missing/unparsable ``version`` field is not
+        cached and is retried on the next call, warning once via a second,
+        version-specific key also shared with ``get_systeminfo()``'s own
+        parse of the same field, rather than silently defaulting
+        ``get_container()`` to legacy behavior.
         """
         if self._version is not None:
             return self._version
         raw = await self._client.call(_SYSTEM_INFO_METHOD)
-        version_str = raw.get("version") if isinstance(raw, dict) else None
-        version = _parse_version_tuple(version_str)
+        if not isinstance(raw, dict):
+            self._note_fallback_outcome(
+                _KEY_SYSTEM_INFO,
+                failed=True,
+                warning=_SYSTEM_INFO_MALFORMED_WARNING,
+                reason=raw,
+            )
+            return (0, 0)
+        self._note_fallback_outcome(
+            _KEY_SYSTEM_INFO, failed=False, recovered=_SYSTEM_INFO_RECOVERED
+        )
+        version = _parse_version_tuple(raw.get("version"))
         if version != (0, 0):
             self._version = version
+            self._note_fallback_outcome(
+                _KEY_DETECT_VERSION, failed=False, recovered=_VERSION_DETECT_RECOVERED
+            )
+        else:
+            self._note_fallback_outcome(
+                _KEY_DETECT_VERSION,
+                failed=True,
+                warning=_VERSION_DETECT_WARNING,
+                reason=raw.get("version"),
+            )
         return version
 
     async def _detect_virtual(self) -> bool:
@@ -1735,7 +1776,19 @@ class TrueNASState:
         skip the CPU-temperature graph -- no physical sensor to report on a
         VM) and the parsed ``(major, minor)`` version, sparing
         ``get_container()``'s own ``_detect_version()`` a redundant
-        ``system.info`` call once this has already run.
+        ``system.info`` call once this has already run. A malformed
+        (non-dict) ``system.info`` response warns on its failing transition
+        regardless of whether a version is already cached -- not just before
+        the first successful poll -- under a key/message shared with
+        ``_detect_version()``'s identical guard, since a ``system.info`` call
+        going from valid to malformed mid-lifetime would otherwise leave
+        every other endpoint (uptime, memory, hostname, ...) silently frozen
+        on stale data with no signal. A
+        missing/unparsable ``version`` field within an otherwise-valid
+        response warns once, while no version is yet cached (via
+        ``_note_fallback_outcome()``, shared with ``_detect_version()``'s own
+        parse of the same field), rather than silently leaving version-gated
+        endpoints on legacy behavior.
 
         CPU/load/memory/ARC-size stats and interface throughput are not part
         of ``system.info`` itself; ``ensure_vals`` only guarantees their keys
@@ -1750,7 +1803,16 @@ class TrueNASState:
         async with self._lock:
             raw = await self._client.call(_SYSTEM_INFO_METHOD)
             if not isinstance(raw, dict):
+                self._note_fallback_outcome(
+                    _KEY_SYSTEM_INFO,
+                    failed=True,
+                    warning=_SYSTEM_INFO_MALFORMED_WARNING,
+                    reason=raw,
+                )
                 return self._ds["system_info"]
+            self._note_fallback_outcome(
+                _KEY_SYSTEM_INFO, failed=False, recovered=_SYSTEM_INFO_RECOVERED
+            )
             self._ds["system_info"] = parse_api(
                 data=self._ds["system_info"],
                 source=raw,
@@ -1762,6 +1824,23 @@ class TrueNASState:
             version = _parse_version_tuple(info.get("version"))
             if version != (0, 0):
                 self._version = version
+                self._note_fallback_outcome(
+                    _KEY_DETECT_VERSION,
+                    failed=False,
+                    recovered=_VERSION_DETECT_RECOVERED,
+                )
+            elif self._version is None:
+                # Only warn while no version is cached yet -- an already-cached
+                # version (from a prior successful poll) stays valid and keeps
+                # gating get_container() correctly, so a later poll's bad
+                # 'version' field here is not actually the failure the warning
+                # text describes.
+                self._note_fallback_outcome(
+                    _KEY_DETECT_VERSION,
+                    failed=True,
+                    warning=_VERSION_DETECT_WARNING,
+                    reason=raw.get("version"),
+                )
             self._is_virtual = _is_virtual_machine(
                 info.get("system_manufacturer"), info.get("system_product")
             )
