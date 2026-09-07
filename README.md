@@ -81,6 +81,12 @@ returning its own endpoint. Its underlying netdata graph queries are best-effort
 leaves its field(s) at the previous value instead of failing the whole call. Check
 `state.systemstats_stale_graphs` after calling it to see which graphs (if any) failed on the most
 recent refresh, so a caller can distinguish a partially stale result from a fully fresh one.
+`get_ups()`'s per-graph netdata queries follow the same best-effort/partial-staleness contract —
+check `state.ups_stale_graphs` after calling it. One difference: a UPS graph that has never once
+produced a reading has no field in the result at all, so a failure on it is not reflected in
+`ups_stale_graphs` either — there's no previous value to call stale. An empty
+`ups_stale_graphs` therefore means "no field is outdated", not "nothing failed", unlike
+`systemstats_stale_graphs`, whose fields are always present from the start.
 
 ## Status
 

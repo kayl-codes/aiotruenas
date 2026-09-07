@@ -80,8 +80,11 @@ _LOGGER = getLogger(__name__)
 _EndpointMap = dict[Hashable, dict[str, Any]]
 #: get_arc() shape: one entry per known metric, None where currently unavailable.
 _ArcMap = dict[str, float | None]
-#: get_ups() shape: only metrics currently reporting a value (never None --
-#: missing/no-UPS metrics are omitted rather than included as None).
+#: get_ups() shape: one entry per currently-discovered UPS graph. A graph
+#: that fails or returns an unusable reading keeps its previous value here
+#: (see ups_stale_graphs) rather than being omitted; a graph no longer
+#: discovered at all is dropped. Never None -- a metric with no prior
+#: reading and a failing/unusable current one is simply absent.
 _UpsMap = dict[str, float]
 #: get_alerts() shape: aggregated counters/messages, no natural object id.
 _AlertsMap = dict[str, Any]
@@ -369,6 +372,10 @@ class TrueNASState:
         # recent call, leaving their field(s) at the previous value instead
         # of a fresh reading -- see systemstats_stale_graphs.
         self._systemstats_stale_graphs: frozenset[str] = frozenset()
+        # Names of get_ups()'s netdata graphs that failed on the most recent
+        # call, leaving their field at the previous value instead of a fresh
+        # reading -- see ups_stale_graphs.
+        self._ups_stale_graphs: frozenset[str] = frozenset()
 
     @property
     def ds(self) -> _PublicStateMap:
@@ -397,6 +404,31 @@ class TrueNASState:
         RPC failed transiently or the connection dropped mid-refresh.
         """
         return self._systemstats_stale_graphs
+
+    @property
+    def ups_stale_graphs(self) -> frozenset[str]:
+        """Names of ``get_ups()``'s netdata graphs that failed on the most
+        recent call, leaving their field at the previous value instead of a
+        fresh reading. Empty after a fully fresh refresh, when no UPS graphs
+        are discovered at all, and before ``get_ups()`` has ever been called.
+
+        A non-empty result does not mean ``get_ups()`` failed -- it still
+        returns the current (partially stale) ``ds["ups"]`` -- only that some
+        of its fields may be outdated, e.g. because a netdata RPC failed
+        transiently. When ``get_ups()`` returns early due to a failed or
+        malformed graph *discovery* call, every field still present in the
+        returned (unrefreshed) snapshot is reported as stale here, since
+        nothing was refreshed this poll -- not just the fields that were
+        already flagged stale before that call.
+
+        A graph that fails but has never once produced a reading is *not*
+        listed here -- its field is absent from ``ds["ups"]`` entirely rather
+        than outdated, so there is no stale value to warn about. An empty
+        result therefore means "no field is outdated", not "nothing failed"
+        -- unlike ``systemstats_stale_graphs``, whose fields are all seeded at
+        construction time and so are always present to begin with.
+        """
+        return self._ups_stale_graphs
 
     async def get_dataset(self) -> _EndpointMap:
         """Refresh and return normalized ZFS datasets (``pool.dataset.query``)."""
@@ -708,6 +740,61 @@ class TrueNASState:
             self._ds["arc"] = arc
             return arc
 
+    def _all_cached_ups_graphs(self) -> frozenset[str]:
+        """Names of every UPS graph whose field is currently present in
+        ``ds["ups"]``, regardless of ``get_ups()``'s per-poll discovery.
+
+        Used by ``get_ups()``'s discovery-failure paths: when discovery
+        itself fails, nothing was refreshed this poll, so every graph
+        backing a field still in the (unrefreshed) snapshot must be reported
+        as stale -- not just the ones already flagged stale before that
+        call. ``_UPS_GRAPHS`` is injective (each graph maps to a distinct
+        field), so this reverse lookup is unambiguous.
+        """
+        return frozenset(
+            name for name, field in _UPS_GRAPHS.items() if field in self._ds["ups"]
+        )
+
+    async def _query_ups_graph(
+        self, graph_name: str, graph_query: dict[str, Any]
+    ) -> float | None:
+        """Query one UPS netdata graph; ``None`` on failure or an unusable payload.
+
+        Both cases are already recorded via ``_note_fallback_outcome()`` before
+        returning, so the caller only needs to decide what ``None`` means for
+        ``ups_stale_graphs`` (see ``get_ups()``).
+        """
+        key = f"{_UPS_GRAPH_KEY_PREFIX}{graph_name}"
+        try:
+            graph_data = await self._client.call(
+                "reporting.netdata_graph", [graph_name, graph_query]
+            )
+        except TrueNASError as err:
+            self._note_fallback_outcome(
+                key,
+                failed=True,
+                warning=f"Failed to query '{graph_name}' UPS netdata graph: %s",
+                reason=err,
+            )
+            return None
+        value = _ups_value(graph_data)
+        if value is None:
+            self._note_fallback_outcome(
+                key,
+                failed=True,
+                warning=(
+                    f"'{graph_name}' UPS netdata graph returned no usable reading: %s"
+                ),
+                reason=graph_data,
+            )
+            return None
+        self._note_fallback_outcome(
+            key,
+            failed=False,
+            recovered=f"'{graph_name}' UPS netdata graph query recovered",
+        )
+        return value
+
     async def get_ups(self) -> dict[str, float]:
         """Refresh and return UPS readings from netdata graphs, if a UPS is present.
 
@@ -716,7 +803,10 @@ class TrueNASState:
         result, so a UPS attached or removed at runtime is picked up without
         needing a restart. Returns an empty dict when no UPS graphs exist; on
         a failed discovery call, the previous reading is preserved instead
-        (retried on the next call).
+        (retried on the next call). A graph that is still discovered but
+        fails, or returns an unusable reading, on this particular call also
+        keeps its previous field value rather than dropping it -- see
+        ``ups_stale_graphs`` for which fields (if any) are stale this way.
         """
         async with self._lock:
             try:
@@ -728,6 +818,12 @@ class TrueNASState:
                     warning="Failed to discover UPS netdata graphs: %s",
                     reason=err,
                 )
+                # Nothing was refreshed this poll -- every field currently in
+                # the returned snapshot is stale, not just the previously
+                # tracked ones, or a caller would see a full (but frozen)
+                # snapshot alongside an empty ups_stale_graphs and mistake it
+                # for a fresh one.
+                self._ups_stale_graphs = self._all_cached_ups_graphs()
                 return self._ds["ups"]
             if not isinstance(graphs, list):
                 self._note_fallback_outcome(
@@ -736,6 +832,7 @@ class TrueNASState:
                     warning="Malformed 'reporting.netdata_graphs' response: %s",
                     reason=graphs,
                 )
+                self._ups_stale_graphs = self._all_cached_ups_graphs()
                 return self._ds["ups"]
             self._note_fallback_outcome(
                 _KEY_UPS_NETDATA_GRAPHS,
@@ -767,6 +864,7 @@ class TrueNASState:
                 self._fallback_failing.pop(stale_key, None)
             if not available:
                 self._ds["ups"] = {}
+                self._ups_stale_graphs = frozenset()
                 return self._ds["ups"]
 
             report_epoch = int(datetime.now(UTC).replace(microsecond=0).timestamp())
@@ -775,52 +873,38 @@ class TrueNASState:
                 "end": report_epoch - 30,
                 "aggregate": True,
             }
-            ups: dict[str, float] = {}
+            # Seed from the previous snapshot (restricted to graphs still
+            # discovered this poll) rather than starting empty -- a graph
+            # that fails or returns an unusable reading below should leave
+            # its field at the previous value, matching
+            # _refresh_systemstat_graphs()/_refresh_interface_throughput(),
+            # not silently drop it from the result.
+            ups: dict[str, float] = {
+                field: self._ds["ups"][field]
+                for graph_name in available
+                if (field := _UPS_GRAPHS[graph_name]) in self._ds["ups"]
+            }
+            stale: set[str] = set()
             for graph_name in available:
-                # Dynamic per-graph key (like _refresh_systemstat_graphs()'s
-                # "systemstat:{graph_name}") rather than a module-level
-                # constant -- the set of graphs is discovered at runtime, not
-                # fixed, so it cannot be enumerated ahead of time.
-                key = f"{_UPS_GRAPH_KEY_PREFIX}{graph_name}"
-                try:
-                    graph_data = await self._client.call(
-                        "reporting.netdata_graph", [graph_name, graph_query]
-                    )
-                except TrueNASError as err:
-                    # One graph failing shouldn't drop the others -- keep
-                    # querying the rest and simply omit this graph's field
-                    # from the result, same as an unusable reading below.
-                    self._note_fallback_outcome(
-                        key,
-                        failed=True,
-                        warning=f"Failed to query '{graph_name}' UPS netdata graph: %s",
-                        reason=err,
-                    )
-                    continue
-                value = _ups_value(graph_data)
+                field = _UPS_GRAPHS[graph_name]
+                value = await self._query_ups_graph(graph_name, graph_query)
                 if value is None:
-                    # The RPC call itself succeeded, but the payload had no
-                    # usable reading -- same "successful call, unusable
-                    # result" case _refresh_systemstat_graphs() and
-                    # _refresh_interface_throughput() also treat as a
-                    # failure, not a silent recovery.
-                    self._note_fallback_outcome(
-                        key,
-                        failed=True,
-                        warning=(
-                            f"'{graph_name}' UPS netdata graph returned no "
-                            "usable reading: %s"
-                        ),
-                        reason=graph_data,
-                    )
+                    # One graph failing (or returning an unusable reading)
+                    # shouldn't drop the others -- keep querying the rest and
+                    # leave this graph's field at its previous (seeded)
+                    # value, same as _refresh_systemstat_graphs()/
+                    # _refresh_interface_throughput() do for the analogous
+                    # case. Only report it as stale if a previous value
+                    # actually exists to be stale -- a graph that has never
+                    # once succeeded has no field in `ups` at all, so
+                    # flagging it here would make ups_stale_graphs name a
+                    # field that is entirely absent from the result.
+                    if field in ups:
+                        stale.add(graph_name)
                     continue
-                self._note_fallback_outcome(
-                    key,
-                    failed=False,
-                    recovered=f"'{graph_name}' UPS netdata graph query recovered",
-                )
-                ups[_UPS_GRAPHS[graph_name]] = value
+                ups[field] = value
             self._ds["ups"] = ups
+            self._ups_stale_graphs = frozenset(stale)
             return ups
 
     async def get_service(self) -> _EndpointMap:

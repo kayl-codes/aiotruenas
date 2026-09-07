@@ -798,9 +798,36 @@ async def test_get_ups_keeps_previous_reading_on_failed_discovery() -> None:
 
             server.responses["reporting.netdata_graphs"] = None
             result = await state.get_ups()
+            stale = state.ups_stale_graphs
 
     assert result is previous_ups
     assert state.ds["ups"] is previous_ups
+    # Discovery itself failed, so nothing was refreshed this poll -- every
+    # field still in the (unrefreshed) snapshot is stale, not just left
+    # unchanged from before.
+    assert stale == frozenset({"upscharge"})
+
+
+async def test_get_ups_reports_no_stale_graphs_on_first_ever_discovery_failure() -> (
+    None
+):
+    """A failed discovery call on the very first ``get_ups()`` call ever must
+    not report any graph as stale -- ``ds["ups"]`` is empty at that point, so
+    there is nothing to be stale, unlike the case above where a previous
+    snapshot already exists.
+    """
+    async with FakeTrueNASServer(
+        valid_api_key=API_KEY,
+        responses={"reporting.netdata_graphs": None},
+    ) as server:
+        async with make_client(server) as client:
+            await client.connect()
+            state = TrueNASState(client)
+            result = await state.get_ups()
+            stale = state.ups_stale_graphs
+
+    assert result == {}
+    assert stale == frozenset()
 
 
 async def test_get_service_derives_running_and_known_display_name() -> None:
@@ -1607,9 +1634,14 @@ async def test_get_ups_keeps_previous_reading_when_discovery_raises() -> None:
                 }
             }
             result = await state.get_ups()
+            stale = state.ups_stale_graphs
 
     assert result is previous_ups
     assert state.ds["ups"] is previous_ups
+    # Discovery itself failed, so nothing was refreshed this poll -- every
+    # field still in the (unrefreshed) snapshot is stale, not just left
+    # unchanged from before.
+    assert stale == frozenset({"upscharge"})
 
 
 async def test_get_ups_logs_warning_when_graph_discovery_raises(
@@ -1736,6 +1768,9 @@ async def test_get_ups_keeps_other_readings_when_one_graph_query_raises() -> Non
 
     assert result == {"load": 42.0}
     assert "battery_charge" not in result
+    # First-ever call: upscharge's field never had a prior value, so it must
+    # not be reported as stale either -- it's absent, not outdated.
+    assert state.ups_stale_graphs == frozenset()
 
 
 async def test_get_ups_logs_warning_when_graph_query_raises(
@@ -1831,6 +1866,156 @@ async def test_get_ups_treats_unusable_graph_as_failure_not_recovery() -> None:
     # validated).
     assert state._fallback_failing.get("ups_graph:upscharge") is True
     assert "ups_graph:upsload" not in state._fallback_failing
+    # This is the very first get_ups() call ever, so upscharge's field never
+    # had a prior value to be stale -- ups_stale_graphs must NOT name it, or
+    # it would name a field that's entirely absent from `result`/`ds["ups"]`
+    # rather than merely outdated (see the analogous raising-branch test
+    # above for the same guarantee on the other failure path).
+    assert state.ups_stale_graphs == frozenset()
+
+
+async def test_get_ups_keeps_previous_graph_reading_when_it_later_fails() -> None:
+    """A UPS graph that succeeded on a prior poll but fails outright, or
+    returns an unusable reading, on a later one must keep its previous
+    value, not have it wiped from the result -- and both cases must be
+    reported via ``ups_stale_graphs``.
+
+    Regression test (Sourcery, PR #29): ``get_ups()`` used to build the
+    ``ups`` dict from scratch each call and unconditionally overwrite
+    ``self._ds["ups"]`` with it -- a graph omitted this poll (RPC failure or
+    an unusable payload) silently erased its previously cached reading,
+    unlike every sibling netdata-graph loop in this module, which leaves a
+    failed field at its previous value.
+
+    Also covers two related ``ups_stale_graphs`` guarantees documented on
+    the property itself: a subsequent failed *discovery* call widens the
+    stale set to every field still present in the snapshot -- not just the
+    ones already flagged stale before that call -- and a fully successful
+    poll afterwards resets the stale set back to empty.
+    """
+
+    def working_netdata_graph(params: list) -> Any:
+        return [{"aggregations": {"mean": {"ups1": 42.0}}}]
+
+    def upscharge_fails_upsload_unusable(params: list) -> Any:
+        if params[0] == "upscharge":
+            return {
+                "error": {
+                    "code": -32603,
+                    "message": "Internal error",
+                    "data": {"error": 1, "errname": "EFAULT", "reason": None},
+                }
+            }
+        if params[0] == "upsload":
+            return [{"aggregations": {}}]
+        return [{"aggregations": {"mean": {"ups1": 55.0}}}]
+
+    async with FakeTrueNASServer(
+        valid_api_key=API_KEY,
+        responses={
+            "reporting.netdata_graphs": [
+                {"name": "upscharge"},
+                {"name": "upsload"},
+                {"name": "upsvoltage"},
+            ],
+            "reporting.netdata_graph": working_netdata_graph,
+        },
+    ) as server:
+        async with make_client(server) as client:
+            await client.connect()
+            state = TrueNASState(client)
+            first = await state.get_ups()
+            assert first == {
+                "battery_charge": 42.0,
+                "load": 42.0,
+                "voltage": 42.0,
+            }
+            assert state.ups_stale_graphs == frozenset()
+
+            server.responses["reporting.netdata_graph"] = (
+                upscharge_fails_upsload_unusable
+            )
+            second = await state.get_ups()
+            second_stale = state.ups_stale_graphs
+            assert second == {
+                "battery_charge": 42.0,
+                "load": 42.0,
+                "voltage": 55.0,
+            }
+            assert second_stale == frozenset({"upscharge", "upsload"})
+
+            # Discovery itself fails next -- every field still in the
+            # (unrefreshed) snapshot must become stale, not just upscharge
+            # and upsload, which were already flagged before this call.
+            server.responses["reporting.netdata_graphs"] = None
+            third = await state.get_ups()
+            third_stale = state.ups_stale_graphs
+            assert third == second
+            assert third_stale == frozenset({"upscharge", "upsload", "upsvoltage"})
+
+            # A fully successful poll afterwards must reset the stale set
+            # back to empty, not leave any graph stuck as stale forever.
+            server.responses["reporting.netdata_graphs"] = [
+                {"name": "upscharge"},
+                {"name": "upsload"},
+                {"name": "upsvoltage"},
+            ]
+            server.responses["reporting.netdata_graph"] = working_netdata_graph
+            fourth = await state.get_ups()
+            fourth_stale = state.ups_stale_graphs
+
+    assert fourth == {
+        "battery_charge": 42.0,
+        "load": 42.0,
+        "voltage": 42.0,
+    }
+    assert fourth_stale == frozenset()
+
+
+async def test_get_ups_drops_reading_when_graph_no_longer_discovered() -> None:
+    """A UPS graph that succeeded on a prior poll but is no longer discovered
+    at all on a later one must be dropped from the result, not kept forever.
+
+    Regression test: the seeding step that restores previous values in
+    ``get_ups()`` is restricted to graphs still present in this poll's
+    ``available`` set specifically so a removed UPS (or a graph it stops
+    exposing) doesn't leave a stale reading around indefinitely -- unlike a
+    graph that merely fails while still discovered (see
+    ``test_get_ups_keeps_previous_graph_reading_when_it_later_fails``), which
+    does keep its previous value.
+    """
+
+    def working_netdata_graph(params: list) -> Any:
+        return [{"aggregations": {"mean": {"ups1": 42.0}}}]
+
+    async with FakeTrueNASServer(
+        valid_api_key=API_KEY,
+        responses={
+            "reporting.netdata_graphs": [
+                {"name": "upscharge"},
+                {"name": "upsload"},
+            ],
+            "reporting.netdata_graph": working_netdata_graph,
+        },
+    ) as server:
+        async with make_client(server) as client:
+            await client.connect()
+            state = TrueNASState(client)
+            first = await state.get_ups()
+            assert first == {"battery_charge": 42.0, "load": 42.0}
+
+            # upsload is no longer exposed at all this poll (UPS unplugged,
+            # or netdata briefly stops reporting it) -- unlike a graph that
+            # is still discovered but fails to query.
+            server.responses["reporting.netdata_graphs"] = [{"name": "upscharge"}]
+            second = await state.get_ups()
+            second_stale = state.ups_stale_graphs
+
+    assert second == {"battery_charge": 42.0}
+    # upscharge is the only graph still discovered and it succeeded, so
+    # nothing is stale -- upsload's disappearance drops it outright rather
+    # than reporting it as a stale field that no longer exists.
+    assert second_stale == frozenset()
 
 
 async def test_get_ups_logs_warning_when_graph_returns_no_usable_reading(
@@ -1917,6 +2102,7 @@ async def test_get_ups_clears_stale_graph_flag_when_graph_disappears() -> None:
 
     assert result == {}
     assert "ups_graph:upscharge" not in state._fallback_failing
+    assert state.ups_stale_graphs == frozenset()
 
 
 async def test_get_interface_normalizes_and_derives_link_up() -> None:
@@ -3435,6 +3621,15 @@ async def test_systemstats_stale_graphs_empty_before_first_call() -> None:
             state = TrueNASState(client)
 
     assert state.systemstats_stale_graphs == frozenset()
+
+
+async def test_ups_stale_graphs_empty_before_first_call() -> None:
+    async with FakeTrueNASServer(valid_api_key=API_KEY) as server:
+        async with make_client(server) as client:
+            await client.connect()
+            state = TrueNASState(client)
+
+    assert state.ups_stale_graphs == frozenset()
 
 
 def _well_formed_netdata_graph(params: list) -> Any:
