@@ -3222,7 +3222,13 @@ async def test_get_systeminfo_logs_warning_on_unparsable_version(
     """
     async with FakeTrueNASServer(
         valid_api_key=API_KEY,
-        responses={"system.info": {"version": "garbage"}},
+        responses={
+            "system.info": {
+                "version": "garbage",
+                "system_manufacturer": "Supermicro",
+                "system_product": "X11SPi-TF",
+            }
+        },
     ) as server:
         async with make_client(server) as client:
             await client.connect()
@@ -3230,7 +3236,11 @@ async def test_get_systeminfo_logs_warning_on_unparsable_version(
             with caplog.at_level(logging.DEBUG, logger="aiotruenas.domain.state"):
                 await state.get_systeminfo()
 
-                server.responses["system.info"] = {"version": "TrueNAS-25.10.0"}
+                server.responses["system.info"] = {
+                    "version": "TrueNAS-25.10.0",
+                    "system_manufacturer": "Supermicro",
+                    "system_product": "X11SPi-TF",
+                }
                 await state.get_systeminfo()
 
     state_records = [r for r in caplog.records if r.name == "aiotruenas.domain.state"]
@@ -3298,7 +3308,13 @@ async def test_get_systeminfo_does_not_warn_when_version_already_cached(
     """
     async with FakeTrueNASServer(
         valid_api_key=API_KEY,
-        responses={"system.info": {"version": "TrueNAS-26.0.0"}},
+        responses={
+            "system.info": {
+                "version": "TrueNAS-26.0.0",
+                "system_manufacturer": "Supermicro",
+                "system_product": "X11SPi-TF",
+            }
+        },
     ) as server:
         async with make_client(server) as client:
             await client.connect()
@@ -3306,7 +3322,11 @@ async def test_get_systeminfo_does_not_warn_when_version_already_cached(
             with caplog.at_level(logging.DEBUG, logger="aiotruenas.domain.state"):
                 await state.get_systeminfo()
 
-                server.responses["system.info"] = {"version": "garbage"}
+                server.responses["system.info"] = {
+                    "version": "garbage",
+                    "system_manufacturer": "Supermicro",
+                    "system_product": "X11SPi-TF",
+                }
                 await state.get_systeminfo()
 
     state_records = [r for r in caplog.records if r.name == "aiotruenas.domain.state"]
@@ -3334,7 +3354,11 @@ async def test_get_systeminfo_logs_warning_on_non_dict_system_info(
             with caplog.at_level(logging.DEBUG, logger="aiotruenas.domain.state"):
                 await state.get_systeminfo()
 
-                server.responses["system.info"] = {"version": "TrueNAS-25.10.0"}
+                server.responses["system.info"] = {
+                    "version": "TrueNAS-25.10.0",
+                    "system_manufacturer": "Supermicro",
+                    "system_product": "X11SPi-TF",
+                }
                 await state.get_systeminfo()
 
     state_records = [r for r in caplog.records if r.name == "aiotruenas.domain.state"]
@@ -3364,7 +3388,13 @@ async def test_get_systeminfo_warns_on_non_dict_even_with_version_already_cached
     """
     async with FakeTrueNASServer(
         valid_api_key=API_KEY,
-        responses={"system.info": {"version": "TrueNAS-26.0.0"}},
+        responses={
+            "system.info": {
+                "version": "TrueNAS-26.0.0",
+                "system_manufacturer": "Supermicro",
+                "system_product": "X11SPi-TF",
+            }
+        },
     ) as server:
         async with make_client(server) as client:
             await client.connect()
@@ -3633,6 +3663,297 @@ async def test_get_systeminfo_handles_unhashable_manufacturer() -> None:
     assert result["system_manufacturer"] == ["QEMU"]
 
 
+async def test_get_systeminfo_does_not_reset_is_virtual_once_cached() -> None:
+    """A later poll's response missing ``system_manufacturer``/``system_product``
+    must not overwrite an already-cached ``True`` with the "unknown" default's
+    ``False`` -- hardware/hypervisor identity cannot change for the lifetime of
+    a running system, so once detected it stays cached, mirroring
+    ``_detect_virtual()``'s own "detect once" guard.
+    """
+    async with FakeTrueNASServer(
+        valid_api_key=API_KEY,
+        responses={
+            "system.info": {
+                "system_manufacturer": "QEMU",
+                "system_product": "Standard PC",
+            }
+        },
+    ) as server:
+        async with make_client(server) as client:
+            await client.connect()
+            state = TrueNASState(client)
+            await state.get_systeminfo()
+            assert state._is_virtual is True
+
+            server.responses["system.info"] = {}
+            await state.get_systeminfo()
+
+    assert state._is_virtual is True
+
+
+async def test_get_systeminfo_does_not_cache_is_virtual_when_fields_missing() -> None:
+    """A first-ever poll whose response is missing both
+    ``system_manufacturer`` and ``system_product`` must leave
+    ``self._is_virtual`` at ``None`` (not cache the "unknown" default's
+    ``False``), so a later poll with real VM identity can still detect it --
+    and ``get_systemstats()`` must then correctly skip ``cputemp``. Before
+    this fix, this exact case permanently and silently misclassified a VM as
+    physical hardware from its very first poll.
+    """
+    called_graphs: list[str] = []
+
+    def netdata_graph(params: list) -> Any:
+        called_graphs.append(params[0])
+        return None
+
+    async with FakeTrueNASServer(
+        valid_api_key=API_KEY,
+        responses={
+            "system.info": {},
+            "reporting.netdata_graph": netdata_graph,
+        },
+    ) as server:
+        async with make_client(server) as client:
+            await client.connect()
+            state = TrueNASState(client)
+            await state.get_systeminfo()
+            assert state._is_virtual is None
+
+            server.responses["system.info"] = {
+                "system_manufacturer": "QEMU",
+                "system_product": "Standard PC",
+            }
+            await state.get_systeminfo()
+            assert state._is_virtual is True
+
+            await state.get_systemstats()
+
+    assert "cputemp" not in called_graphs
+
+
+async def test_get_systeminfo_does_not_cache_is_virtual_when_fields_are_null() -> None:
+    """A first-ever poll where both fields are *present but null* (e.g. a
+    dmidecode-less container) must leave ``self._is_virtual`` at ``None``,
+    same as when the fields are missing entirely -- key presence alone is
+    not usable detection evidence. A later poll with real VM identity must
+    still be able to detect it.
+    """
+    async with FakeTrueNASServer(
+        valid_api_key=API_KEY,
+        responses={
+            "system.info": {
+                "system_manufacturer": None,
+                "system_product": None,
+            }
+        },
+    ) as server:
+        async with make_client(server) as client:
+            await client.connect()
+            state = TrueNASState(client)
+            await state.get_systeminfo()
+            assert state._is_virtual is None
+
+            server.responses["system.info"] = {
+                "system_manufacturer": "QEMU",
+                "system_product": "Standard PC",
+            }
+            await state.get_systeminfo()
+            assert state._is_virtual is True
+
+
+async def test_get_systemstats_does_not_cache_is_virtual_when_fields_are_null() -> None:
+    """Mirrors ``test_get_systeminfo_does_not_cache_is_virtual_when_fields_are_null``
+    for ``_detect_virtual()``'s own cached-on-first-use path: a first poll
+    with both fields present but null must not permanently mis-cache "not
+    virtual" -- a later poll (here, via ``get_systeminfo()``) must still be
+    able to detect it and have ``get_systemstats()`` skip ``cputemp``.
+    """
+    called_graphs: list[str] = []
+
+    def netdata_graph(params: list) -> Any:
+        called_graphs.append(params[0])
+        return None
+
+    async with FakeTrueNASServer(
+        valid_api_key=API_KEY,
+        responses={
+            "system.info": {
+                "system_manufacturer": None,
+                "system_product": None,
+            },
+            "reporting.netdata_graph": netdata_graph,
+        },
+    ) as server:
+        async with make_client(server) as client:
+            await client.connect()
+            state = TrueNASState(client)
+            await state.get_systemstats()
+            assert state._is_virtual is None
+
+            server.responses["system.info"] = {
+                "system_manufacturer": "QEMU",
+                "system_product": "Standard PC",
+            }
+            await state.get_systeminfo()
+            assert state._is_virtual is True
+
+            called_graphs.clear()
+            await state.get_systemstats()
+
+    assert "cputemp" not in called_graphs
+
+
+async def test_get_systeminfo_does_not_cache_is_virtual_when_fields_are_blank() -> None:
+    """A first-ever poll where both fields are *present but blank* (``""``,
+    a known dmidecode "not set" sentinel distinct from ``None``/missing) must
+    also leave ``self._is_virtual`` at ``None`` -- being a string is not by
+    itself usable detection evidence. A later poll with real VM identity must
+    still be able to detect it.
+    """
+    async with FakeTrueNASServer(
+        valid_api_key=API_KEY,
+        responses={
+            "system.info": {
+                "system_manufacturer": "",
+                "system_product": "  ",
+            }
+        },
+    ) as server:
+        async with make_client(server) as client:
+            await client.connect()
+            state = TrueNASState(client)
+            await state.get_systeminfo()
+            assert state._is_virtual is None
+
+            server.responses["system.info"] = {
+                "system_manufacturer": "QEMU",
+                "system_product": "Standard PC",
+            }
+            await state.get_systeminfo()
+            assert state._is_virtual is True
+
+
+async def test_get_systemstats_does_not_cache_is_virtual_fields_blank() -> None:
+    """Mirrors ``test_get_systeminfo_does_not_cache_is_virtual_when_fields_are_blank``
+    for ``_detect_virtual()``'s own cached-on-first-use path: a first poll
+    with both fields present but blank must not permanently mis-cache "not
+    virtual" -- a later poll (here, via ``get_systeminfo()``) must still be
+    able to detect it and have ``get_systemstats()`` skip ``cputemp``.
+    """
+    called_graphs: list[str] = []
+
+    def netdata_graph(params: list) -> Any:
+        called_graphs.append(params[0])
+        return None
+
+    async with FakeTrueNASServer(
+        valid_api_key=API_KEY,
+        responses={
+            "system.info": {
+                "system_manufacturer": "",
+                "system_product": "",
+            },
+            "reporting.netdata_graph": netdata_graph,
+        },
+    ) as server:
+        async with make_client(server) as client:
+            await client.connect()
+            state = TrueNASState(client)
+            await state.get_systemstats()
+            assert state._is_virtual is None
+
+            server.responses["system.info"] = {
+                "system_manufacturer": "QEMU",
+                "system_product": "Standard PC",
+            }
+            await state.get_systeminfo()
+            assert state._is_virtual is True
+
+            called_graphs.clear()
+            await state.get_systemstats()
+
+    assert "cputemp" not in called_graphs
+
+
+async def test_get_systeminfo_logs_warning_when_is_virtual_fields_missing(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """Mirrors ``test_get_systeminfo_logs_warning_on_unparsable_version``:
+    a response missing both virtualization-detection fields must warn once
+    (while nothing is cached yet) and log recovery once a subsequent poll
+    supplies them.
+    """
+    async with FakeTrueNASServer(
+        valid_api_key=API_KEY,
+        responses={"system.info": {"version": "TrueNAS-25.10.0"}},
+    ) as server:
+        async with make_client(server) as client:
+            await client.connect()
+            state = TrueNASState(client)
+            with caplog.at_level(logging.DEBUG, logger="aiotruenas.domain.state"):
+                await state.get_systeminfo()
+
+                server.responses["system.info"] = {
+                    "version": "TrueNAS-25.10.0",
+                    "system_manufacturer": "QEMU",
+                    "system_product": "Standard PC",
+                }
+                await state.get_systeminfo()
+
+    state_records = [r for r in caplog.records if r.name == "aiotruenas.domain.state"]
+    warnings = [r for r in state_records if r.levelno == logging.WARNING]
+    recoveries = [
+        r
+        for r in state_records
+        if r.levelno == logging.DEBUG and "recovered" in r.getMessage()
+    ]
+    assert len(warnings) == 1
+    assert "virtual" in warnings[0].getMessage().lower()
+    assert len(recoveries) == 1
+
+
+async def test_detect_virtual_recovers_after_partial_response() -> None:
+    """``get_systemstats()`` calling ``_detect_virtual()`` first against a
+    response missing both fields must not permanently lock in "not virtual"
+    either -- a later ``get_systeminfo()`` poll with real VM identity must
+    still be able to detect it, and the *next* ``get_systemstats()`` call
+    must then skip ``cputemp``. Covers the same regression as
+    ``test_get_systeminfo_does_not_cache_is_virtual_when_fields_missing``,
+    but entering through ``_detect_virtual()`` instead.
+    """
+    called_graphs: list[str] = []
+
+    def netdata_graph(params: list) -> Any:
+        called_graphs.append(params[0])
+        return None
+
+    async with FakeTrueNASServer(
+        valid_api_key=API_KEY,
+        responses={
+            "system.info": {},
+            "reporting.netdata_graph": netdata_graph,
+        },
+    ) as server:
+        async with make_client(server) as client:
+            await client.connect()
+            state = TrueNASState(client)
+            await state.get_systemstats()
+            assert state._is_virtual is None
+            assert "cputemp" in called_graphs
+
+            called_graphs.clear()
+            server.responses["system.info"] = {
+                "system_manufacturer": "QEMU",
+                "system_product": "Standard PC",
+            }
+            await state.get_systeminfo()
+            assert state._is_virtual is True
+
+            await state.get_systemstats()
+
+    assert "cputemp" not in called_graphs
+
+
 async def test_get_systemstats_skips_cputemp_on_vm_without_get_systeminfo() -> None:
     called_graphs: list[str] = []
 
@@ -3861,7 +4182,10 @@ async def test_get_systemstats_logs_warning_when_virtual_detection_raises(
             with caplog.at_level(logging.DEBUG, logger="aiotruenas.domain.state"):
                 await state.get_systemstats()
 
-                server.responses["system.info"] = {}
+                server.responses["system.info"] = {
+                    "system_manufacturer": "Dell Inc.",
+                    "system_product": "PowerEdge R730",
+                }
                 await state.get_systemstats()
 
     state_records = [r for r in caplog.records if r.name == "aiotruenas.domain.state"]
@@ -3898,7 +4222,10 @@ async def test_get_systemstats_logs_warning_when_virtual_detection_malformed(
             with caplog.at_level(logging.DEBUG, logger="aiotruenas.domain.state"):
                 await state.get_systemstats()
 
-                server.responses["system.info"] = {}
+                server.responses["system.info"] = {
+                    "system_manufacturer": "Dell Inc.",
+                    "system_product": "PowerEdge R730",
+                }
                 await state.get_systemstats()
 
     state_records = [r for r in caplog.records if r.name == "aiotruenas.domain.state"]
@@ -4073,7 +4400,13 @@ async def test_get_systemstats_logs_warning_for_single_stale_systemstat_graph(
 
     async with FakeTrueNASServer(
         valid_api_key=API_KEY,
-        responses={"system.info": {}, "reporting.netdata_graph": netdata_graph},
+        responses={
+            "system.info": {
+                "system_manufacturer": "Supermicro",
+                "system_product": "X11SPi-TF",
+            },
+            "reporting.netdata_graph": netdata_graph,
+        },
     ) as server:
         async with make_client(server) as client:
             await client.connect()
@@ -4155,7 +4488,10 @@ async def test_get_systemstats_logs_warning_when_interface_throughput_raises(
     async with FakeTrueNASServer(
         valid_api_key=API_KEY,
         responses={
-            "system.info": {},
+            "system.info": {
+                "system_manufacturer": "Supermicro",
+                "system_product": "X11SPi-TF",
+            },
             "interface.query": raw_interfaces,
             "reporting.netdata_graph": netdata_graph,
         },
@@ -4212,7 +4548,10 @@ async def test_get_systemstats_logs_warning_when_interface_throughput_unusable(
     async with FakeTrueNASServer(
         valid_api_key=API_KEY,
         responses={
-            "system.info": {},
+            "system.info": {
+                "system_manufacturer": "Supermicro",
+                "system_product": "X11SPi-TF",
+            },
             "interface.query": raw_interfaces,
             "reporting.netdata_graph": netdata_graph_with_unmatched_interface,
         },
