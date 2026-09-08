@@ -252,6 +252,44 @@ def test_netdata_mean_value_raw_data_fallback_averages_all_series_per_point() ->
     assert _netdata_mean_value(graph_data) == pytest.approx(3.0)
 
 
+def test_netdata_mean_value_raw_data_fallback_weighs_series_equally() -> None:
+    """A series with fewer valid samples than another must not be
+    under-weighted -- each series is averaged independently first, then
+    those per-series means are averaged together, matching the primary
+    ``aggregations.mean`` path's equal per-series weighting. A flat average
+    across all raw samples would instead skew toward whichever series has
+    more valid samples (here series 1, which has one non-finite point).
+    """
+    graph_data = [
+        {
+            "aggregations": {"mean": {}},
+            "data": [
+                [1000, 2.0, 10.0],
+                [1002, 4.0, float("nan")],
+                [1004, 6.0, 30.0],
+            ],
+        }
+    ]
+    # series 0 mean = (2+4+6)/3 = 4.0; series 1 mean = (10+30)/2 = 20.0
+    # -> (4.0 + 20.0) / 2 = 12.0, not the flat mean of 10.4.
+    assert _netdata_mean_value(graph_data) == pytest.approx(12.0)
+
+
+def test_netdata_mean_value_raw_data_fallback_drops_series_with_no_valid_sample() -> (
+    None
+):
+    """A series with zero finite samples across every point must be
+    omitted from the average entirely, not counted in as 0.0.
+    """
+    graph_data = [
+        {
+            "aggregations": {"mean": {}},
+            "data": [[1000, float("nan"), 5.0], [1002, float("nan"), 15.0]],
+        }
+    ]
+    assert _netdata_mean_value(graph_data) == pytest.approx(10.0)
+
+
 def test_netdata_mean_value_returns_none_when_raw_data_also_empty() -> None:
     graph_data = [{"aggregations": {"mean": {}}, "data": []}]
     assert _netdata_mean_value(graph_data) is None

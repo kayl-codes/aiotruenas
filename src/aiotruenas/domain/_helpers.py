@@ -13,6 +13,7 @@ from __future__ import annotations
 
 import math
 import re
+from collections import defaultdict
 from typing import Any
 
 
@@ -120,22 +121,30 @@ def _aggregate_topology_errors(topology: Any) -> tuple[int, int, int]:
 
 
 def _raw_sample_values(data: Any) -> list[float]:
-    """Extract numeric sample values from a netdata graph's raw ``data`` points.
+    """Extract one mean-per-series from a netdata graph's raw ``data`` points.
 
     Each point is ``[timestamp, v1, ..., vN]``; used by
     ``_netdata_mean_value()`` as a fallback source when ``aggregations`` is
-    missing or empty. Mirrors that function's primary path in averaging all
-    series of a point together, not just the first.
+    missing or empty. Values are grouped by series (column index) and each
+    series is averaged independently before being returned -- mirroring the
+    primary ``aggregations.mean`` path's equal per-series weighting. A flat
+    average across all series' raw samples would instead over-weight
+    whichever series happens to have more valid (finite, non-missing)
+    samples than the others. A series with no valid sample at all is
+    dropped rather than counted as 0.0, matching this module's convention
+    elsewhere (e.g. ``_netdata_named_means``) of omitting unusable series
+    instead of defaulting them.
     """
     if not isinstance(data, list):
         return []
-    return [
-        v
-        for point in data
-        if isinstance(point, list) and len(point) >= 2
-        for v in point[1:]
-        if _is_finite_number(v)
-    ]
+    series_values: defaultdict[int, list[float]] = defaultdict(list)
+    for point in data:
+        if not isinstance(point, list) or len(point) < 2:
+            continue
+        for i, v in enumerate(point[1:]):
+            if _is_finite_number(v):
+                series_values[i].append(v)
+    return [sum(vals) / len(vals) for vals in series_values.values()]
 
 
 def _netdata_mean_value(graph_data: Any) -> float | None:
@@ -143,9 +152,10 @@ def _netdata_mean_value(graph_data: Any) -> float | None:
 
     Defensive parsing: handles missing/malformed structure. Returns
     ``None`` only when neither the aggregation mean nor the raw sample
-    fallback contains usable values. Falls back to averaging the raw
-    per-sample ``data`` points when ``aggregations.mean`` is missing or
-    present-but-empty -- TrueNAS's netdata backend can return an empty
+    fallback contains usable values. Falls back to averaging each series'
+    mean of the raw per-sample ``data`` points when ``aggregations.mean``
+    is missing or present-but-empty -- TrueNAS's netdata backend can return
+    an empty
     ``aggregations`` map (e.g. ``{"min": {}, "mean": {}, "max": {}}``) for
     an all-zero-valued series, which would otherwise read as "no usable
     reading" even though the raw samples (a real, if degenerate, e.g. 0.0
