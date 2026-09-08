@@ -13,6 +13,7 @@ from __future__ import annotations
 
 import math
 import re
+from collections import defaultdict
 from typing import Any
 
 
@@ -119,10 +120,46 @@ def _aggregate_topology_errors(topology: Any) -> tuple[int, int, int]:
     return totals["read"], totals["write"], totals["checksum"]
 
 
+def _raw_sample_values(data: Any) -> list[float]:
+    """Extract one mean-per-series from a netdata graph's raw ``data`` points.
+
+    Each point is ``[timestamp, v1, ..., vN]``; used by
+    ``_netdata_mean_value()`` as a fallback source when ``aggregations`` is
+    missing or empty. Values are grouped by series (column index) and each
+    series is averaged independently before being returned -- mirroring the
+    primary ``aggregations.mean`` path's equal per-series weighting. A flat
+    average across all series' raw samples would instead over-weight
+    whichever series happens to have more valid (finite, non-missing)
+    samples than the others. A series with no valid sample at all is
+    dropped rather than counted as 0.0, matching this module's convention
+    elsewhere (e.g. ``_netdata_named_means``) of omitting unusable series
+    instead of defaulting them.
+    """
+    if not isinstance(data, list):
+        return []
+    series_values: defaultdict[int, list[float]] = defaultdict(list)
+    for point in data:
+        if not isinstance(point, list) or len(point) < 2:
+            continue
+        for i, v in enumerate(point[1:]):
+            if _is_finite_number(v):
+                series_values[i].append(v)
+    return [sum(vals) / len(vals) for vals in series_values.values()]
+
+
 def _netdata_mean_value(graph_data: Any) -> float | None:
     """Extract mean value from a netdata graph response.
 
-    Defensive parsing: handles missing/malformed structure by returning None.
+    Defensive parsing: handles missing/malformed structure. Returns
+    ``None`` only when neither the aggregation mean nor the raw sample
+    fallback contains usable values. Falls back to averaging each series'
+    mean of the raw per-sample ``data`` points when ``aggregations.mean``
+    is missing or present-but-empty -- TrueNAS's netdata backend can return
+    an empty
+    ``aggregations`` map (e.g. ``{"min": {}, "mean": {}, "max": {}}``) for
+    an all-zero-valued series, which would otherwise read as "no usable
+    reading" even though the raw samples (a real, if degenerate, e.g. 0.0
+    reading) are perfectly valid.
     """
     if not isinstance(graph_data, list) or not graph_data:
         return None
@@ -132,18 +169,14 @@ def _netdata_mean_value(graph_data: Any) -> float | None:
         return None
 
     aggregations = item.get("aggregations")
-    if not isinstance(aggregations, dict):
-        return None
-
-    mean = aggregations.get("mean", {})
-    if not isinstance(mean, dict):
-        return None
-
-    values = [
-        v
-        for v in mean.values()
-        if isinstance(v, (int, float)) and not isinstance(v, bool)
-    ]
+    mean = aggregations.get("mean") if isinstance(aggregations, dict) else None
+    values = (
+        [v for v in mean.values() if _is_finite_number(v)]
+        if isinstance(mean, dict)
+        else []
+    )
+    if not values:
+        values = _raw_sample_values(item.get("data"))
     return round(sum(values) / len(values), 2) if values else None
 
 

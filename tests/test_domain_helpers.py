@@ -188,6 +188,113 @@ def test_netdata_mean_value_excludes_bool_values() -> None:
     assert _netdata_mean_value(graph_data_only_bool) is None
 
 
+def test_netdata_mean_value_falls_back_to_raw_data_when_aggregations_empty() -> None:
+    """TrueNAS's netdata backend can return present-but-empty aggregations
+    (e.g. all-``{}`` min/mean/max) for an all-zero-valued series.
+    """
+    graph_data = [
+        {
+            "aggregations": {"min": {}, "mean": {}, "max": {}},
+            "data": [[1000, 0], [1002, 0], [1004, 0]],
+        }
+    ]
+    assert _netdata_mean_value(graph_data) == pytest.approx(0.0)
+
+
+def test_netdata_mean_value_falls_back_to_raw_data_when_aggregations_missing() -> None:
+    graph_data = [{"data": [[1000, 2.0], [1002, 4.0]]}]
+    assert _netdata_mean_value(graph_data) == pytest.approx(3.0)
+
+
+def test_netdata_mean_value_falls_back_to_raw_data_when_aggregations_not_a_dict() -> (
+    None
+):
+    graph_data = [{"aggregations": "not-a-dict", "data": [[1000, 2.0], [1002, 6.0]]}]
+    assert _netdata_mean_value(graph_data) == pytest.approx(4.0)
+
+
+def test_netdata_mean_value_raw_data_fallback_ignores_malformed_points() -> None:
+    graph_data = [
+        {
+            "aggregations": {"mean": {}},
+            "data": ["not-a-point", [1000], [1002, "nan"], [1004, True], [1006, 5.0]],
+        }
+    ]
+    assert _netdata_mean_value(graph_data) == pytest.approx(5.0)
+
+
+def test_netdata_mean_value_raw_data_fallback_ignores_non_finite_values() -> None:
+    """A literal NaN/Infinity sample (valid JSON, real wire risk) must not
+    silently become the reported reading -- it has to be filtered out like
+    any other unusable value, not averaged in.
+    """
+    graph_data = [
+        {
+            "aggregations": {"mean": {}},
+            "data": [[1000, float("nan")], [1002, float("inf")], [1004, 5.0]],
+        }
+    ]
+    assert _netdata_mean_value(graph_data) == pytest.approx(5.0)
+
+
+def test_netdata_mean_value_raw_data_fallback_returns_none_for_only_non_finite() -> (
+    None
+):
+    graph_data = [{"aggregations": {"mean": {}}, "data": [[1000, float("nan")]]}]
+    assert _netdata_mean_value(graph_data) is None
+
+
+def test_netdata_mean_value_raw_data_fallback_averages_all_series_per_point() -> None:
+    """Mirrors the primary ``aggregations.mean`` path, which averages every
+    series in the mean dict together rather than picking just one.
+    """
+    graph_data = [{"aggregations": {"mean": {}}, "data": [[1000, 2.0, 4.0]]}]
+    assert _netdata_mean_value(graph_data) == pytest.approx(3.0)
+
+
+def test_netdata_mean_value_raw_data_fallback_weighs_series_equally() -> None:
+    """A series with fewer valid samples than another must not be
+    under-weighted -- each series is averaged independently first, then
+    those per-series means are averaged together, matching the primary
+    ``aggregations.mean`` path's equal per-series weighting. A flat average
+    across all raw samples would instead skew toward whichever series has
+    more valid samples (here series 1, which has one non-finite point).
+    """
+    graph_data = [
+        {
+            "aggregations": {"mean": {}},
+            "data": [
+                [1000, 2.0, 10.0],
+                [1002, 4.0, float("nan")],
+                [1004, 6.0, 30.0],
+            ],
+        }
+    ]
+    # series 0 mean = (2+4+6)/3 = 4.0; series 1 mean = (10+30)/2 = 20.0
+    # -> (4.0 + 20.0) / 2 = 12.0, not the flat mean of 10.4.
+    assert _netdata_mean_value(graph_data) == pytest.approx(12.0)
+
+
+def test_netdata_mean_value_raw_data_fallback_drops_series_with_no_valid_sample() -> (
+    None
+):
+    """A series with zero finite samples across every point must be
+    omitted from the average entirely, not counted in as 0.0.
+    """
+    graph_data = [
+        {
+            "aggregations": {"mean": {}},
+            "data": [[1000, float("nan"), 5.0], [1002, float("nan"), 15.0]],
+        }
+    ]
+    assert _netdata_mean_value(graph_data) == pytest.approx(10.0)
+
+
+def test_netdata_mean_value_returns_none_when_raw_data_also_empty() -> None:
+    graph_data = [{"aggregations": {"mean": {}}, "data": []}]
+    assert _netdata_mean_value(graph_data) is None
+
+
 def test_arc_value_delegates_to_netdata_mean_value() -> None:
     graph_data = [{"aggregations": {"mean": {"a": 10.0}}}]
     assert _arc_value(graph_data) == pytest.approx(10.0)
