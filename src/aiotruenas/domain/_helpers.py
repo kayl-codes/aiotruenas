@@ -141,13 +141,15 @@ def _raw_sample_values(data: Any) -> list[float]:
 def _netdata_mean_value(graph_data: Any) -> float | None:
     """Extract mean value from a netdata graph response.
 
-    Defensive parsing: handles missing/malformed structure by returning
-    None. Falls back to averaging the raw per-sample ``data`` points when
-    ``aggregations.mean`` is missing or present-but-empty -- TrueNAS's
-    netdata backend can return an empty ``aggregations`` map (e.g.
-    ``{"min": {}, "mean": {}, "max": {}}``) for an all-zero-valued series,
-    which would otherwise read as "no usable reading" even though the raw
-    samples (a real, if degenerate, e.g. 0.0 reading) are perfectly valid.
+    Defensive parsing: handles missing/malformed structure. Returns
+    ``None`` only when neither the aggregation mean nor the raw sample
+    fallback contains usable values. Falls back to averaging the raw
+    per-sample ``data`` points when ``aggregations.mean`` is missing or
+    present-but-empty -- TrueNAS's netdata backend can return an empty
+    ``aggregations`` map (e.g. ``{"min": {}, "mean": {}, "max": {}}``) for
+    an all-zero-valued series, which would otherwise read as "no usable
+    reading" even though the raw samples (a real, if degenerate, e.g. 0.0
+    reading) are perfectly valid.
     """
     if not isinstance(graph_data, list) or not graph_data:
         return None
