@@ -337,6 +337,35 @@ def test_disk_temps_from_graph_data_ignores_malformed_entries() -> None:
     assert _disk_temps_from_graph_data(graph_data) == {}
 
 
+def test_disk_temps_from_graph_data_falls_back_to_raw_samples() -> None:
+    """TrueNAS's netdata backend can return present-but-empty ``aggregations``
+    (``{"min": {}, "mean": {}, "max": {}}``) alongside populated raw ``data``
+    points -- mirrors the shape ``_netdata_mean_value()`` already falls back
+    for (see f3533a7)."""
+    graph_data = [
+        {
+            "identifier": "disk1",
+            "aggregations": {"mean": {}},
+            "data": [[100, 30.0], [101, 40.0]],
+        }
+    ]
+    assert _disk_temps_from_graph_data(graph_data) == {"disk1": 35.0}
+
+
+def test_disk_temps_from_graph_data_stays_empty_when_raw_data_also_empty() -> None:
+    """The shape reported in kayl-codes/homeassistant-truenas#139: both the
+    aggregations and the raw data are genuinely empty (no samples in this
+    poll's window at all), so no fallback source can produce a reading."""
+    graph_data = [
+        {
+            "identifier": "disk1",
+            "aggregations": {"min": {}, "mean": {}, "max": {}},
+            "data": [],
+        }
+    ]
+    assert _disk_temps_from_graph_data(graph_data) == {}
+
+
 # ---------------------------
 #   _netdata_named_means
 # ---------------------------

@@ -1632,20 +1632,34 @@ class TrueNASState:
     async def _disk_temps_from_netdata(self) -> dict[str, float] | None:
         """Return per-disk temperatures from the netdata disk-temp graph, if any.
 
-        Returns ``None`` both when no disk-temp graph is configured at all
-        (legitimate -- nothing to *warn* about) and when graph discovery or
-        the graph query itself fails, or the query's payload turns out
-        unusable (a real failure). Both still resolve the failing/recovered
-        transition on ``_KEY_DISK_TEMP_NETDATA`` -- only the failure cases
-        warn, "no graph configured" just clears a stuck flag left over from
-        an earlier discovery error -- and a failed or malformed discovery
-        leaves ``self._disk_temp_graph`` at ``None`` so discovery is retried
-        on the next call instead of being cached as "no graph found" --
-        mirroring how ``get_ups()`` treats a failed/malformed discovery, and
-        "RPC succeeded but no usable reading", as failures rather than a
-        silent recovery. Either way, returning ``None`` here (never raising)
-        is what lets the caller, ``_update_disk_temperatures()``, still fall
-        back to ``disk.temperatures`` for every disk.
+        Returns ``None`` when no disk-temp graph is configured at all, when
+        graph discovery or the graph query itself fails or returns a
+        malformed payload (a real failure -- warned on the failing
+        transition, mirroring ``get_ups()``'s handling of a failed/malformed
+        discovery), and when the query succeeded but yielded no usable
+        reading for any disk. A failed or malformed discovery leaves
+        ``self._disk_temp_graph`` at ``None`` so discovery is retried on the
+        next call instead of being cached as "no graph found".
+
+        Unlike those, "RPC succeeded but every disk's samples/aggregations
+        came back empty" is *not* treated as a failure worth warning about:
+        TrueNAS's netdata backend legitimately has nothing to report for a
+        disk yet right after a service restart (samples haven't accumulated
+        for that poll's window), and some collectors (observed with NVMe
+        SMART-temp probes) simply sample slower than this library's polling
+        interval, so an empty window here and there is expected, not an
+        outage -- see kayl-codes/homeassistant-truenas#139. Warning on every
+        such poll was pure noise, especially since ``disk.temperatures`` (see
+        ``_update_disk_temperatures()``) already covers any disk this leaves
+        unrefreshed. Only logged at DEBUG for troubleshooting, and any
+        failing flag left over from an earlier *real* failure is cleared
+        silently (no recovery log -- nothing was actually confirmed working
+        this poll, mirroring the fallback-uid case in
+        ``_update_disk_temperatures()``) rather than left stuck, or a later
+        real failure would stay silently unwarned forever. Either way,
+        returning ``None`` here (never raising) is what lets the caller,
+        ``_update_disk_temperatures()``, still fall back to
+        ``disk.temperatures`` for every disk.
         """
         if self._disk_temp_graph is None:
             try:
@@ -1710,11 +1724,18 @@ class TrueNASState:
             return None
         temps = _disk_temps_from_graph_data(graph_data)
         if not temps:
-            self._note_fallback_outcome(
-                _KEY_DISK_TEMP_NETDATA,
-                failed=True,
-                warning="Disk-temp netdata graph returned no usable reading: %s",
-                reason=graph_data,
+            # Not a failing transition (see docstring): the RPC itself
+            # succeeded, so whatever earlier real failure set this flag no
+            # longer applies. Clear it silently (no recovery log -- nothing
+            # was actually confirmed recovered this poll) rather than
+            # leaving it stuck True, or a later real failure would stay
+            # unwarned forever. Mirrors the same reasoning in
+            # _update_disk_temperatures() for _KEY_DISK_TEMP_FALLBACK.
+            self._fallback_failing.pop(_KEY_DISK_TEMP_NETDATA, None)
+            _LOGGER.debug(
+                "Disk-temp netdata graph returned no usable reading this "
+                "poll (falling back to 'disk.temperatures'): %s",
+                graph_data,
             )
             return None
         self._note_fallback_outcome(

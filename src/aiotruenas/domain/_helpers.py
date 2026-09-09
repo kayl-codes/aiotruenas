@@ -247,7 +247,12 @@ def _disk_temps_from_graph_data(graph_data: list[Any]) -> dict[str, float]:
     Each entry carries a disk "identifier" and an "aggregations/mean" map of
     per-series readings; values outside the 0-100 degC sane range are
     discarded before taking the median, to reduce the impact of transient
-    spikes/outliers.
+    spikes/outliers. Falls back to averaging each series' mean of the raw
+    per-sample "data" points (see ``_raw_sample_values()``) when
+    "aggregations/mean" is missing or present-but-empty for an entry --
+    mirroring ``_netdata_mean_value()``'s handling of the same
+    present-but-empty-aggregations shape TrueNAS's netdata backend can
+    return.
     """
     temps: dict[str, float] = {}
     for entry in graph_data:
@@ -258,15 +263,14 @@ def _disk_temps_from_graph_data(graph_data: list[Any]) -> dict[str, float]:
             continue
         mean = entry.get("aggregations", {})
         mean = mean.get("mean") if isinstance(mean, dict) else None
-        if not isinstance(mean, dict):
-            continue
-        if valid_means := [
-            v
-            for v in mean.values()
-            if isinstance(v, (int, float))
-            and not isinstance(v, bool)
-            and 0.0 <= v <= 100.0
-        ]:
+        values = (
+            [v for v in mean.values() if _is_finite_number(v)]
+            if isinstance(mean, dict)
+            else []
+        )
+        if not values:
+            values = _raw_sample_values(entry.get("data"))
+        if valid_means := [v for v in values if 0.0 <= v <= 100.0]:
             temps[str(identifier)] = _median(valid_means)
     return temps
 
