@@ -2707,7 +2707,8 @@ async def test_get_disk_logs_debug_when_netdata_graph_returns_no_usable_reading(
     netdata service restart or for slower collectors (observed with NVMe
     SMART-temp probes), and the ``disk.temperatures`` fallback already
     covers it -- see kayl-codes/homeassistant-truenas#139. Only a DEBUG
-    trace is logged, and the failing/recovered flag is left untouched since
+    trace is logged, and any leftover failing flag is silently cleared (a
+    no-op here since none was set) rather than warned as a recovery, since
     this isn't treated as a failing transition.
 
     Uses the exact payload shape from the linked issue (a listed entry per
@@ -2820,6 +2821,53 @@ async def test_get_disk_clears_netdata_flag_after_failure_then_empty_reading(
         for r in state_records
         if r.levelno == logging.DEBUG and "recovered" in r.getMessage().lower()
     ]
+
+
+async def test_get_disk_warns_when_netdata_graph_response_has_no_disk_entries(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """A *non-empty* netdata-graph response that contains no recognizable
+    per-disk series at all is a malformed payload, not the expected
+    "samples not accumulated yet" empty window -- it must follow the
+    real-failure path (warn once, set the failing flag) rather than being
+    silently demoted to a DEBUG trace. An empty top-level list stays the
+    expected-window case (covered separately above).
+    """
+    async with FakeTrueNASServer(
+        valid_api_key=API_KEY,
+        responses={
+            "disk.query": [_DISK_SDA],
+            "reporting.netdata_graphs": [
+                {
+                    "name": "disktemp",
+                    "title": "Disk Temperature",
+                    "vertical_label": "Celsius",
+                }
+            ],
+            "reporting.netdata_graph": ["garbage", 42, {"no": "identifier"}],
+            "disk.temperatures": {"sda": 42.5},
+        },
+    ) as server:
+        async with make_client(server) as client:
+            await client.connect()
+            state = TrueNASState(client)
+            with caplog.at_level(logging.WARNING, logger="aiotruenas.domain.state"):
+                result = await state.get_disk()
+
+    assert result["{serial}S1"]["temperature"] == 42.5
+    assert state._fallback_failing.get("disk_temp_netdata") is True
+
+    state_records = [r for r in caplog.records if r.name == "aiotruenas.domain.state"]
+    # "no disk entries" is unique to the new malformed-payload branch -- a bare
+    # "malformed" substring also matches the two sibling warnings for a
+    # non-list graphs/graph_data response, so the test could pass for the
+    # wrong reason.
+    malformed_warnings = [
+        r
+        for r in state_records
+        if r.levelno == logging.WARNING and "no disk entries" in r.getMessage().lower()
+    ]
+    assert len(malformed_warnings) == 1
 
 
 async def test_get_disk_falls_back_to_disk_temperatures_when_no_netdata_graph() -> None:

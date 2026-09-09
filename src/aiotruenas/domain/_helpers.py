@@ -275,6 +275,27 @@ def _disk_temps_from_graph_data(graph_data: list[Any]) -> dict[str, float]:
     return temps
 
 
+def _has_disk_temp_entries(graph_data: Any) -> bool:
+    """Return True if a netdata disk-temp response has >=1 per-disk series entry.
+
+    A "per-disk series entry" is a dict carrying a truthy ``identifier``,
+    regardless of whether it currently holds a usable reading. This lets the
+    caller tell a genuinely empty sampling window (entries present, samples
+    just not accumulated yet -- kayl-codes/homeassistant-truenas#139) apart
+    from a malformed response (a non-empty list with no recognizable disk
+    entry at all), which should follow the real-failure path rather than
+    being treated as an expected empty window. An empty top-level list is
+    *not* malformed -- netdata legitimately returns it for that same
+    no-samples-yet case -- so callers gate this on ``graph_data`` being
+    non-empty first.
+    """
+    if not isinstance(graph_data, list):
+        return False
+    return any(
+        isinstance(entry, dict) and entry.get("identifier") for entry in graph_data
+    )
+
+
 def _netdata_named_means(graph_data: Any, names: tuple[str, ...]) -> dict[str, float]:
     """Extract named per-series mean values from a netdata graph response.
 

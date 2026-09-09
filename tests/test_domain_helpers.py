@@ -15,6 +15,7 @@ from aiotruenas.domain._helpers import (
     _arc_value,
     _as_int,
     _disk_temps_from_graph_data,
+    _has_disk_temp_entries,
     _is_finite_number,
     _is_virtual_machine,
     _median,
@@ -364,6 +365,51 @@ def test_disk_temps_from_graph_data_stays_empty_when_raw_data_also_empty() -> No
         }
     ]
     assert _disk_temps_from_graph_data(graph_data) == {}
+
+
+# ---------------------------
+#   _has_disk_temp_entries
+# ---------------------------
+def test_has_disk_temp_entries_true_for_series_without_readings() -> None:
+    """The empty-sampling-window shape (kayl-codes/homeassistant-truenas#139)
+    still counts as recognizable per-disk series."""
+    graph_data = [
+        {
+            "identifier": "disk1",
+            "aggregations": {"min": {}, "mean": {}, "max": {}},
+            "data": [],
+        }
+    ]
+    assert _has_disk_temp_entries(graph_data) is True
+
+
+def test_has_disk_temp_entries_true_when_one_series_among_garbage() -> None:
+    """A single recognizable per-disk series is enough -- ``any()``, not
+    ``all()``: garbage entries alongside it must not push an otherwise
+    expected empty window onto the real-failure path."""
+    graph_data = [
+        "garbage",
+        42,
+        {"identifier": "disk1", "aggregations": {"mean": {}}, "data": []},
+    ]
+    assert _disk_temps_from_graph_data(graph_data) == {}
+    assert _has_disk_temp_entries(graph_data) is True
+
+
+@pytest.mark.parametrize(
+    "graph_data",
+    [
+        pytest.param([], id="empty-list"),
+        pytest.param(["not-a-dict", 3, None], id="no-dict-entries"),
+        pytest.param([{"aggregations": {"mean": {"a": 30.0}}}], id="dict-without-id"),
+        pytest.param([{"identifier": None}, {"identifier": ""}], id="falsy-id"),
+        pytest.param("not-a-list", id="not-a-list"),
+    ],
+)
+def test_has_disk_temp_entries_false_for_unrecognizable_payloads(
+    graph_data: object,
+) -> None:
+    assert _has_disk_temp_entries(graph_data) is False
 
 
 # ---------------------------

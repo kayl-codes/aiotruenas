@@ -32,6 +32,7 @@ from ._helpers import (
     _disk_temps_from_graph_data,
     _find_disk_temp_graph_name,
     _first_ipv4,
+    _has_disk_temp_entries,
     _is_finite_number,
     _is_virtual_machine,
     _netdata_interface_throughput,
@@ -1641,8 +1642,9 @@ class TrueNASState:
         ``self._disk_temp_graph`` at ``None`` so discovery is retried on the
         next call instead of being cached as "no graph found".
 
-        Unlike those, "RPC succeeded but every disk's samples/aggregations
-        came back empty" is *not* treated as a failure worth warning about:
+        Unlike those, "RPC succeeded and returned recognizable per-disk
+        series, but every disk's samples/aggregations came back empty" is
+        *not* treated as a failure worth warning about:
         TrueNAS's netdata backend legitimately has nothing to report for a
         disk yet right after a service restart (samples haven't accumulated
         for that poll's window), and some collectors (observed with NVMe
@@ -1656,8 +1658,12 @@ class TrueNASState:
         silently (no recovery log -- nothing was actually confirmed working
         this poll, mirroring the fallback-uid case in
         ``_update_disk_temperatures()``) rather than left stuck, or a later
-        real failure would stay silently unwarned forever. Either way,
-        returning ``None`` here (never raising) is what lets the caller,
+        real failure would stay silently unwarned forever. A *non-empty*
+        response that contains no recognizable per-disk series at all is a
+        different case -- a malformed payload, not an empty window -- and
+        does follow the real-failure path (warn once, set the flag).
+        Either way, returning ``None`` here (never raising) is what lets
+        the caller,
         ``_update_disk_temperatures()``, still fall back to
         ``disk.temperatures`` for every disk.
         """
@@ -1724,6 +1730,23 @@ class TrueNASState:
             return None
         temps = _disk_temps_from_graph_data(graph_data)
         if not temps:
+            if graph_data and not _has_disk_temp_entries(graph_data):
+                # Non-empty response we could not recognize as per-disk
+                # series at all -- a malformed payload, not the expected
+                # "samples not accumulated yet" empty window handled below
+                # (an empty list *is* that window and stays out of here).
+                # Follow the real-failure path so a stuck fallback value
+                # never goes silently unwarned.
+                self._note_fallback_outcome(
+                    _KEY_DISK_TEMP_NETDATA,
+                    failed=True,
+                    warning=(
+                        "Malformed disk-temp netdata graph response "
+                        "(no disk entries): %s"
+                    ),
+                    reason=graph_data,
+                )
+                return None
             # Not a failing transition (see docstring): the RPC itself
             # succeeded, so whatever earlier real failure set this flag no
             # longer applies. Clear it silently (no recovery log -- nothing
