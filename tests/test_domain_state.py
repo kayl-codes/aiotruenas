@@ -2662,15 +2662,18 @@ async def test_get_disk_normalizes_and_applies_netdata_temperature() -> None:
     assert state.ds["disk"] == result
 
 
-async def test_get_disk_treats_empty_netdata_graph_reading_as_failure() -> None:
+async def test_get_disk_does_not_treat_empty_netdata_graph_reading_as_failure() -> None:
     """A discovered disk-temp graph whose query succeeds but yields no usable
-    reading (e.g. an empty aggregation window) must be recorded as failing,
-    not silently as recovered -- otherwise a broken netdata source is
-    indistinguishable from "no graph configured at all" and never warns
-    (regression: ``_update_disk_temperatures()`` used to call
-    ``_note_fallback_outcome(..., failed=False, ...)`` unconditionally
-    whenever ``_disk_temps_from_netdata()`` didn't raise, even though that
-    helper also returns ``None`` for a successful-but-empty payload).
+    reading (e.g. an empty aggregation window) must *not* be recorded as
+    failing, and the ``disk.temperatures`` fallback must still populate the
+    temperature.
+
+    TrueNAS's netdata backend legitimately has nothing to report for a disk
+    right after a service restart, or for slower collectors (observed with
+    NVMe SMART-temp probes) whose sampling cadence can miss this library's
+    60-second query window -- warning on every such poll was pure log noise
+    given the fallback already covers it (kayl-codes/homeassistant-truenas#139).
+    This supersedes the opposite behavior this test previously asserted.
     """
     async with FakeTrueNASServer(
         valid_api_key=API_KEY,
@@ -2693,15 +2696,25 @@ async def test_get_disk_treats_empty_netdata_graph_reading_as_failure() -> None:
             result = await state.get_disk()
 
     assert result["{serial}S1"]["temperature"] == 42.5
-    assert state._fallback_failing.get("disk_temp_netdata") is True
+    assert "disk_temp_netdata" not in state._fallback_failing
 
 
-async def test_get_disk_logs_warning_when_netdata_graph_returns_no_usable_reading(
+async def test_get_disk_logs_debug_when_netdata_graph_returns_no_usable_reading(
     caplog: pytest.LogCaptureFixture,
 ) -> None:
-    """The netdata-side failure above must also surface its own warning and
-    clear it again once the graph starts returning a usable reading --
-    independently of the ``disk.temperatures`` fallback's own warning.
+    """An RPC-succeeded-but-empty netdata reading (empty samples/aggregations
+    for every disk) must not warn -- it's expected right after a TrueNAS
+    netdata service restart or for slower collectors (observed with NVMe
+    SMART-temp probes), and the ``disk.temperatures`` fallback already
+    covers it -- see kayl-codes/homeassistant-truenas#139. Only a DEBUG
+    trace is logged, and any leftover failing flag is silently cleared (a
+    no-op here since none was set) rather than warned as a recovery, since
+    this isn't treated as a failing transition.
+
+    Uses the exact payload shape from the linked issue (a listed entry per
+    disk, with empty ``data``/``aggregations`` rather than an empty
+    top-level list) so this stays a regression test for that report
+    specifically, not just for the simpler no-entries case covered above.
     """
     async with FakeTrueNASServer(
         valid_api_key=API_KEY,
@@ -2714,7 +2727,15 @@ async def test_get_disk_logs_warning_when_netdata_graph_returns_no_usable_readin
                     "vertical_label": "Celsius",
                 }
             ],
-            "reporting.netdata_graph": [],
+            "reporting.netdata_graph": [
+                {
+                    "name": "disktemp",
+                    "identifier": "{serial}S1",
+                    "data": [],
+                    "aggregations": {"min": {}, "mean": {}, "max": {}},
+                    "legend": ["time", "temperature_value"],
+                }
+            ],
             "disk.temperatures": {"sda": 42.5},
         },
     ) as server:
@@ -2722,30 +2743,131 @@ async def test_get_disk_logs_warning_when_netdata_graph_returns_no_usable_readin
             await client.connect()
             state = TrueNASState(client)
             with caplog.at_level(logging.DEBUG, logger="aiotruenas.domain.state"):
-                await state.get_disk()
+                result = await state.get_disk()
 
-                server.responses["reporting.netdata_graph"] = [
-                    {
-                        "identifier": "{serial}S1",
-                        "aggregations": {"mean": {"sda": 35.0}},
-                    }
-                ]
-                await state.get_disk()
+    assert result["{serial}S1"]["temperature"] == 42.5
+    assert "disk_temp_netdata" not in state._fallback_failing
 
     state_records = [r for r in caplog.records if r.name == "aiotruenas.domain.state"]
-    netdata_warnings = [
+    netdata_warnings = [r for r in state_records if r.levelno == logging.WARNING]
+    netdata_debug_traces = [
         r
         for r in state_records
-        if r.levelno == logging.WARNING and "netdata graph returned" in r.getMessage()
+        if r.levelno == logging.DEBUG and "no usable reading" in r.getMessage().lower()
     ]
-    netdata_recoveries = [
+    assert not netdata_warnings
+    assert len(netdata_debug_traces) == 1
+
+
+async def test_get_disk_clears_netdata_flag_after_failure_then_empty_reading(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """A prior *real* netdata-graph-query failure (RPC error) must not stay
+    stuck ``True`` once a later poll gets an RPC-succeeded-but-empty
+    reading -- otherwise a second genuine failure after that would go
+    unwarned forever, since ``_note_fallback_outcome`` only warns on the
+    False -> True transition. Regression test for the stuck-flag bug fixed
+    alongside kayl-codes/homeassistant-truenas#139: the empty-reading branch
+    now pops the flag (silently, since nothing was actually confirmed
+    recovered) instead of leaving it untouched.
+    """
+    async with FakeTrueNASServer(
+        valid_api_key=API_KEY,
+        responses={
+            "disk.query": [_DISK_SDA],
+            "reporting.netdata_graphs": [
+                {
+                    "name": "disktemp",
+                    "title": "Disk Temperature",
+                    "vertical_label": "Celsius",
+                }
+            ],
+            "reporting.netdata_graph": {
+                "error": {
+                    "code": -32603,
+                    "message": "Internal error",
+                    "data": {"error": 1, "errname": "EFAULT", "reason": None},
+                }
+            },
+            "disk.temperatures": {"sda": 42.5},
+        },
+    ) as server:
+        async with make_client(server) as client:
+            await client.connect()
+            state = TrueNASState(client)
+            first = await state.get_disk()
+            assert first["{serial}S1"]["temperature"] == 42.5
+            assert state._fallback_failing.get("disk_temp_netdata") is True
+
+            caplog.clear()
+            server.responses["reporting.netdata_graph"] = [
+                {
+                    "name": "disktemp",
+                    "identifier": "{serial}S1",
+                    "data": [],
+                    "aggregations": {"min": {}, "mean": {}, "max": {}},
+                    "legend": ["time", "temperature_value"],
+                }
+            ]
+            second = await state.get_disk()
+
+    assert second["{serial}S1"]["temperature"] == 42.5
+    assert "disk_temp_netdata" not in state._fallback_failing
+
+    state_records = [r for r in caplog.records if r.name == "aiotruenas.domain.state"]
+    assert not [r for r in state_records if r.levelno == logging.WARNING]
+    assert not [
         r
         for r in state_records
-        if r.levelno == logging.DEBUG
-        and "Disk temperatures from netdata recovered" in r.getMessage()
+        if r.levelno == logging.DEBUG and "recovered" in r.getMessage().lower()
     ]
-    assert len(netdata_warnings) == 1
-    assert len(netdata_recoveries) == 1
+
+
+async def test_get_disk_warns_when_netdata_graph_response_has_no_disk_entries(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """A *non-empty* netdata-graph response that contains no recognizable
+    per-disk series at all is a malformed payload, not the expected
+    "samples not accumulated yet" empty window -- it must follow the
+    real-failure path (warn once, set the failing flag) rather than being
+    silently demoted to a DEBUG trace. An empty top-level list stays the
+    expected-window case (covered separately above).
+    """
+    async with FakeTrueNASServer(
+        valid_api_key=API_KEY,
+        responses={
+            "disk.query": [_DISK_SDA],
+            "reporting.netdata_graphs": [
+                {
+                    "name": "disktemp",
+                    "title": "Disk Temperature",
+                    "vertical_label": "Celsius",
+                }
+            ],
+            "reporting.netdata_graph": ["garbage", 42, {"no": "identifier"}],
+            "disk.temperatures": {"sda": 42.5},
+        },
+    ) as server:
+        async with make_client(server) as client:
+            await client.connect()
+            state = TrueNASState(client)
+            with caplog.at_level(logging.WARNING, logger="aiotruenas.domain.state"):
+                result = await state.get_disk()
+
+    assert result["{serial}S1"]["temperature"] == 42.5
+    assert state._fallback_failing.get("disk_temp_netdata") is True
+
+    state_records = [r for r in caplog.records if r.name == "aiotruenas.domain.state"]
+    # "no disk entries" is unique to the new malformed-payload branch -- a bare
+    # "malformed" substring also matches the two sibling warnings for a
+    # non-list graphs/graph_data response, so the test could pass for the
+    # wrong reason.
+    malformed_warnings = [
+        r
+        for r in state_records
+        if r.levelno == logging.WARNING and "no disk entries" in r.getMessage().lower()
+    ]
+    assert len(malformed_warnings) == 1
 
 
 async def test_get_disk_falls_back_to_disk_temperatures_when_no_netdata_graph() -> None:
