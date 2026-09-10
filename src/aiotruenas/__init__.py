@@ -23,7 +23,7 @@ from .exceptions import (
     TrueNASWebSocketUnsupportedError,
 )
 
-__version__ = "1.5.2"
+__version__ = "1.5.3"
 
 __all__ = [
     "DEFAULT_QUERY_TIMEOUT",
