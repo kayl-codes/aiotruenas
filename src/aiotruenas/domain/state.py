@@ -33,6 +33,7 @@ from ._helpers import (
     _find_disk_temp_graph_name,
     _first_ipv4,
     _has_disk_temp_entries,
+    _has_netdata_series_entry,
     _is_finite_number,
     _is_virtual_machine,
     _netdata_interface_throughput,
@@ -789,10 +790,37 @@ class TrueNASState:
     def _apply_ups_graph_result(self, graph_name: str, result: Any) -> float | None:
         """Turn one UPS netdata graph's ``asyncio.gather`` result into a value.
 
-        ``None`` on failure or an unusable payload; both cases are already
-        recorded via ``_note_fallback_outcome()`` before returning, so the
-        caller only needs to decide what ``None`` means for
-        ``ups_stale_graphs`` (see ``get_ups()``).
+        ``None`` on failure or an unusable payload; the two unusable-payload
+        cases are handled differently (see below), and the hard-failure
+        (raised ``TrueNASError``) case is always recorded via
+        ``_note_fallback_outcome()`` before returning, so the caller only
+        needs to decide what ``None`` means for ``ups_stale_graphs`` (see
+        ``get_ups()``).
+
+        A structurally recognized but empty response (a recognizable
+        per-series entry, e.g. matching ``{"name": ..., "identifier": ...}``,
+        with no samples/aggregations yet, or an empty top-level list) is
+        *not* treated as a failure worth warning about: some UPS/NUT drivers
+        simply never report a given metric for a particular device (observed
+        for "upscurrent" -- kayl-codes/homeassistant-truenas#142), mirroring
+        the disk-temperature fallback's handling of the analogous
+        empty-sampling-window shape (kayl-codes/homeassistant-truenas#139,
+        see ``_disk_temps_from_netdata()``). Only logged at DEBUG, and any
+        failing flag left over from an earlier *real* failure is cleared
+        silently (no recovery log -- nothing was actually confirmed working
+        this poll). A non-empty response with no recognizable series entry
+        at all is a different case -- a malformed payload -- and does follow
+        the real-failure path (warn once, set the flag).
+
+        The recognizability check is scoped to ``result[:1]`` only, matching
+        ``_ups_value()`` -> ``_netdata_mean_value()``'s own single-entry
+        (``graph_data[0]``) parse scope -- unlike the disk-temp graph, a UPS
+        netdata graph is single-series, so only the first entry is ever
+        actually consulted for a value. Scanning the *whole* list here (as
+        ``_has_netdata_series_entry()`` does by default) would let a
+        malformed first entry alongside an unrelated well-formed later one
+        get misclassified as "recognized but empty", silently clearing a
+        failing flag that should stay set.
         """
         key = f"{_UPS_GRAPH_KEY_PREFIX}{graph_name}"
         if isinstance(result, TrueNASError):
@@ -807,12 +835,21 @@ class TrueNASState:
             raise result
         value = _ups_value(result)
         if value is None:
+            if isinstance(result, list) and (
+                not result or _has_netdata_series_entry(result[:1])
+            ):
+                self._fallback_failing.pop(key, None)
+                _LOGGER.debug(
+                    "'%s' UPS netdata graph returned no usable reading this "
+                    "poll (keeping previous value, if any): %s",
+                    graph_name,
+                    result,
+                )
+                return None
             self._note_fallback_outcome(
                 key,
                 failed=True,
-                warning=(
-                    f"'{graph_name}' UPS netdata graph returned no usable reading: %s"
-                ),
+                warning=f"Malformed '{graph_name}' UPS netdata graph response: %s",
                 reason=result,
             )
             return None
