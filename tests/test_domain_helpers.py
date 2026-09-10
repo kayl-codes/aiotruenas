@@ -16,6 +16,7 @@ from aiotruenas.domain._helpers import (
     _as_int,
     _disk_temps_from_graph_data,
     _has_disk_temp_entries,
+    _has_netdata_series_entry,
     _is_finite_number,
     _is_virtual_machine,
     _median,
@@ -410,6 +411,60 @@ def test_has_disk_temp_entries_false_for_unrecognizable_payloads(
     graph_data: object,
 ) -> None:
     assert _has_disk_temp_entries(graph_data) is False
+
+
+# ---------------------------
+#   _has_netdata_series_entry
+# ---------------------------
+def test_has_netdata_series_entry_true_for_name_and_identifier_without_readings() -> (
+    None
+):
+    """The shape TrueNAS's UPS netdata graphs actually carry (both "name" and
+    "identifier"), with no samples accumulated yet -- kayl-codes/
+    homeassistant-truenas#142 -- still counts as a recognizable series."""
+    graph_data = [
+        {
+            "name": "upscurrent",
+            "identifier": "upscurrent",
+            "data": [],
+            "aggregations": {"min": {}, "mean": {}, "max": {}},
+        }
+    ]
+    assert _has_netdata_series_entry(graph_data) is True
+
+
+def test_has_netdata_series_entry_true_for_name_only() -> None:
+    """A "name"-only entry (no "identifier") is also recognizable."""
+    graph_data = [{"name": "upscurrent", "aggregations": {"mean": {}}}]
+    assert _has_netdata_series_entry(graph_data) is True
+
+
+def test_has_netdata_series_entry_true_when_one_series_among_garbage() -> None:
+    graph_data = [
+        "garbage",
+        42,
+        {"identifier": "ups1", "aggregations": {"mean": {}}, "data": []},
+    ]
+    assert _has_netdata_series_entry(graph_data) is True
+
+
+@pytest.mark.parametrize(
+    "graph_data",
+    [
+        pytest.param([], id="empty-list"),
+        pytest.param(["not-a-dict", 3, None], id="no-dict-entries"),
+        pytest.param([{"aggregations": {"mean": {"a": 30.0}}}], id="dict-without-id"),
+        pytest.param(
+            [{"identifier": None, "name": ""}, {"identifier": "", "name": None}],
+            id="falsy-id-and-name",
+        ),
+        pytest.param("not-a-list", id="not-a-list"),
+    ],
+)
+def test_has_netdata_series_entry_false_for_unrecognizable_payloads(
+    graph_data: object,
+) -> None:
+    assert _has_netdata_series_entry(graph_data) is False
 
 
 # ---------------------------

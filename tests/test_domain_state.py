@@ -2071,6 +2071,235 @@ async def test_get_ups_treats_unusable_graph_as_failure_not_recovery() -> None:
     assert state.ups_stale_graphs == frozenset()
 
 
+async def test_get_ups_logs_debug_when_graph_structurally_empty(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """A recognized-but-structurally-empty UPS netdata graph response (the
+    shape reported in kayl-codes/homeassistant-truenas#142: a listed entry
+    carrying both "name" and "identifier", with empty "data"/"aggregations")
+    must not warn -- some UPS/NUT drivers simply never report a given
+    metric for a particular device, and TrueNAS's own reporting UI shows no
+    value for it either. Only a DEBUG trace is logged, and no failing flag
+    is set for that graph.
+    """
+    graph_data = [
+        {
+            "name": "upscurrent",
+            "identifier": "upscurrent",
+            "data": [],
+            "aggregations": {"min": {}, "mean": {}, "max": {}},
+        }
+    ]
+
+    async with FakeTrueNASServer(
+        valid_api_key=API_KEY,
+        responses={
+            "reporting.netdata_graphs": [{"name": "upscurrent"}],
+            "reporting.netdata_graph": graph_data,
+        },
+    ) as server:
+        async with make_client(server) as client:
+            await client.connect()
+            state = TrueNASState(client)
+            with caplog.at_level(logging.DEBUG, logger="aiotruenas.domain.state"):
+                result = await state.get_ups()
+
+    assert result == {}
+    assert "ups_graph:upscurrent" not in state._fallback_failing
+    # A field that never had a prior successful reading is not stale --
+    # it's simply absent, same as an outright failure with no prior value.
+    assert state.ups_stale_graphs == frozenset()
+
+    state_records = [r for r in caplog.records if r.name == "aiotruenas.domain.state"]
+    assert not [r for r in state_records if r.levelno == logging.WARNING]
+    debug_traces = [
+        r
+        for r in state_records
+        if r.levelno == logging.DEBUG and "no usable reading" in r.getMessage().lower()
+    ]
+    assert len(debug_traces) == 1
+
+
+async def test_get_ups_clears_flag_after_failure_then_structurally_empty_reading() -> (
+    None
+):
+    """A prior *real* netdata-graph-query failure (RPC error) must not stay
+    stuck ``True`` once a later poll gets a recognized-but-empty reading --
+    otherwise a second genuine failure after that would go unwarned forever,
+    mirroring the analogous disk-temp regression test.
+    """
+
+    def always_failing_graph(params: list) -> Any:
+        return {
+            "error": {
+                "code": -32603,
+                "message": "Internal error",
+                "data": {"error": 1, "errname": "EFAULT", "reason": None},
+            }
+        }
+
+    empty_graph_data = [
+        {
+            "name": "upscurrent",
+            "identifier": "upscurrent",
+            "data": [],
+            "aggregations": {"min": {}, "mean": {}, "max": {}},
+        }
+    ]
+
+    async with FakeTrueNASServer(
+        valid_api_key=API_KEY,
+        responses={
+            "reporting.netdata_graphs": [{"name": "upscurrent"}],
+            "reporting.netdata_graph": always_failing_graph,
+        },
+    ) as server:
+        async with make_client(server) as client:
+            await client.connect()
+            state = TrueNASState(client)
+            await state.get_ups()
+            assert state._fallback_failing.get("ups_graph:upscurrent") is True
+
+            server.responses["reporting.netdata_graph"] = empty_graph_data
+            await state.get_ups()
+
+    assert "ups_graph:upscurrent" not in state._fallback_failing
+
+
+async def test_get_ups_empty_top_level_list_logs_debug_not_warning(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """An empty top-level list from ``reporting.netdata_graph`` is the same
+    "no samples this window" shape as a recognized-but-empty entry (see
+    kayl-codes/homeassistant-truenas#142) -- DEBUG only, no failing flag."""
+
+    async with FakeTrueNASServer(
+        valid_api_key=API_KEY,
+        responses={
+            "reporting.netdata_graphs": [{"name": "upscurrent"}],
+            "reporting.netdata_graph": [],
+        },
+    ) as server:
+        async with make_client(server) as client:
+            await client.connect()
+            state = TrueNASState(client)
+            with caplog.at_level(logging.DEBUG, logger="aiotruenas.domain.state"):
+                result = await state.get_ups()
+
+    assert result == {}
+    assert "ups_graph:upscurrent" not in state._fallback_failing
+    state_records = [r for r in caplog.records if r.name == "aiotruenas.domain.state"]
+    assert not [r for r in state_records if r.levelno == logging.WARNING]
+
+
+async def test_get_ups_non_list_graph_response_still_warns(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """A non-list (but non-raising) ``reporting.netdata_graph`` response is a
+    genuinely malformed payload, not an empty sampling window -- it must
+    still follow the real-failure path (WARNING once, failing flag set),
+    unchanged by the #142 empty-window handling."""
+
+    async with FakeTrueNASServer(
+        valid_api_key=API_KEY,
+        responses={
+            "reporting.netdata_graphs": [{"name": "upscurrent"}],
+            "reporting.netdata_graph": None,
+        },
+    ) as server:
+        async with make_client(server) as client:
+            await client.connect()
+            state = TrueNASState(client)
+            with caplog.at_level(logging.DEBUG, logger="aiotruenas.domain.state"):
+                await state.get_ups()
+
+    assert state._fallback_failing.get("ups_graph:upscurrent") is True
+    state_records = [r for r in caplog.records if r.name == "aiotruenas.domain.state"]
+    warnings = [r for r in state_records if r.levelno == logging.WARNING]
+    assert len(warnings) == 1
+    assert "upscurrent" in warnings[0].getMessage()
+
+
+async def test_get_ups_garbage_first_entry_treated_as_malformed(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """``_ups_value()`` only ever inspects ``graph_data[0]``; the
+    recognizability check must be scoped the same way. A response whose
+    first entry is unparseable is malformed *as far as value extraction is
+    concerned*, even if a later entry happens to look well-formed -- it must
+    warn, not be silently downgraded to DEBUG with the failing flag cleared.
+    """
+
+    def garbage_first(params: list) -> Any:
+        return ["garbage", {"name": "upscurrent", "identifier": "upscurrent"}]
+
+    async with FakeTrueNASServer(
+        valid_api_key=API_KEY,
+        responses={
+            "reporting.netdata_graphs": [{"name": "upscurrent"}],
+            "reporting.netdata_graph": garbage_first,
+        },
+    ) as server:
+        async with make_client(server) as client:
+            await client.connect()
+            state = TrueNASState(client)
+            with caplog.at_level(logging.DEBUG, logger="aiotruenas.domain.state"):
+                await state.get_ups()
+
+    assert state._fallback_failing.get("ups_graph:upscurrent") is True
+    state_records = [r for r in caplog.records if r.name == "aiotruenas.domain.state"]
+    warnings = [r for r in state_records if r.levelno == logging.WARNING]
+    assert len(warnings) == 1
+    assert "Malformed" in warnings[0].getMessage()
+
+
+async def test_get_ups_keeps_previous_value_when_graph_turns_structurally_empty(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """A UPS graph with a real prior reading that later starts returning a
+    recognized-but-structurally-empty response (kayl-codes/homeassistant-
+    truenas#142) must keep its previous value, surface it via
+    ``ups_stale_graphs``, and *not* warn or set a failing flag -- the
+    "previously worked, now silent" transition the #142 fix centers on.
+    """
+
+    def working_graph(params: list) -> Any:
+        return [{"aggregations": {"mean": {"ups1": 1.4}}}]
+
+    empty_graph = [
+        {
+            "name": "upscurrent",
+            "identifier": "upscurrent",
+            "data": [],
+            "aggregations": {"min": {}, "mean": {}, "max": {}},
+        }
+    ]
+
+    async with FakeTrueNASServer(
+        valid_api_key=API_KEY,
+        responses={
+            "reporting.netdata_graphs": [{"name": "upscurrent"}],
+            "reporting.netdata_graph": working_graph,
+        },
+    ) as server:
+        async with make_client(server) as client:
+            await client.connect()
+            state = TrueNASState(client)
+            first = await state.get_ups()
+            assert first == {"current": 1.4}
+
+            server.responses["reporting.netdata_graph"] = empty_graph
+            with caplog.at_level(logging.DEBUG, logger="aiotruenas.domain.state"):
+                second = await state.get_ups()
+            second_stale = state.ups_stale_graphs
+
+    assert second == {"current": 1.4}
+    assert second_stale == frozenset({"upscurrent"})
+    assert "ups_graph:upscurrent" not in state._fallback_failing
+    state_records = [r for r in caplog.records if r.name == "aiotruenas.domain.state"]
+    assert not [r for r in state_records if r.levelno == logging.WARNING]
+
+
 async def test_get_ups_keeps_previous_graph_reading_when_it_later_fails() -> None:
     """A UPS graph that succeeded on a prior poll but fails outright, or
     returns an unusable reading, on a later one must keep its previous
@@ -2215,11 +2444,14 @@ async def test_get_ups_drops_reading_when_graph_no_longer_discovered() -> None:
     assert second_stale == frozenset()
 
 
-async def test_get_ups_logs_warning_when_graph_returns_no_usable_reading(
+async def test_get_ups_logs_warning_when_graph_response_malformed(
     caplog: pytest.LogCaptureFixture,
 ) -> None:
-    """A successful but unusable per-graph response must surface a warning
-    and clear it again once that graph starts returning a usable reading.
+    """A successful but malformed per-graph response (a non-empty list whose
+    entry carries no recognizable "identifier"/"name" -- distinct from the
+    recognized-but-empty #142 shape, which only logs DEBUG) must surface a
+    warning and clear it again once that graph starts returning a usable
+    reading.
     """
 
     def unusable_netdata_graph(params: list) -> Any:

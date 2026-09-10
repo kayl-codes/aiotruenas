@@ -296,6 +296,29 @@ def _has_disk_temp_entries(graph_data: Any) -> bool:
     )
 
 
+def _has_netdata_series_entry(graph_data: Any) -> bool:
+    """Return True if a netdata graph response has >=1 recognizable series entry.
+
+    Mirrors ``_has_disk_temp_entries()`` for graphs (e.g. the UPS graphs
+    queried by ``_apply_ups_graph_result()``) whose per-series entries carry
+    a truthy "identifier" and/or "name" instead of only "identifier" --
+    TrueNAS's UPS netdata responses carry both, e.g. ``{"name": "upscurrent",
+    "identifier": "upscurrent", ...}``. Lets the caller tell a genuinely
+    empty sampling window (entry present, no samples accumulated yet --
+    kayl-codes/homeassistant-truenas#142, analogous to #139 for disk temps)
+    apart from a malformed response (a non-empty list with no recognizable
+    entry at all). An empty top-level list is *not* malformed -- netdata
+    legitimately returns it for that same no-samples-yet case -- so callers
+    gate this on ``graph_data`` being non-empty first.
+    """
+    if not isinstance(graph_data, list):
+        return False
+    return any(
+        isinstance(entry, dict) and (entry.get("identifier") or entry.get("name"))
+        for entry in graph_data
+    )
+
+
 def _netdata_named_means(graph_data: Any, names: tuple[str, ...]) -> dict[str, float]:
     """Extract named per-series mean values from a netdata graph response.
 
