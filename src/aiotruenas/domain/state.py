@@ -527,13 +527,16 @@ class TrueNASState:
         """``ds`` endpoint names whose most recent refresh used a cached value
         for at least one primary or field-level result instead of a fresh one.
 
-        One-way guarantee: if ``e`` is in the result, the last refresh that
-        writes ``ds[e]`` could not freshly fetch at least one primary or
+        One-way guarantee: if ``e`` is in the result, the most recent refresh
+        attempt for ``e`` could not freshly fetch at least one primary or
         field-level result for ``e`` and carried the corresponding prior
         value over -- not necessarily the whole ``ds[e]`` snapshot left
         unchanged: ``get_directoryservices()`` and ``get_ups()`` still
         refresh every other field from the fresh response and only carry
-        over the one piece that failed. The converse does not
+        over the one piece that failed when the failure is field-level: a
+        whole-endpoint failure such as ``get_ups()``'s graph-discovery call
+        erroring out leaves ``ds[e]`` untouched -- unwritten, not merely
+        unchanged -- for that refresh attempt. The converse does not
         hold in full -- a primary ``get_*`` that fails by *raising* is not
         reflected here (the caller's own error handling already sees it), and
         so are the pre-existing silent-fallback paths that this property does
