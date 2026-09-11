@@ -5502,6 +5502,37 @@ async def test_stale_endpoints_reports_system_info_on_malformed_response() -> No
             assert "system_info" not in state.stale_endpoints
 
 
+async def test_stale_endpoints_ignores_detect_version_malformed_system_info() -> None:
+    """A malformed ``system.info`` response reached via ``_detect_version()``
+    (through ``get_container()``, before ``get_systeminfo()`` has ever run)
+    must not flag ``"system_info"`` in ``stale_endpoints`` -- that method
+    never refreshes ``ds["system_info"]``, so its own RPC failure says
+    nothing about whether that endpoint's data is stale. Regression test for
+    a Sourcery finding on PR #44: ``_detect_version()`` previously reused
+    ``get_systeminfo()``'s own fallback key for its malformed-response check,
+    so this exact sequence falsely marked ``"system_info"`` stale.
+    """
+    import aiotruenas.domain.state as state_module
+
+    async with FakeTrueNASServer(
+        valid_api_key=API_KEY,
+        responses={
+            "system.info": None,
+            "virt.instance.query": [],
+            "container.query": [],
+        },
+    ) as server:
+        async with make_client(server) as client:
+            await client.connect()
+            state = TrueNASState(client)
+            await state.get_container()
+
+    assert state._fallback_failing.get(state_module._KEY_DETECT_VERSION) is True
+    assert state_module._KEY_SYSTEM_INFO not in state._fallback_failing
+    assert "system_info" not in state.stale_endpoints
+    assert state.stale_endpoints == frozenset()
+
+
 def test_stale_endpoints_fallback_keys_are_classified_exactly_once() -> None:
     """Every ``_KEY_*`` / key-prefix constant must be classified exactly once
     as either an endpoint key or a deliberate non-endpoint (enrichment /

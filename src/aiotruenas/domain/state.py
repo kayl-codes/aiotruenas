@@ -1182,30 +1182,37 @@ class TrueNASState:
         The version cannot change without a full appliance reboot, which
         drops the underlying WebSocket connection, so a single successful
         detection is reused for the lifetime of this ``TrueNASState``. A
-        malformed (non-dict) ``system.info`` response warns once on the
-        failing transition, under its own key shared with
-        ``get_systeminfo()``'s identical guard so the two call sites log the
-        same message for the same condition.
-        A valid response with a missing/unparsable ``version`` field is not
-        cached and is retried on the next call, warning once via a second,
-        version-specific key also shared with ``get_systeminfo()``'s own
-        parse of the same field, rather than silently defaulting
-        ``get_container()`` to legacy behavior.
+        malformed (non-dict) ``system.info`` response and a valid response
+        with a missing/unparsable ``version`` field both warn once (via
+        ``_KEY_DETECT_VERSION``) and are retried on the next call, rather
+        than silently defaulting ``get_container()`` to legacy behavior.
+
+        Deliberately does **not** touch ``_KEY_SYSTEM_INFO`` -- the key
+        ``get_systeminfo()`` uses for its own primary-refresh tracking, which
+        ``stale_endpoints`` maps to the ``"system_info"`` endpoint. This
+        method can run (via ``get_container()``) before ``get_systeminfo()``
+        has ever refreshed ``ds["system_info"]``, or long after it last did,
+        so its own success/failure here says nothing about whether that
+        endpoint's last refresh was fresh or fell back to cache; sharing the
+        key would let this method's own RPC call flag (or silently clear)
+        ``"system_info"`` in ``stale_endpoints`` for a refresh it never
+        performed. Mirrors ``_detect_virtual()``/``_apply_virtual_detection()``,
+        which likewise only ever touch their own ``_KEY_DETECT_VIRTUAL``.
         """
         if self._version is not None:
             return self._version
         raw = await self._client.call(_SYSTEM_INFO_METHOD)
         if not isinstance(raw, dict):
             self._note_fallback_outcome(
-                _KEY_SYSTEM_INFO,
+                _KEY_DETECT_VERSION,
                 failed=True,
-                warning=_SYSTEM_INFO_MALFORMED_WARNING,
+                warning=(
+                    "Malformed 'system.info' response while detecting "
+                    "TrueNAS version: %s"
+                ),
                 reason=raw,
             )
             return (0, 0)
-        self._note_fallback_outcome(
-            _KEY_SYSTEM_INFO, failed=False, recovered=_SYSTEM_INFO_RECOVERED
-        )
         version = _parse_version_tuple(raw.get("version"))
         if version != (0, 0):
             self._version = version
@@ -2062,9 +2069,10 @@ class TrueNASState:
         ``system.info`` call once this has already run. A malformed
         (non-dict) ``system.info`` response warns on its failing transition
         regardless of whether a version is already cached -- not just before
-        the first successful poll -- under a key/message shared with
-        ``_detect_version()``'s identical guard, since a ``system.info`` call
-        going from valid to malformed mid-lifetime would otherwise leave
+        the first successful poll -- under its own key (``_KEY_SYSTEM_INFO``,
+        deliberately *not* shared with ``_detect_version()``'s identical
+        guard -- see that method's docstring for why), since a ``system.info``
+        call going from valid to malformed mid-lifetime would otherwise leave
         every other endpoint (uptime, memory, hostname, ...) silently frozen
         on stale data with no signal. A
         missing/unparsable ``version`` field within an otherwise-valid
