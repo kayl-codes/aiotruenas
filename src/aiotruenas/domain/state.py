@@ -524,12 +524,16 @@ class TrueNASState:
 
     @property
     def stale_endpoints(self) -> frozenset[str]:
-        """``ds`` endpoint names whose most recent refresh could not fetch the
-        endpoint's *primary* RPC result and kept the previous cached snapshot.
+        """``ds`` endpoint names whose most recent refresh used a cached value
+        for at least one primary or field-level result instead of a fresh one.
 
         One-way guarantee: if ``e`` is in the result, the last refresh that
-        writes ``ds[e]`` could not freshly fetch the primary RPC result for
-        ``e`` and left the prior ``ds[e]`` in place. The converse does not
+        writes ``ds[e]`` could not freshly fetch at least one primary or
+        field-level result for ``e`` and carried the corresponding prior
+        value over -- not necessarily the whole ``ds[e]`` snapshot left
+        unchanged: ``get_directoryservices()`` and ``get_ups()`` still
+        refresh every other field from the fresh response and only carry
+        over the one piece that failed. The converse does not
         hold in full -- a primary ``get_*`` that fails by *raising* is not
         reflected here (the caller's own error handling already sees it), and
         so are the pre-existing silent-fallback paths that this property does
