@@ -5169,3 +5169,419 @@ async def test_systemstats_stale_graphs_reports_interface_with_no_matching_id() 
     assert "interface" in state.systemstats_stale_graphs
     assert "cpu" not in state.systemstats_stale_graphs
     assert state.ds["interface"]["eno1"]["rx"] == 0
+
+
+# --- stale_endpoints (endpoint-granular staleness API) -----------------------
+
+_RPC_ERROR = {
+    "error": {
+        "code": -32603,
+        "message": "Internal error",
+        "data": {"error": 1, "errname": "EFAULT", "reason": None},
+    }
+}
+
+
+async def test_stale_endpoints_empty_before_any_refresh() -> None:
+    async with FakeTrueNASServer(valid_api_key=API_KEY) as server:
+        async with make_client(server) as client:
+            await client.connect()
+            state = TrueNASState(client)
+
+    assert state.stale_endpoints == frozenset()
+
+
+async def test_stale_endpoints_reports_smb_then_clears_on_recovery() -> None:
+    async with FakeTrueNASServer(
+        valid_api_key=API_KEY,
+        responses={"smb.status": [{}, {}]},
+    ) as server:
+        async with make_client(server) as client:
+            await client.connect()
+            state = TrueNASState(client)
+            await state.get_smb()
+            assert state.stale_endpoints == frozenset()
+
+            server.responses["smb.status"] = None
+            await state.get_smb()
+            assert "smb" in state.stale_endpoints
+
+            server.responses["smb.status"] = [{}, {}]
+            await state.get_smb()
+            assert "smb" not in state.stale_endpoints
+
+
+async def test_stale_endpoints_reports_pool_then_clears_on_recovery() -> None:
+    async with FakeTrueNASServer(
+        valid_api_key=API_KEY,
+        responses={
+            "pool.dataset.query": [_ROOT_DATASET],
+            "pool.query": [_POOL_TANK],
+            "boot.get_state": _BOOT_POOL,
+        },
+    ) as server:
+        async with make_client(server) as client:
+            await client.connect()
+            state = TrueNASState(client)
+            await state.get_pool()
+            assert "pool" not in state.stale_endpoints
+
+            server.responses["pool.query"] = None
+            await state.get_pool()
+            assert "pool" in state.stale_endpoints
+
+            server.responses["pool.query"] = [_POOL_TANK]
+            await state.get_pool()
+            assert "pool" not in state.stale_endpoints
+
+
+async def test_stale_endpoints_reports_directoryservices_then_recovers() -> None:
+    config = {"id": 1, "service_type": "LDAP", "enable": True}
+    async with FakeTrueNASServer(
+        valid_api_key=API_KEY,
+        responses={
+            "directoryservices.config": config,
+            "directoryservices.status": {"status": "HEALTHY"},
+        },
+    ) as server:
+        async with make_client(server) as client:
+            await client.connect()
+            state = TrueNASState(client)
+            await state.get_directoryservices()
+            assert "directoryservices" not in state.stale_endpoints
+
+            server.responses["directoryservices.config"] = None
+            await state.get_directoryservices()
+            assert "directoryservices" in state.stale_endpoints
+
+            server.responses["directoryservices.config"] = config
+            await state.get_directoryservices()
+            assert "directoryservices" not in state.stale_endpoints
+
+
+async def test_stale_endpoints_reports_alerts_then_recovers() -> None:
+    alert = {"uuid": "a1", "level": "CRITICAL", "formatted": "boom"}
+    async with FakeTrueNASServer(
+        valid_api_key=API_KEY,
+        responses={"alert.list": [alert]},
+    ) as server:
+        async with make_client(server) as client:
+            await client.connect()
+            state = TrueNASState(client)
+            await state.get_alerts()
+            assert "alerts" not in state.stale_endpoints
+
+            server.responses["alert.list"] = None
+            await state.get_alerts()
+            assert "alerts" in state.stale_endpoints
+
+            server.responses["alert.list"] = [alert]
+            await state.get_alerts()
+            assert "alerts" not in state.stale_endpoints
+
+
+async def test_stale_endpoints_reports_ups_on_discovery_failure_then_recovers() -> None:
+    async with FakeTrueNASServer(
+        valid_api_key=API_KEY,
+        responses={
+            "reporting.netdata_graphs": [{"name": "upscharge"}],
+            "reporting.netdata_graph": lambda params: [
+                {"aggregations": {"mean": {"ups1": 55.0}}}
+            ],
+        },
+    ) as server:
+        async with make_client(server) as client:
+            await client.connect()
+            state = TrueNASState(client)
+            await state.get_ups()
+            assert "ups" not in state.stale_endpoints
+
+            server.responses["reporting.netdata_graphs"] = _RPC_ERROR
+            await state.get_ups()
+            assert "ups" in state.stale_endpoints
+
+            server.responses["reporting.netdata_graphs"] = [{"name": "upscharge"}]
+            await state.get_ups()
+            assert "ups" not in state.stale_endpoints
+
+
+async def test_stale_endpoints_reports_ups_via_per_graph_stale_reading() -> None:
+    """A discovered UPS graph that stops returning a usable reading keeps its
+    previous field value -- ``stale_endpoints`` must flag ``"ups"`` off the
+    self-clearing ``ups_stale_graphs`` set, not only off a failed discovery
+    call.
+    """
+
+    def usable(params: list) -> Any:
+        return [{"aggregations": {"mean": {"ups1": 55.0}}}]
+
+    async with FakeTrueNASServer(
+        valid_api_key=API_KEY,
+        responses={
+            "reporting.netdata_graphs": [{"name": "upscharge"}],
+            "reporting.netdata_graph": usable,
+        },
+    ) as server:
+        async with make_client(server) as client:
+            await client.connect()
+            state = TrueNASState(client)
+            await state.get_ups()
+            assert "ups" not in state.stale_endpoints
+
+            server.responses["reporting.netdata_graph"] = _RPC_ERROR
+            await state.get_ups()
+            assert state.ups_stale_graphs == frozenset({"upscharge"})
+            assert "ups" in state.stale_endpoints
+
+            server.responses["reporting.netdata_graph"] = usable
+            await state.get_ups()
+            assert "ups" not in state.stale_endpoints
+
+
+async def test_stale_endpoints_ignores_permanently_failing_ups_graph() -> None:
+    """A UPS graph that is discovered but whose ``reporting.netdata_graph``
+    query fails on every poll from the very first one -- so it never produces
+    a value and stays absent from ``ups_stale_graphs`` -- must NOT pin
+    ``"ups"`` into ``stale_endpoints`` forever. The stuck ``ups_graph:<name>``
+    fallback key is deliberately a non-endpoint key (a NUT driver that never
+    reports "upscurrent" would otherwise make the whole UPS endpoint
+    permanently unavailable).
+    """
+    import aiotruenas.domain.state as state_module
+
+    async with FakeTrueNASServer(
+        valid_api_key=API_KEY,
+        responses={
+            "reporting.netdata_graphs": [{"name": "upscharge"}],
+            "reporting.netdata_graph": _RPC_ERROR,
+        },
+    ) as server:
+        async with make_client(server) as client:
+            await client.connect()
+            state = TrueNASState(client)
+            await state.get_ups()
+            await state.get_ups()
+
+    graph_key = f"{state_module._UPS_GRAPH_KEY_PREFIX}upscharge"
+    assert state._fallback_failing.get(graph_key) is True
+    assert state.ups_stale_graphs == frozenset()
+    assert "ups" not in state.stale_endpoints
+    assert state.stale_endpoints == frozenset()
+
+
+async def test_stale_endpoints_ignores_disk_temperature_fallback_failure() -> None:
+    """A failed disk-temperature enrichment must NOT flag ``"disk"``:
+    ``disk.query`` (the primary result) is fresh, and a disk with no temp
+    sensor would otherwise pin the whole endpoint stale forever.
+    """
+    import aiotruenas.domain.state as state_module
+
+    async with FakeTrueNASServer(
+        valid_api_key=API_KEY,
+        responses={
+            "disk.query": [_DISK_SDA],
+            "reporting.netdata_graphs": [],
+            "disk.temperatures": _RPC_ERROR,
+        },
+    ) as server:
+        async with make_client(server) as client:
+            await client.connect()
+            state = TrueNASState(client)
+            await state.get_disk()
+
+    # The enrichment path did fail...
+    assert state._fallback_failing.get(state_module._KEY_DISK_TEMP_FALLBACK) is True
+    # ...but the endpoint is not reported stale.
+    assert "disk" not in state.stale_endpoints
+    assert state.stale_endpoints == frozenset()
+
+
+async def test_stale_endpoints_ignores_systemstats_graph_failure() -> None:
+    """Failed systemstats netdata graphs surface only in
+    ``systemstats_stale_graphs`` -- they enrich an already-fresh
+    ``ds["system_info"]`` and must not flag the endpoint.
+    """
+    async with FakeTrueNASServer(
+        valid_api_key=API_KEY,
+        responses={
+            "system.info": {"system_manufacturer": "Supermicro"},
+            "reporting.netdata_graph": _RPC_ERROR,
+        },
+    ) as server:
+        async with make_client(server) as client:
+            await client.connect()
+            state = TrueNASState(client)
+            await state.get_systeminfo()
+            await state.get_systemstats()
+
+    assert state.systemstats_stale_graphs  # the fine-grained signal fired
+    assert "system_info" not in state.stale_endpoints
+    assert state.stale_endpoints == frozenset()
+
+
+async def test_stale_endpoints_ignores_interface_throughput_failure() -> None:
+    """A failed interface-throughput enrichment surfaces only in
+    ``systemstats_stale_graphs`` (named ``"interface"``), never as a
+    ``stale_endpoints`` entry -- ``interface.query`` is the primary result.
+    """
+    raw_interfaces = [
+        {"id": "eno1", "name": "eno1", "state": {"link_state": "LINK_STATE_UP"}}
+    ]
+
+    def netdata_graph(params: list) -> Any:
+        if params[0] == "interface":
+            return _RPC_ERROR
+        return [{"legend": ["cpu"], "aggregations": {"mean": {"cpu": 20.0}}}]
+
+    async with FakeTrueNASServer(
+        valid_api_key=API_KEY,
+        responses={
+            "system.info": {"system_manufacturer": "Supermicro"},
+            "interface.query": raw_interfaces,
+            "reporting.netdata_graph": netdata_graph,
+        },
+    ) as server:
+        async with make_client(server) as client:
+            await client.connect()
+            state = TrueNASState(client)
+            await state.get_interface()
+            await state.get_systemstats()
+
+    assert "interface" in state.systemstats_stale_graphs
+    assert "interface" not in state.stale_endpoints
+
+
+async def test_stale_endpoints_ignores_version_and_virtual_detection_failure() -> None:
+    """A ``system.info`` response that is a valid dict but lacks a parseable
+    version and manufacturer/product still freshly populates the core
+    ``ds["system_info"]`` fields -- the failed capability detection must not
+    flag the endpoint (a dmidecode-less container would never recover).
+    """
+    import aiotruenas.domain.state as state_module
+
+    async with FakeTrueNASServer(
+        valid_api_key=API_KEY,
+        responses={
+            "system.info": {"version": "not-a-version", "hostname": "nas", "physmem": 8}
+        },
+    ) as server:
+        async with make_client(server) as client:
+            await client.connect()
+            state = TrueNASState(client)
+            await state.get_systeminfo()
+
+    assert state._fallback_failing.get(state_module._KEY_DETECT_VERSION) is True
+    assert state._fallback_failing.get(state_module._KEY_DETECT_VIRTUAL) is True
+    assert state.ds["system_info"]["hostname"] == "nas"
+    assert state.stale_endpoints == frozenset()
+
+
+async def test_stale_endpoints_reports_system_info_on_malformed_response() -> None:
+    good_info = {
+        "version": "TrueNAS-25.04.0",
+        "physmem": 8,
+        "system_manufacturer": "Supermicro",
+        "system_product": "X11SPi-TF",
+    }
+    async with FakeTrueNASServer(
+        valid_api_key=API_KEY,
+        responses={"system.info": good_info},
+    ) as server:
+        async with make_client(server) as client:
+            await client.connect()
+            state = TrueNASState(client)
+            await state.get_systeminfo()
+            assert "system_info" not in state.stale_endpoints
+
+            server.responses["system.info"] = None
+            await state.get_systeminfo()
+            assert "system_info" in state.stale_endpoints
+
+            server.responses["system.info"] = good_info
+            await state.get_systeminfo()
+            assert "system_info" not in state.stale_endpoints
+
+
+async def test_stale_endpoints_ignores_detect_version_malformed_system_info() -> None:
+    """A malformed ``system.info`` response reached via ``_detect_version()``
+    (through ``get_container()``, before ``get_systeminfo()`` has ever run)
+    must not flag ``"system_info"`` in ``stale_endpoints`` -- that method
+    never refreshes ``ds["system_info"]``, so its own RPC failure says
+    nothing about whether that endpoint's data is stale. Regression test for
+    a Sourcery finding on PR #44: ``_detect_version()`` previously reused
+    ``get_systeminfo()``'s own fallback key for its malformed-response check,
+    so this exact sequence falsely marked ``"system_info"`` stale.
+    """
+    import aiotruenas.domain.state as state_module
+
+    async with FakeTrueNASServer(
+        valid_api_key=API_KEY,
+        responses={
+            "system.info": None,
+            "virt.instance.query": [],
+            "container.query": [],
+        },
+    ) as server:
+        async with make_client(server) as client:
+            await client.connect()
+            state = TrueNASState(client)
+            await state.get_container()
+
+    assert state._fallback_failing.get(state_module._KEY_DETECT_VERSION) is True
+    assert state_module._KEY_SYSTEM_INFO not in state._fallback_failing
+    assert "system_info" not in state.stale_endpoints
+    assert state.stale_endpoints == frozenset()
+
+
+def test_stale_endpoints_fallback_keys_are_classified_exactly_once() -> None:
+    """Every ``_KEY_*`` / key-prefix constant must be classified exactly once
+    as either an endpoint key or a deliberate non-endpoint (enrichment /
+    capability-detection) key -- so a renamed or newly added key can't
+    silently fall through ``stale_endpoints`` unnoticed.
+    """
+    import aiotruenas.domain.state as m
+
+    key_constants = {
+        value
+        for name, value in vars(m).items()
+        if name.startswith("_KEY_") and isinstance(value, str)
+    }
+    # Runtime-built keys are matched by prefix; introspect every
+    # ``*_KEY_PREFIX`` module constant so a newly added one is covered here
+    # without editing this test.
+    prefix_constants = {
+        value
+        for name, value in vars(m).items()
+        if name.endswith("_KEY_PREFIX") and isinstance(value, str)
+    }
+
+    endpoint_keys = set(m._FALLBACK_KEY_ENDPOINTS)
+    non_endpoint_keys = set(m._NON_ENDPOINT_FALLBACK_KEYS)
+    assert endpoint_keys.isdisjoint(non_endpoint_keys)
+    assert endpoint_keys | non_endpoint_keys == key_constants
+
+    # Every runtime-built key prefix is currently a deliberate non-endpoint
+    # one -- ``stale_endpoints`` never resolves an endpoint by prefix.
+    assert m._NON_ENDPOINT_FALLBACK_KEY_PREFIXES == prefix_constants
+
+    # The resolver returns the mapped endpoint for endpoint keys and None for
+    # the deliberate non-endpoint ones (and for an unknown key).
+    for key, endpoint in m._FALLBACK_KEY_ENDPOINTS.items():
+        assert TrueNASState._fallback_endpoint(key) == endpoint
+    for key in m._NON_ENDPOINT_FALLBACK_KEYS:
+        assert TrueNASState._fallback_endpoint(key) is None
+    for prefix in m._NON_ENDPOINT_FALLBACK_KEY_PREFIXES:
+        assert TrueNASState._fallback_endpoint(f"{prefix}example") is None
+    assert TrueNASState._fallback_endpoint("no_such_key") is None
+
+
+async def test_stale_endpoints_mapping_values_are_real_ds_keys() -> None:
+    import aiotruenas.domain.state as state_module
+
+    async with FakeTrueNASServer(valid_api_key=API_KEY) as server:
+        async with make_client(server) as client:
+            await client.connect()
+            state = TrueNASState(client)
+
+    mapped = set(state_module._FALLBACK_KEY_ENDPOINTS.values())
+    assert mapped <= set(state.ds)

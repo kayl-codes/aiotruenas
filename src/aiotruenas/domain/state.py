@@ -226,6 +226,66 @@ _SYSTEM_INFO_RECOVERED = "'system.info' response recovered"
 # extracted so the prefix can't drift between where it's built and where
 # it's matched.
 _UPS_GRAPH_KEY_PREFIX = "ups_graph:"
+# Prefix for get_systemstats()'s dynamic per-graph fallback keys (e.g.
+# "systemstat:cpu") -- like _UPS_GRAPH_KEY_PREFIX, a runtime-built key, but
+# extracted so the prefix can't drift between where it is built
+# (_refresh_systemstat_graphs()) and _NON_ENDPOINT_FALLBACK_KEY_PREFIXES,
+# where it is listed as an intentional non-endpoint key for stale_endpoints.
+_SYSTEMSTAT_KEY_PREFIX = "systemstat:"
+
+# Maps a _note_fallback_outcome() key that guards an endpoint's *primary*
+# RPC result to that endpoint's public ``ds`` name, so ``stale_endpoints``
+# can report -- per endpoint -- when the last refresh served the previous
+# cached snapshot instead of a fresh reading.
+#
+# Only *primary-result* keys belong here. A key guarding best-effort
+# enrichment layered onto an otherwise-fresh primary result (disk
+# temperatures, interface throughput, the systemstats netdata graphs, a
+# single one of get_ups()'s several per-graph queries) or an internal
+# capability detection (TrueNAS version, virtualization) is listed in
+# _NON_ENDPOINT_FALLBACK_KEYS / _NON_ENDPOINT_FALLBACK_KEY_PREFIXES instead
+# and deliberately does *not* flag its endpoint: on hardware that never
+# reports the optional metric (a disk with no temp sensor, a NUT driver
+# that never yields "upscurrent", a dmidecode-less container) that path
+# fails on every poll forever, which would pin the whole endpoint -- and
+# every entity a consumer derives from it -- to a permanent stale state
+# even though the primary result is perfectly fresh. That staleness stays
+# visible through the finer ``systemstats_stale_graphs`` /
+# ``ups_stale_graphs`` (which are field-based -- they only fire when a
+# value that *did* exist went stale) only. A test asserts every _KEY_* /
+# prefix constant is classified exactly once, so a renamed or newly added
+# key can't silently fall through.
+#
+# get_ups()'s *discovery* call (_KEY_UPS_NETDATA_GRAPHS) is the exception:
+# it gates every UPS field at once, so a failed discovery is a genuine
+# primary-result failure for the endpoint and stays mapped here.
+_FALLBACK_KEY_ENDPOINTS: dict[str, str] = {
+    _KEY_POOL_QUERY: "pool",
+    _KEY_UPS_NETDATA_GRAPHS: "ups",
+    _KEY_DIRECTORYSERVICES_CONFIG: "directoryservices",
+    _KEY_DIRECTORYSERVICES_STATUS: "directoryservices",
+    _KEY_ALERT_LIST: "alerts",
+    _KEY_SMB_STATUS: "smb",
+    _KEY_SYSTEM_INFO: "system_info",
+}
+
+# _note_fallback_outcome() keys/prefixes that intentionally map to *no*
+# endpoint -- see _FALLBACK_KEY_ENDPOINTS above for the rationale. Kept as
+# explicit sets (rather than "anything not in the map") so the completeness
+# test can tell a deliberate omission from a forgotten one.
+_NON_ENDPOINT_FALLBACK_KEYS: frozenset[str] = frozenset(
+    {
+        _KEY_DISK_TEMPERATURE_UPDATE_UNEXPECTED,
+        _KEY_DISK_TEMP_NETDATA,
+        _KEY_DISK_TEMP_FALLBACK,
+        _KEY_INTERFACE_THROUGHPUT,
+        _KEY_DETECT_VIRTUAL,
+        _KEY_DETECT_VERSION,
+    }
+)
+_NON_ENDPOINT_FALLBACK_KEY_PREFIXES: frozenset[str] = frozenset(
+    {_SYSTEMSTAT_KEY_PREFIX, _UPS_GRAPH_KEY_PREFIX}
+)
 
 
 def _apply_cputemp_stat(raw: Any, info: dict[str, Any]) -> bool:
@@ -461,6 +521,89 @@ class TrueNASState:
         construction time and so are always present to begin with.
         """
         return self._ups_stale_graphs
+
+    @property
+    def stale_endpoints(self) -> frozenset[str]:
+        """``ds`` endpoint names whose most recent refresh used a cached value
+        for at least one primary or field-level result instead of a fresh one.
+
+        One-way guarantee: if ``e`` is in the result, the most recent refresh
+        attempt for ``e`` could not freshly fetch at least one primary or
+        field-level result for ``e`` and carried the corresponding prior
+        value over -- not necessarily the whole ``ds[e]`` snapshot left
+        unchanged: ``get_directoryservices()`` and ``get_ups()`` still
+        refresh every other field from the fresh response and only carry
+        over the one piece that failed when the failure is field-level: a
+        whole-endpoint failure such as ``get_ups()``'s graph-discovery call
+        erroring out leaves ``ds[e]`` untouched -- unwritten, not merely
+        unchanged -- for that refresh attempt. The converse does not
+        hold in full -- a primary ``get_*`` that fails by *raising* is not
+        reflected here (the caller's own error handling already sees it), and
+        so are the pre-existing silent-fallback paths that this property does
+        not yet map. The reachable names are a subset of ``ds``'s keys --
+        ``"pool"``, ``"ups"``, ``"directoryservices"``, ``"alerts"``,
+        ``"smb"``, ``"system_info"``.
+
+        Best-effort *enrichment* layered onto an otherwise-fresh primary
+        result does **not** count: disk temperatures (``"disk"`` stays out --
+        ``disk.query`` is the primary result and raises on a real failure),
+        interface throughput (``"interface"`` stays out likewise), the
+        systemstats netdata graphs (CPU/load/memory/ARC-size -- they enrich
+        an already-fresh ``ds["system_info"]``), and a single one of
+        ``get_ups()``'s per-graph queries failing while discovery still
+        succeeds. Nor does internal capability detection (TrueNAS version /
+        virtualization). Those stay observable only through
+        :attr:`systemstats_stale_graphs` / :attr:`ups_stale_graphs` -- the
+        finer, per-graph counterparts this sits above. Mapping them to an
+        endpoint here would pin that endpoint (and every entity a consumer
+        derives from it) to a permanent stale state on hardware that simply
+        never reports the optional metric.
+
+        ``"ups"`` is the one place the two layers meet: it is reported here
+        both when the graph *discovery* call fails (a genuine all-or-nothing
+        primary failure) and when :attr:`ups_stale_graphs` is non-empty. The
+        latter is safe to fold in because that set is field-based and
+        self-clearing -- it only lists graphs whose value *did* exist and
+        went stale, never a graph that has failed since the first poll.
+
+        Exists for a consumer (e.g. a Home Assistant coordinator applying the
+        ``entity-unavailable`` / ``log-when-unavailable`` quality-scale
+        rules): the ``get_*`` methods for these endpoints do **not** raise
+        when the primary RPC errors (``get_smb()`` / ``get_ups()``) or
+        returns a malformed payload -- they log once via
+        :meth:`_note_fallback_outcome` and return the previous snapshot -- so
+        this property is the only signal that the data went stale.
+        ``get_systeminfo()`` is narrower here than the other five: it only
+        treats a *non-dict* ``system.info`` response as malformed, so a
+        structurally-empty ``{}`` response is accepted as-is and will not be
+        reflected in ``stale_endpoints`` -- a known pre-existing gap, not
+        introduced by this property.
+
+        ``"arc"`` is deliberately absent: :meth:`get_arc` does not swallow a
+        failure into a cached value -- a ``TrueNASError`` propagates to the
+        caller, and a malformed-but-non-raising response writes ``None`` for
+        the affected field rather than serving a stale one.
+        """
+        stale: set[str] = {
+            endpoint
+            for key, failing in self._fallback_failing.items()
+            if failing and (endpoint := self._fallback_endpoint(key)) is not None
+        }
+        if self._ups_stale_graphs:
+            stale.add("ups")
+        return frozenset(stale)
+
+    @staticmethod
+    def _fallback_endpoint(key: str) -> str | None:
+        """Resolve a ``self._fallback_failing`` key to its ``ds`` endpoint name.
+
+        Returns ``None`` for a key that maps to no endpoint -- both an
+        unrecognized key and a deliberately non-endpoint one (enrichment /
+        capability detection, see ``_NON_ENDPOINT_FALLBACK_KEYS`` /
+        ``_NON_ENDPOINT_FALLBACK_KEY_PREFIXES``). A test asserts every known
+        ``_KEY_*`` / prefix constant is classified on purpose either way.
+        """
+        return _FALLBACK_KEY_ENDPOINTS.get(key)
 
     async def get_dataset(self) -> _EndpointMap:
         """Refresh and return normalized ZFS datasets (``pool.dataset.query``)."""
@@ -1046,30 +1189,37 @@ class TrueNASState:
         The version cannot change without a full appliance reboot, which
         drops the underlying WebSocket connection, so a single successful
         detection is reused for the lifetime of this ``TrueNASState``. A
-        malformed (non-dict) ``system.info`` response warns once on the
-        failing transition, under its own key shared with
-        ``get_systeminfo()``'s identical guard so the two call sites log the
-        same message for the same condition.
-        A valid response with a missing/unparsable ``version`` field is not
-        cached and is retried on the next call, warning once via a second,
-        version-specific key also shared with ``get_systeminfo()``'s own
-        parse of the same field, rather than silently defaulting
-        ``get_container()`` to legacy behavior.
+        malformed (non-dict) ``system.info`` response and a valid response
+        with a missing/unparsable ``version`` field both warn once (via
+        ``_KEY_DETECT_VERSION``) and are retried on the next call, rather
+        than silently defaulting ``get_container()`` to legacy behavior.
+
+        Deliberately does **not** touch ``_KEY_SYSTEM_INFO`` -- the key
+        ``get_systeminfo()`` uses for its own primary-refresh tracking, which
+        ``stale_endpoints`` maps to the ``"system_info"`` endpoint. This
+        method can run (via ``get_container()``) before ``get_systeminfo()``
+        has ever refreshed ``ds["system_info"]``, or long after it last did,
+        so its own success/failure here says nothing about whether that
+        endpoint's last refresh was fresh or fell back to cache; sharing the
+        key would let this method's own RPC call flag (or silently clear)
+        ``"system_info"`` in ``stale_endpoints`` for a refresh it never
+        performed. Mirrors ``_detect_virtual()``/``_apply_virtual_detection()``,
+        which likewise only ever touch their own ``_KEY_DETECT_VIRTUAL``.
         """
         if self._version is not None:
             return self._version
         raw = await self._client.call(_SYSTEM_INFO_METHOD)
         if not isinstance(raw, dict):
             self._note_fallback_outcome(
-                _KEY_SYSTEM_INFO,
+                _KEY_DETECT_VERSION,
                 failed=True,
-                warning=_SYSTEM_INFO_MALFORMED_WARNING,
+                warning=(
+                    "Malformed 'system.info' response while detecting "
+                    "TrueNAS version: %s"
+                ),
                 reason=raw,
             )
             return (0, 0)
-        self._note_fallback_outcome(
-            _KEY_SYSTEM_INFO, failed=False, recovered=_SYSTEM_INFO_RECOVERED
-        )
         version = _parse_version_tuple(raw.get("version"))
         if version != (0, 0):
             self._version = version
@@ -1926,9 +2076,10 @@ class TrueNASState:
         ``system.info`` call once this has already run. A malformed
         (non-dict) ``system.info`` response warns on its failing transition
         regardless of whether a version is already cached -- not just before
-        the first successful poll -- under a key/message shared with
-        ``_detect_version()``'s identical guard, since a ``system.info`` call
-        going from valid to malformed mid-lifetime would otherwise leave
+        the first successful poll -- under its own key (``_KEY_SYSTEM_INFO``,
+        deliberately *not* shared with ``_detect_version()``'s identical
+        guard -- see that method's docstring for why), since a ``system.info``
+        call going from valid to malformed mid-lifetime would otherwise leave
         every other endpoint (uptime, memory, hostname, ...) silently frozen
         on stale data with no signal. A
         missing/unparsable ``version`` field within an otherwise-valid
@@ -2077,7 +2228,7 @@ class TrueNASState:
         )
         stale: set[str] = set()
         for graph_name, result in zip(graph_names, results, strict=True):
-            key = f"systemstat:{graph_name}"
+            key = f"{_SYSTEMSTAT_KEY_PREFIX}{graph_name}"
             if isinstance(result, TrueNASError):
                 stale.add(graph_name)
                 self._note_fallback_outcome(

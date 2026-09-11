@@ -88,6 +88,36 @@ produced a reading has no field in the result at all, so a failure on it is not 
 `ups_stale_graphs` therefore means "no field is outdated", not "nothing failed", unlike
 `systemstats_stale_graphs`, whose fields are always present from the start.
 
+Several other `get_*` methods return the previous cached snapshot (logging once) instead of raising
+when their *primary* RPC result cannot be freshly fetched: `get_smb()` and `get_ups()` swallow an
+actual RPC error this way, and all six of `get_smb()`, `get_pool()`, `get_directoryservices()`,
+`get_alerts()`, `get_systeminfo()`, `get_ups()` swallow a malformed/unusable payload — though
+`get_systeminfo()` only treats a *non-dict* `system.info` response as malformed, so a
+structurally-empty `{}` response is accepted as-is (a known pre-existing gap; it will not show up in
+`stale_endpoints`). `get_directoryservices()` and `get_ups()` are narrower still: on a partial failure
+(the status call, or a single graph) they still refresh every other field from the fresh response and
+only carry over the one piece that failed, rather than leaving the whole cached snapshot untouched.
+`state.stale_endpoints` is a `frozenset` of the `ds` endpoint names currently in that
+fell-back-to-cache state; the reachable names are `"pool"`, `"ups"`, `"system_info"`,
+`"directoryservices"`, `"alerts"`, `"smb"`. It is the coarse counterpart to the per-graph
+`*_stale_graphs` sets, meant for a consumer that marks an endpoint's entities unavailable when its
+data source stops being freshly reachable. It is a one-way signal — a name in the set really is
+stale, but a primary `get_*` that fails by *raising* is not listed (the caller sees that itself).
+
+Only a stale *primary* result counts. Best-effort enrichment on top of a fresh primary result is
+deliberately excluded — disk temperatures and interface throughput (`"disk"` / `"interface"` never
+appear; `disk.query` / `interface.query` raise on a real failure, which the caller already sees),
+the CPU/load/memory/ARC-size netdata graphs (they only enrich an already-fresh `ds["system_info"]`),
+a single failing `get_ups()` per-graph query while discovery still succeeds, and the internal
+TrueNAS-version / virtualization detection. Mapping those to an endpoint would pin it — and every
+entity derived from it — to a permanent stale state on hardware that simply never reports the
+optional metric (a disk with no temperature sensor, a dmidecode-less container). Their staleness
+stays visible through `systemstats_stale_graphs` / `ups_stale_graphs` only. `"ups"` is still
+reported when the graph *discovery* call fails outright or when `ups_stale_graphs` is non-empty
+(that set is self-clearing, so it can't stick). `"arc"` is likewise absent: `get_arc()` raises on a
+failed graph query (and writes `None`, not a stale value, for a malformed-but-non-raising one), so
+there is no silent fallback to report.
+
 ## Status
 
 Early development. Generic `call()` RPC surface plus a growing set of normalized `TrueNASState`
