@@ -90,23 +90,39 @@ produced a reading has no field in the result at all, so a failure on it is not 
 
 Several other `get_*` methods return the previous cached snapshot (logging once) instead of raising
 when their *primary* RPC result cannot be freshly fetched: `get_smb()` and `get_ups()` swallow an
-actual RPC error this way, and all six of `get_smb()`, `get_pool()`, `get_directoryservices()`,
-`get_alerts()`, `get_systeminfo()`, `get_ups()` swallow a malformed/unusable payload — though
-`get_systeminfo()` only treats a *non-dict* `system.info` response as malformed, so a
-structurally-empty `{}` response is accepted as-is (a known pre-existing gap; it will not show up in
-`stale_endpoints`). `get_directoryservices()` and `get_ups()` are narrower still: on a partial failure
-(the status call, or a single graph) they still refresh every other field from the fresh response and
-only carry over the one piece that failed, rather than leaving the whole cached snapshot untouched.
+actual RPC error this way, and `get_smb()`, `get_pool()`, `get_directoryservices()`, `get_alerts()`,
+`get_systeminfo()`, `get_ups()`, `get_dataset()`, `get_interface()`, `get_scrub()`, `get_service()`,
+`get_vm()` all swallow a malformed/unusable payload — though `get_systeminfo()` only treats a
+*non-dict* `system.info` response as malformed, so a structurally-empty `{}` response is accepted
+as-is (a known pre-existing gap; it will not show up in `stale_endpoints`). `get_directoryservices()`
+and `get_ups()` are narrower still: on a partial failure (the status call, or a single graph) they
+still refresh every other field from the fresh response and only carry over the one piece that
+failed, rather than leaving the whole cached snapshot untouched. `_add_boot_pool()` (part of
+`get_pool()`) follows the same carry-over pattern for a malformed/empty `boot.get_state()` response,
+when a previously cached boot-pool entry actually exists to carry over into `ds["pool"]` instead of
+silently dropping it; a response with nothing to carry over (`boot.get_state` has never once
+succeeded) is not reported as stale — there is no previous value to call stale, and permanently
+pinning `"pool"` for a `boot.get_state` call that never once works would falsely mark every pool
+entity unavailable even while `pool.query` itself stays fresh.
 `state.stale_endpoints` is a `frozenset` of the `ds` endpoint names currently in that
-fell-back-to-cache state; the reachable names are `"pool"`, `"ups"`, `"system_info"`,
-`"directoryservices"`, `"alerts"`, `"smb"`. It is the coarse counterpart to the per-graph
-`*_stale_graphs` sets, meant for a consumer that marks an endpoint's entities unavailable when its
-data source stops being freshly reachable. It is a one-way signal — a name in the set really is
-stale, but a primary `get_*` that fails by *raising* is not listed (the caller sees that itself).
+fell-back-to-cache state; the reachable names are `"pool"`, `"dataset"`, `"ups"`, `"system_info"`,
+`"directoryservices"`, `"alerts"`, `"smb"`, `"interface"`, `"scrub"`, `"service"`, `"vm"`. It is the
+coarse counterpart to the per-graph `*_stale_graphs` sets, meant for a consumer that marks an
+endpoint's entities unavailable when its data source stops being freshly reachable. It is a one-way
+signal — a name in the set really is stale, but a primary `get_*` that fails by *raising* is not
+listed (the caller sees that itself).
 
-Only a stale *primary* result counts. Best-effort enrichment on top of a fresh primary result is
-deliberately excluded — disk temperatures and interface throughput (`"disk"` / `"interface"` never
-appear; `disk.query` / `interface.query` raise on a real failure, which the caller already sees),
+`"pool"` also covers a field-level dependency, not just `pool.query` itself: pool capacity
+(available/total/usage/size/allocated) is derived from the pool's root dataset, so when
+`pool.dataset.query` falls back to cached data, `"pool"` is reported stale too for any pool that
+actually has a root dataset to depend on — even if `pool.query` refreshed cleanly. A boot-pool-only
+refresh (no root dataset at all) never triggers this.
+
+Only a stale *primary* result (or, for `"pool"`, the dataset dependency above) counts. Best-effort
+enrichment on top of a fresh primary result is deliberately excluded — disk temperatures (`"disk"`
+never appears; `disk.query` raises on a real failure, which the caller already sees), interface
+*throughput* specifically (`get_systemstats()`'s netdata enrichment of `rx`/`tx` onto an
+already-fresh `ds["interface"]` — distinct from `interface.query` itself, which now *is* covered),
 the CPU/load/memory/ARC-size netdata graphs (they only enrich an already-fresh `ds["system_info"]`),
 a single failing `get_ups()` per-graph query while discovery still succeeds, and the internal
 TrueNAS-version / virtualization detection. Mapping those to an endpoint would pin it — and every
