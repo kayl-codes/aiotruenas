@@ -92,9 +92,12 @@ Several other `get_*` methods return the previous cached snapshot (logging once)
 when their *primary* RPC result cannot be freshly fetched: `get_smb()` and `get_ups()` swallow an
 actual RPC error this way, and `get_smb()`, `get_pool()`, `get_directoryservices()`, `get_alerts()`,
 `get_systeminfo()`, `get_ups()`, `get_dataset()`, `get_interface()`, `get_scrub()`, `get_service()`,
-`get_vm()` all swallow a malformed/unusable payload — though `get_systeminfo()` only treats a
-*non-dict* `system.info` response as malformed, so a structurally-empty `{}` response is accepted
-as-is (a known pre-existing gap; it will not show up in `stale_endpoints`). `get_directoryservices()`
+`get_vm()` all swallow a malformed/unusable payload — `get_systeminfo()` treats a structurally-empty
+`{}` `system.info` response as malformed too, not just a non-dict one (like `get_smb()` also rejects
+`{}` on its own flat-dict shape, though as a side effect of requiring a `sessions` list rather than
+an explicit emptiness check). A non-empty response missing individual fields is not malformed —
+those fields are instead reset to their own normalized defaults (e.g. `"unknown"`/`0`), not carried
+over from the previous snapshot the way a malformed response's fields are. `get_directoryservices()`
 and `get_ups()` are narrower still: on a partial failure (the status call, or a single graph) they
 still refresh every other field from the fresh response and only carry over the one piece that
 failed, rather than leaving the whole cached snapshot untouched. `_add_boot_pool()` (part of

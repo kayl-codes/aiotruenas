@@ -3820,7 +3820,12 @@ async def test_systeminfo_and_detect_version_agree_on_missing_version_reason(
     """
     async with FakeTrueNASServer(
         valid_api_key=API_KEY,
-        responses={"system.info": {}, "virt.instance.query": []},
+        # Non-empty but missing "version" -- a *fully* empty {} is now its
+        # own, separate malformed case (see
+        # test_get_systeminfo_logs_warning_on_empty_dict_system_info), which
+        # would short-circuit before ever reaching the version check this
+        # test exercises.
+        responses={"system.info": {"hostname": "truenas"}, "virt.instance.query": []},
     ) as server:
         async with make_client(server) as client:
             await client.connect()
@@ -3961,6 +3966,94 @@ async def test_get_systeminfo_warns_on_non_dict_even_with_version_already_cached
     assert state._version == (26, 0)
 
 
+async def test_get_systeminfo_logs_warning_on_empty_dict_system_info(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """A structurally empty ``{}`` ``system.info`` response must warn and be
+    rejected just like a non-dict one -- unlike the five id-keyed endpoints,
+    ``system_info`` has no id concept to check individual entries' emptiness
+    against, so the top-level dict's own emptiness is the narrowest signal
+    available. Matches ``get_smb()``'s equivalent check on its own flat-dict
+    shape.
+    """
+    async with FakeTrueNASServer(
+        valid_api_key=API_KEY,
+        responses={
+            "system.info": {
+                "version": "TrueNAS-25.10.0",
+                "system_manufacturer": "Supermicro",
+                "system_product": "X11SPi-TF",
+            }
+        },
+    ) as server:
+        async with make_client(server) as client:
+            await client.connect()
+            state = TrueNASState(client)
+            with caplog.at_level(logging.DEBUG, logger="aiotruenas.domain.state"):
+                await state.get_systeminfo()
+
+                server.responses["system.info"] = {}
+                await state.get_systeminfo()
+
+                server.responses["system.info"] = {
+                    "version": "TrueNAS-25.10.0",
+                    "system_manufacturer": "Supermicro",
+                    "system_product": "X11SPi-TF",
+                }
+                await state.get_systeminfo()
+
+    state_records = [r for r in caplog.records if r.name == "aiotruenas.domain.state"]
+    warnings = [r for r in state_records if r.levelno == logging.WARNING]
+    recoveries = [
+        r
+        for r in state_records
+        if r.levelno == logging.DEBUG and "recovered" in r.getMessage()
+    ]
+    assert len(warnings) == 1
+    assert "malformed" in warnings[0].getMessage().lower()
+    # Exactly one recovery: the initial successful poll does not log
+    # "recovered" (nothing was failing yet), only the second good response
+    # after the empty-dict poll does.
+    assert len(recoveries) == 1
+
+
+async def test_get_systeminfo_does_not_warn_on_partial_nonempty_response(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """A non-empty ``system.info`` response missing individual fields is not
+    malformed -- only a fully empty dict is. Guards against the empty-dict
+    check above (``not raw``) accidentally broadening into something that
+    also rejects ordinary partial responses (those fall through to
+    ``parse_api()``, which resets each missing field to its own normalized
+    default instead). Includes a valid ``version`` so the (unrelated)
+    missing-version-field warning path isn't also triggered, keeping this
+    test focused on the malformed-response check.
+    Also includes manufacturer/product so the (also unrelated)
+    virtualization-detection warning isn't triggered either.
+    """
+    async with FakeTrueNASServer(
+        valid_api_key=API_KEY,
+        responses={
+            "system.info": {
+                "hostname": "truenas",
+                "version": "TrueNAS-25.10.0",
+                "system_manufacturer": "Supermicro",
+                "system_product": "X11SPi-TF",
+            }
+        },
+    ) as server:
+        async with make_client(server) as client:
+            await client.connect()
+            state = TrueNASState(client)
+            with caplog.at_level(logging.DEBUG, logger="aiotruenas.domain.state"):
+                result = await state.get_systeminfo()
+
+    state_records = [r for r in caplog.records if r.name == "aiotruenas.domain.state"]
+    warnings = [r for r in state_records if r.levelno == logging.WARNING]
+    assert len(warnings) == 0
+    assert result["hostname"] == "truenas"
+
+
 async def test_get_systeminfo_keeps_previous_total_memory_on_bogus_physmem() -> None:
     async with FakeTrueNASServer(
         valid_api_key=API_KEY,
@@ -4095,6 +4188,26 @@ async def test_get_systeminfo_preserves_previous_values_on_list_response() -> No
                 {"hostname": "bogus1"},
                 {"hostname": "bogus2"},
             ]
+            result = await state.get_systeminfo()
+
+    assert result["hostname"] == "truenas"
+    assert result is previous
+
+
+async def test_get_systeminfo_preserves_previous_values_on_empty_dict_response() -> (
+    None
+):
+    async with FakeTrueNASServer(
+        valid_api_key=API_KEY,
+        responses={"system.info": {"hostname": "truenas", "uptime_seconds": 500}},
+    ) as server:
+        async with make_client(server) as client:
+            await client.connect()
+            state = TrueNASState(client)
+            await state.get_systeminfo()
+            previous = state.ds["system_info"]
+
+            server.responses["system.info"] = {}
             result = await state.get_systeminfo()
 
     assert result["hostname"] == "truenas"
@@ -5611,6 +5724,32 @@ async def test_stale_endpoints_reports_system_info_on_malformed_response() -> No
             assert "system_info" not in state.stale_endpoints
 
             server.responses["system.info"] = None
+            await state.get_systeminfo()
+            assert "system_info" in state.stale_endpoints
+
+            server.responses["system.info"] = good_info
+            await state.get_systeminfo()
+            assert "system_info" not in state.stale_endpoints
+
+
+async def test_stale_endpoints_reports_system_info_on_empty_dict_response() -> None:
+    good_info = {
+        "version": "TrueNAS-25.04.0",
+        "physmem": 8,
+        "system_manufacturer": "Supermicro",
+        "system_product": "X11SPi-TF",
+    }
+    async with FakeTrueNASServer(
+        valid_api_key=API_KEY,
+        responses={"system.info": good_info},
+    ) as server:
+        async with make_client(server) as client:
+            await client.connect()
+            state = TrueNASState(client)
+            await state.get_systeminfo()
+            assert "system_info" not in state.stale_endpoints
+
+            server.responses["system.info"] = {}
             await state.get_systeminfo()
             assert "system_info" in state.stale_endpoints
 
