@@ -220,6 +220,50 @@ _VERSION_DETECT_RECOVERED = "TrueNAS version detection recovered"
 _KEY_SYSTEM_INFO = "system_info"
 _SYSTEM_INFO_MALFORMED_WARNING = "Malformed 'system.info' response: %s"
 _SYSTEM_INFO_RECOVERED = "'system.info' response recovered"
+_KEY_DATASET_QUERY = "dataset_query"
+_KEY_INTERFACE_QUERY = "interface_query"
+_KEY_SCRUB_QUERY = "scrub_query"
+_KEY_SERVICE_QUERY = "service_query"
+_KEY_VM_QUERY = "vm_query"
+_KEY_BOOT_POOL = "boot_pool"
+_KEY_POOL_CAPACITY_DATASET = "pool_capacity_dataset"
+# Separate from _KEY_DATASET_QUERY on purpose: that key tracks
+# 'pool.dataset.query's own raw outcome (set by _compute_dataset(), which
+# assumes its result will be published) and can legitimately flip back to
+# "recovered" every poll while 'pool.query' stays malformed -- reusing it in
+# get_pool()'s early-return branch below would re-warn on every single poll
+# of a persistent 'pool.query' outage instead of once per transition,
+# breaking _note_fallback_outcome()'s "warn only on the failing transition"
+# contract. This key instead tracks whether "dataset" was actually
+# (re-)published this refresh -- by *either* get_pool() (whose early-return
+# branch sets it) or get_dataset() (which clears it on every call,
+# regardless of whether the underlying 'pool.dataset.query' itself
+# succeeded -- _KEY_DATASET_QUERY tracks that outcome separately -- since
+# get_dataset() is the only other call site that ever writes
+# self._ds["dataset"]).
+#
+# Both get_pool() and get_dataset() write self._fallback_failing[this key]
+# directly rather than through _note_fallback_outcome(): a real consumer
+# (e.g. a coordinator's poll loop) calls both every single poll, in a fixed
+# get_dataset()-then-get_pool() order, so this key's own value flips on
+# every poll of a persistent 'pool.query' outage regardless of whether the
+# underlying condition ever actually changes -- it is not a meaningful
+# "transition" to warn or recover-log on. The warning/recovery log lines
+# for this condition are instead driven entirely by _KEY_POOL_QUERY's own
+# transition (checked explicitly in get_pool()), which does reflect the
+# real, once-per-outage event.
+#
+# Known over-reporting tradeoff: get_pool()'s early-return branch sets this
+# key unconditionally, without checking whether a get_dataset() call already
+# republished "dataset" earlier in the same poll (the real coordinator order)
+# -- so "dataset" can show up in stale_endpoints for the whole 'pool.query'
+# outage even though the data it points at is, in fact, current. Accepted
+# rather than chased further: distinguishing "truly never republished" from
+# "republished moments ago by a sibling call" would need its own generation
+# counter across two call sites, for a signal no current consumer reads yet
+# (see stale_endpoints's own docstring for the equivalent, deliberate
+# get_systeminfo() gap).
+_KEY_DATASET_NOT_PUBLISHED = "dataset_not_published"
 # Prefix for get_ups()'s dynamic per-graph fallback keys (e.g.
 # "ups_graph:upscharge") -- a module-level constant rather than a fixed
 # _KEY_* value since the graph name is only known at runtime, but still
@@ -261,12 +305,26 @@ _SYSTEMSTAT_KEY_PREFIX = "systemstat:"
 # primary-result failure for the endpoint and stays mapped here.
 _FALLBACK_KEY_ENDPOINTS: dict[str, str] = {
     _KEY_POOL_QUERY: "pool",
+    _KEY_BOOT_POOL: "pool",
+    # Pool capacity (available/total/usage/size/allocated) is derived from
+    # the pool's root dataset (see _apply_pool_capacity()); when
+    # 'pool.dataset.query' itself falls back to its cached snapshot, those
+    # fields are stale even though 'pool.query' may have refreshed cleanly,
+    # so this key flags "pool" too -- a field-level fallback like
+    # _KEY_DIRECTORYSERVICES_STATUS, just sourced from a different RPC call.
+    _KEY_POOL_CAPACITY_DATASET: "pool",
+    _KEY_DATASET_QUERY: "dataset",
+    _KEY_DATASET_NOT_PUBLISHED: "dataset",
     _KEY_UPS_NETDATA_GRAPHS: "ups",
     _KEY_DIRECTORYSERVICES_CONFIG: "directoryservices",
     _KEY_DIRECTORYSERVICES_STATUS: "directoryservices",
     _KEY_ALERT_LIST: "alerts",
     _KEY_SMB_STATUS: "smb",
     _KEY_SYSTEM_INFO: "system_info",
+    _KEY_INTERFACE_QUERY: "interface",
+    _KEY_SCRUB_QUERY: "scrub",
+    _KEY_SERVICE_QUERY: "service",
+    _KEY_VM_QUERY: "vm",
 }
 
 # _note_fallback_outcome() keys/prefixes that intentionally map to *no*
@@ -468,6 +526,17 @@ class TrueNASState:
         # call, leaving their field at the previous value instead of a fresh
         # reading -- see ups_stale_graphs.
         self._ups_stale_graphs: frozenset[str] = frozenset()
+        # The ds["pool"] key of the boot-pool entry, once _add_boot_pool()
+        # has successfully merged one in -- lets a later malformed/empty
+        # boot.get_state() response re-carry over that specific cached
+        # entry (see _add_boot_pool()) instead of silently dropping it from
+        # ds["pool"], the way pool.query's own removed-pool guids can't be
+        # told apart from a boot-pool that merely failed to refresh this
+        # poll. None until the first successful merge.
+        # Typed Hashable rather than str: parse_api()/get_uid() never coerce
+        # a guid to str, so a hashable-but-non-str guid (e.g. an int) is
+        # technically possible and would be stored as-is.
+        self._boot_pool_uid: Hashable | None = None
 
     @property
     def ds(self) -> _PublicStateMap:
@@ -541,18 +610,52 @@ class TrueNASState:
         reflected here (the caller's own error handling already sees it), and
         so are the pre-existing silent-fallback paths that this property does
         not yet map. The reachable names are a subset of ``ds``'s keys --
-        ``"pool"``, ``"ups"``, ``"directoryservices"``, ``"alerts"``,
-        ``"smb"``, ``"system_info"``.
+        ``"pool"``, ``"dataset"``, ``"ups"``, ``"directoryservices"``,
+        ``"alerts"``, ``"smb"``, ``"system_info"``, ``"interface"``,
+        ``"scrub"``, ``"service"``, ``"vm"``.
+
+        ``"pool"`` is also reported when its capacity figures (available/
+        total/usage/size/allocated), derived from the pool's root dataset --
+        see ``_apply_pool_capacity()`` -- were computed from a stale
+        ``"dataset"`` snapshot, even if ``pool.query`` itself refreshed
+        cleanly: a field-level fallback sourced from a different endpoint's
+        RPC call, only flagged when at least one pool actually has a root
+        dataset to depend on (a boot-pool-only refresh never triggers it).
+        Likewise, a malformed/empty ``boot.get_state()`` response no longer
+        silently drops the boot-pool from ``ds["pool"]`` when a previous
+        entry exists to carry over -- and ``"pool"`` is reported stale for
+        that refresh. A response with nothing to carry over (``boot.get_
+        state`` has never once succeeded) leaves ``"pool"`` unreported --
+        same rationale as ``ups_stale_graphs``: there is no previous value
+        to call stale, and permanently pinning ``"pool"`` for a
+        boot.get_state that never once works would falsely mark every pool
+        entity unavailable even while ``pool.query`` itself stays fresh.
+
+        ``"dataset"`` has one known exception to the one-way guarantee
+        above: a malformed ``pool.query`` response always (re-)flags
+        ``"dataset"`` too (see :meth:`get_pool`'s malformed-``pool.query``
+        branch, and ``_KEY_DATASET_NOT_PUBLISHED``'s own module-level
+        comment), even if a direct
+        :meth:`get_dataset` call already republished a fully fresh dataset
+        map earlier in the very same refresh cycle -- a real consumer
+        (e.g. a coordinator's poll loop) that calls both every cycle would
+        see ``"dataset"`` reported stale for the whole ``pool.query``
+        outage regardless, even though the data it points at is in fact
+        current. Distinguishing that case would need its own cross-call
+        tracking for a signal no current consumer reads yet, so it is left
+        as a deliberate over-report rather than a silent gap.
 
         Best-effort *enrichment* layered onto an otherwise-fresh primary
         result does **not** count: disk temperatures (``"disk"`` stays out --
         ``disk.query`` is the primary result and raises on a real failure),
-        interface throughput (``"interface"`` stays out likewise), the
-        systemstats netdata graphs (CPU/load/memory/ARC-size -- they enrich
-        an already-fresh ``ds["system_info"]``), and a single one of
-        ``get_ups()``'s per-graph queries failing while discovery still
-        succeeds. Nor does internal capability detection (TrueNAS version /
-        virtualization). Those stay observable only through
+        interface throughput specifically (rx/tx, enriched by
+        ``get_systemstats()``'s netdata queries onto an already-fresh
+        ``ds["interface"]`` -- distinct from ``interface.query`` itself,
+        which *is* covered), the systemstats netdata graphs (CPU/load/
+        memory/ARC-size -- they enrich an already-fresh ``ds["system_info"]``),
+        and a single one of ``get_ups()``'s per-graph queries failing while
+        discovery still succeeds. Nor does internal capability detection
+        (TrueNAS version / virtualization). Those stay observable only through
         :attr:`systemstats_stale_graphs` / :attr:`ups_stale_graphs` -- the
         finer, per-graph counterparts this sits above. Mapping them to an
         endpoint here would pin that endpoint (and every entity a consumer
@@ -609,6 +712,13 @@ class TrueNASState:
         """Refresh and return normalized ZFS datasets (``pool.dataset.query``)."""
         async with self._lock:
             self._ds["dataset"] = await self._compute_dataset()
+            # This call just published a dataset map directly, so any
+            # earlier _KEY_DATASET_NOT_PUBLISHED (set by get_pool()'s
+            # early-return branch) no longer applies -- cleared directly,
+            # bypassing _note_fallback_outcome()'s own log-on-transition
+            # tracking, for the reasons given at that key's own definition
+            # above.
+            self._fallback_failing.pop(_KEY_DATASET_NOT_PUBLISHED, None)
             return self._ds["dataset"]
 
     async def _compute_dataset(self) -> _EndpointMap:
@@ -621,12 +731,19 @@ class TrueNASState:
         only its own entries, since ``parse_api()`` prunes anything absent
         from it.
 
+        Notes the outcome under ``_KEY_DATASET_QUERY`` (mapped to the
+        ``"dataset"`` endpoint) so a malformed/failed response is reflected
+        in ``stale_endpoints`` -- this call site had no such tracking before,
+        unlike every other primary RPC result in this module.
+
         Caller must hold ``self._lock`` and is responsible for publishing the
         result to ``self._ds["dataset"]``.
         """
+        raw = await self._client.call("pool.dataset.query")
+        self._note_primary_query_outcome(_KEY_DATASET_QUERY, raw, "pool.dataset.query")
         return parse_api(
             data=copy.deepcopy(self._ds["dataset"]),
-            source=await self._client.call("pool.dataset.query"),
+            source=raw,
             key="id",
             vals=_DATASET_VALS,
         )
@@ -639,11 +756,19 @@ class TrueNASState:
         which requires up-to-date dataset data.
 
         Both the dataset and pool maps are built up on local (deep-copied)
-        snapshots and only published to ``self._ds`` once every step --
-        including the fallible boot-pool lookup -- has succeeded, so a
-        failure partway through leaves the previous, fully-consistent
-        snapshot of both endpoints in place instead of a dataset/pool pair
-        that no longer agree with each other.
+        snapshots and only published to ``self._ds`` once the primary
+        ``pool.query`` step has succeeded, so a malformed response there
+        leaves the previous, fully-consistent snapshot of both endpoints in
+        place instead of a dataset/pool pair that no longer agree with each
+        other. The boot-pool lookup (``_add_boot_pool()``) is handled more
+        leniently: a malformed/empty ``boot.get_state()`` response there
+        does not block publishing -- if a previously cached boot-pool entry
+        exists, it carries that entry over instead (see
+        ``_add_boot_pool()``) and flags ``"pool"`` in ``stale_endpoints`` to
+        reflect the carry-over; if none exists yet (``boot.get_state`` has
+        never once succeeded), the boot-pool is simply left out and nothing
+        is flagged. Either way this method still publishes the resulting
+        snapshot normally.
         """
         async with self._lock:
             datasets = await self._compute_dataset()
@@ -663,13 +788,25 @@ class TrueNASState:
                 self._note_fallback_outcome(
                     _KEY_POOL_QUERY,
                     failed=True,
-                    warning="Malformed 'pool.query' response: %s",
+                    warning=(
+                        "Malformed 'pool.query' response: %s -- 'dataset' "
+                        "not refreshed either"
+                    ),
                     reason=raw_pools,
                 )
+                # self._ds["dataset"] is never reassigned below on this path,
+                # so "dataset" must be (re-)flagged stale here too -- see
+                # _KEY_DATASET_NOT_PUBLISHED's own comment above for why
+                # this is written directly rather than through a second
+                # _note_fallback_outcome() call.
+                self._fallback_failing[_KEY_DATASET_NOT_PUBLISHED] = True
                 return self._ds["pool"]
             self._note_fallback_outcome(
-                _KEY_POOL_QUERY, failed=False, recovered="'pool.query' recovered"
+                _KEY_POOL_QUERY,
+                failed=False,
+                recovered="'pool.query' recovered; 'dataset' recovered with it",
             )
+            self._fallback_failing.pop(_KEY_DATASET_NOT_PUBLISHED, None)
 
             pools = parse_api(
                 data=copy.deepcopy(self._ds["pool"]),
@@ -694,6 +831,13 @@ class TrueNASState:
                 and dataset["mountpoint"] not in ("", "unknown")
             }
 
+            # Whether this refresh's dataset map is itself the previous
+            # cached snapshot (pool.dataset.query fell back) rather than a
+            # fresh one -- checked once, outside the loop, since it applies
+            # equally to every pool that resolves a root dataset below.
+            dataset_query_stale = self._fallback_failing.get(_KEY_DATASET_QUERY, False)
+            stale_capacity_uids: list[str] = []
+
             for uid, vals in pools.items():
                 # A malformed "path"/"name" (e.g. a list, from a corrupted
                 # API response) is unhashable and would raise TypeError from
@@ -707,11 +851,30 @@ class TrueNASState:
                     if isinstance(name, Hashable):
                         root_dataset = datasets.get(name)
 
+                if root_dataset is not None and dataset_query_stale:
+                    stale_capacity_uids.append(str(uid))
+
                 self._apply_pool_capacity(pools, uid, vals, root_dataset)
 
                 # pool.query reports fragmentation as a percentage string
                 # (e.g. "48").
                 pools[uid]["fragmentation"] = _to_int(vals.get("fragmentation"))
+
+            # Flag "pool" itself only when at least one pool actually used a
+            # stale root dataset for its capacity figures -- e.g. a
+            # boot-pool-only refresh has no root dataset to begin with, so a
+            # stale dataset snapshot never actually reached any pool's
+            # capacity that poll and shouldn't be reported as if it had.
+            self._note_fallback_outcome(
+                _KEY_POOL_CAPACITY_DATASET,
+                failed=bool(stale_capacity_uids),
+                warning=(
+                    "Pool capacity computed from a stale 'pool.dataset.query' "
+                    "snapshot for pool(s): %s"
+                ),
+                recovered="Pool capacity dataset dependency recovered",
+                reason=stale_capacity_uids,
+            )
 
             self._ds["dataset"] = datasets
             self._ds["pool"] = pools
@@ -725,14 +888,57 @@ class TrueNASState:
         size/allocated/free/fragmentation), so it is parsed with the same
         field mapping. It has no root dataset, so the capacity falls back to
         the pool's own free/size (handled in ``_apply_pool_capacity``).
+
+        A malformed/empty response carries over the previously cached
+        boot-pool entry (tracked via ``self._boot_pool_uid``), if one
+        exists, instead of silently omitting it from ``pools`` -- unlike
+        every other primary RPC result in this module, this call site used
+        to drop its entity outright on failure rather than keeping the last
+        known snapshot, and noted no fallback outcome at all. Notes
+        ``_KEY_BOOT_POOL`` (mapped to the ``"pool"`` endpoint) only when a
+        carry-over actually happens -- not on every malformed response --
+        matching ``stale_endpoints``'s own "carried the corresponding prior
+        value over" contract and ``ups_stale_graphs``'s precedent that a
+        value which has never once existed has nothing stale to report (a
+        ``boot.get_state`` that has never once succeeded, e.g. early in this
+        object's lifetime, would otherwise pin ``"pool"`` permanently stale
+        even while ``pool.query`` itself keeps refreshing cleanly).
+
+        The ``guid`` used as ``self._boot_pool_uid`` -- and as the merge key
+        below -- is resolved via :func:`get_uid`, the same resolver
+        :func:`parse_api` itself uses internally, so a response that would
+        leave ``parse_api()`` unable to find a usable uid (an unhashable
+        ``guid``/derived ``"name"``, or an explicit ``None`` one -- e.g.
+        ``isinstance(None, Hashable)`` is ``True``, so a bare ``Hashable``
+        check alone would miss it) is treated identically here, rather than
+        being merged as a bogus "success" or stored into
+        ``self._boot_pool_uid`` and breaking every later carry-over attempt.
         """
         raw_boot = await self._client.call("boot.get_state")
-        if not isinstance(raw_boot, dict) or not raw_boot:
+        if isinstance(raw_boot, dict) and raw_boot:
+            # boot.get_state carries no guid/id; use the pool name as a
+            # stable key.
+            raw_boot.setdefault("guid", raw_boot.get("name", "boot-pool"))
+            raw_boot.setdefault("id", raw_boot.get("name", "boot-pool"))
+        guid = get_uid(raw_boot, "guid", None, None, None)
+
+        if guid is None:
+            carried_over = False
+            if self._boot_pool_uid is not None:
+                cached = self._ds["pool"].get(self._boot_pool_uid)
+                if cached is not None:
+                    pools[self._boot_pool_uid] = copy.deepcopy(cached)
+                    carried_over = True
+            if carried_over:
+                self._note_fallback_outcome(
+                    _KEY_BOOT_POOL,
+                    failed=True,
+                    warning="Malformed or empty 'boot.get_state' response: %s",
+                    reason=raw_boot,
+                )
             return pools
 
-        # boot.get_state carries no guid/id; use the pool name as a stable key.
-        raw_boot.setdefault("guid", raw_boot.get("name", "boot-pool"))
-        raw_boot.setdefault("id", raw_boot.get("name", "boot-pool"))
+        self._boot_pool_uid = guid
         pools = parse_api(
             data=pools,
             source=raw_boot,
@@ -742,6 +948,9 @@ class TrueNASState:
             prune=False,
         )
         self._apply_pool_errors(pools, [raw_boot])
+        self._note_fallback_outcome(
+            _KEY_BOOT_POOL, failed=False, recovered="'boot.get_state' recovered"
+        )
         return pools
 
     def _apply_pool_capacity(
@@ -1141,12 +1350,17 @@ class TrueNASState:
 
         Derives ``running`` from the service state and a ``display_name``
         that falls back to a known human-friendly label (``_SERVICE_DISPLAY_
-        NAMES``) when the API's own "name" field is missing/"unknown".
+        NAMES``) when the API's own "name" field is missing/"unknown". A
+        malformed/failed response is tracked under ``_KEY_SERVICE_QUERY``
+        (mapped to the ``"service"`` endpoint) -- see
+        ``_note_primary_query_outcome``.
         """
         async with self._lock:
+            raw = await self._client.call("service.query")
+            self._note_primary_query_outcome(_KEY_SERVICE_QUERY, raw, "service.query")
             self._ds["service"] = parse_api(
                 data=self._ds["service"],
-                source=await self._client.call("service.query"),
+                source=raw,
                 key="id",
                 vals=_SERVICE_VALS,
                 ensure_vals=_SERVICE_ENSURE_VALS,
@@ -1162,11 +1376,18 @@ class TrueNASState:
             return self._ds["service"]
 
     async def get_vm(self) -> _EndpointMap:
-        """Refresh and return normalized VMs (``vm.query``)."""
+        """Refresh and return normalized VMs (``vm.query``).
+
+        A malformed/failed response is tracked under ``_KEY_VM_QUERY``
+        (mapped to the ``"vm"`` endpoint) -- see
+        ``_note_primary_query_outcome``.
+        """
         async with self._lock:
+            raw = await self._client.call("vm.query")
+            self._note_primary_query_outcome(_KEY_VM_QUERY, raw, "vm.query")
             self._ds["vm"] = parse_api(
                 data=self._ds["vm"],
-                source=await self._client.call("vm.query"),
+                source=raw,
                 key="id",
                 vals=_VM_VALS,
                 ensure_vals=_VM_ENSURE_VALS,
@@ -1607,12 +1828,18 @@ class TrueNASState:
 
         Derives a boolean ``link_up`` from the link state. Live rx/tx
         throughput is out of scope (see ``_INTERFACE_VALS``'s docstring in
-        ``_specs.py``) -- ``rx``/``tx`` default to 0.
+        ``_specs.py``) -- ``rx``/``tx`` default to 0. A malformed/failed
+        response is tracked under ``_KEY_INTERFACE_QUERY`` (mapped to the
+        ``"interface"`` endpoint) -- see ``_note_primary_query_outcome``.
         """
         async with self._lock:
+            raw = await self._client.call("interface.query")
+            self._note_primary_query_outcome(
+                _KEY_INTERFACE_QUERY, raw, "interface.query"
+            )
             self._ds["interface"] = parse_api(
                 data=self._ds["interface"],
-                source=await self._client.call("interface.query"),
+                source=raw,
                 key="id",
                 vals=_INTERFACE_VALS,
                 ensure_vals=_INTERFACE_ENSURE_VALS,
@@ -1622,11 +1849,18 @@ class TrueNASState:
             return self._ds["interface"]
 
     async def get_scrub(self) -> _EndpointMap:
-        """Refresh and return normalized pool scrub tasks (``pool.scrub.query``)."""
+        """Refresh and return normalized pool scrub tasks (``pool.scrub.query``).
+
+        A malformed/failed response is tracked under ``_KEY_SCRUB_QUERY``
+        (mapped to the ``"scrub"`` endpoint) -- see
+        ``_note_primary_query_outcome``.
+        """
         async with self._lock:
+            raw = await self._client.call("pool.scrub.query")
+            self._note_primary_query_outcome(_KEY_SCRUB_QUERY, raw, "pool.scrub.query")
             self._ds["scrub"] = parse_api(
                 data=self._ds["scrub"],
-                source=await self._client.call("pool.scrub.query"),
+                source=raw,
                 key="id",
                 vals=_SCRUB_VALS,
             )
@@ -2000,6 +2234,64 @@ class TrueNASState:
                 _LOGGER.debug(recovered)
             else:
                 _LOGGER.debug("Fallback path '%s' recovered", key)
+
+    def _note_primary_query_outcome(
+        self, key: str, raw: Any, method: str, *, id_field: str = "id"
+    ) -> None:
+        """Track whether ``raw`` (the result of calling RPC ``method``) is usable.
+
+        Shared by every primary ``get_*`` call site that hands its raw RPC
+        result straight to :func:`parse_api` (keyed on ``id_field``, "id" for
+        every current caller) without its own bespoke validation.
+        ``parse_api()`` already falls back to the cached snapshot on its own
+        in two cases -- a ``None``/non-list/non-dict ``source``, and a
+        non-empty list/dict none of whose entries resolve to a usable
+        ``id_field`` uid (e.g. ``[{}]``, ``[None]``: ``parse_api()``'s own
+        pruning guard leaves ``data`` completely untouched rather than
+        wiping it, since ``seen_uids`` stays empty) -- this makes both
+        fallbacks *visible* via :meth:`_note_fallback_outcome`/
+        ``stale_endpoints`` instead of silently keeping the previous value
+        with no tracked failing flag, the gap that originally motivated
+        ``stale_endpoints`` for the other primary results in this module.
+        Reuses :func:`get_uid` (the same resolver ``parse_api()`` itself
+        calls) so this mirrors its real fallback trigger exactly rather than
+        approximating it.
+
+        An empty list is not malformed -- it is ``parse_api()``'s legitimate
+        "nothing left" signal (it prunes ``data`` to ``{}``) -- so it counts
+        as usable here too.
+
+        Not used by call sites with their own dedicated validation (e.g.
+        ``get_pool()``'s usable-entry scan, ``_add_boot_pool()``'s
+        empty-dict/unhashable-guid checks) -- those already note their own,
+        more specific outcome.
+        """
+        if isinstance(raw, dict):
+            entries: list[Any] | None = [raw]
+        elif isinstance(raw, list):
+            entries = raw
+        else:
+            entries = None
+
+        usable = entries is not None and (
+            not entries
+            or any(
+                get_uid(entry, id_field, None, None, None) is not None
+                for entry in entries
+            )
+        )
+
+        if not usable:
+            self._note_fallback_outcome(
+                key,
+                failed=True,
+                warning=f"Malformed {method!r} response: %s",
+                reason=raw,
+            )
+        else:
+            self._note_fallback_outcome(
+                key, failed=False, recovered=f"{method!r} recovered"
+            )
 
     async def _fallback_disk_temperatures(self, stale_uids: list[Hashable]) -> None:
         """Fetch temperatures for ``stale_uids`` via ``disk.temperatures``.

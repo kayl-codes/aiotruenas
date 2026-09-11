@@ -213,7 +213,9 @@ async def test_get_pool_prunes_pools_absent_from_a_later_query() -> None:
 async def test_get_pool_keeps_previous_snapshot_on_malformed_pool_query() -> None:
     """A null/malformed pool.query response must not be paired with a freshly
     refreshed dataset map -- both the dataset and pool caches stay on their
-    previous, mutually-consistent snapshot instead."""
+    previous, mutually-consistent snapshot instead. Both "pool" and "dataset"
+    must show up in stale_endpoints: the dataset map was never published this
+    poll either, even though pool.dataset.query itself succeeded."""
     async with FakeTrueNASServer(
         valid_api_key=API_KEY,
         responses={
@@ -235,6 +237,103 @@ async def test_get_pool_keeps_previous_snapshot_on_malformed_pool_query() -> Non
     assert result is previous_pool
     assert state.ds["dataset"] is previous_dataset
     assert state.ds["pool"] is previous_pool
+    assert {"pool", "dataset"} <= state.stale_endpoints
+
+
+async def test_get_dataset_clears_dataset_stale_flag_left_by_get_pool() -> None:
+    """A direct get_dataset() refresh must clear "dataset" from
+    stale_endpoints even after a prior get_pool() call flagged it stale via
+    a malformed pool.query response -- and even while 'pool.query' is still
+    malformed (deliberately left unrecovered here, unlike the companion
+    get_pool()-driven recovery already covered by
+    test_get_pool_logs_warning_when_pool_query_is_malformed), to prove the
+    clear is unconditional on get_dataset()'s own success rather than
+    incidentally riding along with a 'pool.query' recovery. "pool" itself
+    must stay stale throughout: get_dataset() only ever owns the "dataset"
+    signal, never "pool".
+
+    Regression test for a Sourcery finding on PR #45: get_pool()'s malformed-
+    pool.query branch sets _KEY_DATASET_NOT_PUBLISHED (mapped to "dataset")
+    failing, but only get_pool() itself ever cleared it again -- get_dataset()
+    only ever touched the separate _KEY_DATASET_QUERY key. A caller that
+    refreshes datasets directly after such a get_pool() failure (rather than
+    calling get_pool() again) would see "dataset" stuck in stale_endpoints
+    forever, even though its own pool.dataset.query response was perfectly
+    fresh.
+    """
+    async with FakeTrueNASServer(
+        valid_api_key=API_KEY,
+        responses={
+            "pool.dataset.query": [_ROOT_DATASET],
+            "pool.query": [_POOL_TANK],
+            "boot.get_state": _BOOT_POOL,
+        },
+    ) as server:
+        async with make_client(server) as client:
+            await client.connect()
+            state = TrueNASState(client)
+            await state.get_pool()
+
+            server.responses["pool.query"] = None
+            await state.get_pool()
+            assert {"pool", "dataset"} <= state.stale_endpoints
+
+            fresh_dataset = await state.get_dataset()
+
+    assert "dataset" not in state.stale_endpoints
+    assert "pool" in state.stale_endpoints
+    assert state.ds["dataset"] is fresh_dataset
+
+
+async def test_get_dataset_between_pool_query_failures_does_not_repeat_warning(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """A get_dataset() call sandwiched between two malformed-pool.query
+    get_pool() polls must not cause the "dataset not refreshed" warning to
+    re-fire on the second poll -- it must still warn only once, on the
+    'pool.query' outage's own first failing transition, matching a real
+    aiotruenas consumer's poll order (get_dataset() then get_pool() every
+    single cycle).
+
+    Regression test for a bug introduced by an earlier, since-reverted fix
+    for the previous test's gap: routing get_dataset()'s clear of
+    _KEY_DATASET_NOT_PUBLISHED through _note_fallback_outcome() made
+    get_dataset()'s own clear count as a "recovered" transition, so
+    get_pool()'s very next malformed poll counted as a brand new "failing"
+    transition and re-warned -- once per poll of a persistent outage
+    instead of once for the whole outage.
+    """
+    async with FakeTrueNASServer(
+        valid_api_key=API_KEY,
+        responses={
+            "pool.dataset.query": [_ROOT_DATASET],
+            "pool.query": [_POOL_TANK],
+            "boot.get_state": _BOOT_POOL,
+        },
+    ) as server:
+        async with make_client(server) as client:
+            await client.connect()
+            state = TrueNASState(client)
+            with caplog.at_level(logging.DEBUG, logger="aiotruenas.domain.state"):
+                await state.get_pool()
+
+                server.responses["pool.query"] = None
+                for _ in range(3):
+                    await state.get_dataset()
+                    await state.get_pool()
+
+    state_records = [r for r in caplog.records if r.name == "aiotruenas.domain.state"]
+    warnings = [
+        r
+        for r in state_records
+        if r.levelno == logging.WARNING and "dataset" in r.getMessage()
+    ]
+    assert len(warnings) == 1
+    # get_pool() ran last (malformed 'pool.query'), so "dataset" must still
+    # be reported here too -- guards against the warning silently vanishing
+    # because the flag stopped being set at all, rather than because it is
+    # genuinely only warned-about once.
+    assert "dataset" in state.stale_endpoints
 
 
 @pytest.mark.parametrize("malformed_pool_query", [[None], [{}]])
@@ -244,7 +343,9 @@ async def test_get_pool_keeps_previous_snapshot_on_unusable_pool_entries(
     """A non-empty pool.query response containing no usable (guid-bearing)
     entries is just as untrustworthy as a null response: neither the dataset
     nor the pool cache may be updated from it. An empty list ([]) is exempt
-    -- that legitimately means "no pools left", not "malformed"."""
+    -- that legitimately means "no pools left", not "malformed". Both "pool"
+    and "dataset" must show up in stale_endpoints for the same reason as the
+    null-response case above."""
     async with FakeTrueNASServer(
         valid_api_key=API_KEY,
         responses={
@@ -266,6 +367,7 @@ async def test_get_pool_keeps_previous_snapshot_on_unusable_pool_entries(
     assert result is previous_pool
     assert state.ds["dataset"] is previous_dataset
     assert state.ds["pool"] is previous_pool
+    assert {"pool", "dataset"} <= state.stale_endpoints
 
 
 async def test_get_pool_logs_warning_when_pool_query_is_malformed(
@@ -273,7 +375,20 @@ async def test_get_pool_logs_warning_when_pool_query_is_malformed(
 ) -> None:
     """A malformed ``pool.query`` response must surface a warning and clear
     it again once the endpoint recovers -- otherwise the pool snapshot can
-    silently go stale with no trace anywhere.
+    silently go stale with no trace anywhere. The same warning also mentions
+    "dataset": this poll's freshly fetched ``pool.dataset.query`` result is
+    discarded along with the malformed ``pool.query`` result (never reaching
+    ``self._ds["dataset"]``), so that endpoint must be flagged stale too, not
+    just "pool" -- both clear again once ``pool.query`` recovers.
+
+    Runs the malformed response across *several consecutive* polls (rather
+    than just one) specifically to catch a regression where the warning
+    would otherwise fire on every single poll of a persistent outage
+    instead of once per failing transition: ``pool.dataset.query`` keeps
+    succeeding throughout, so ``_compute_dataset()``'s own outcome tracking
+    would otherwise flip "dataset" back to recovered and then immediately
+    back to failed again on every poll if the same key were (mis-)reused
+    for both signals.
     """
     async with FakeTrueNASServer(
         valid_api_key=API_KEY,
@@ -290,7 +405,8 @@ async def test_get_pool_logs_warning_when_pool_query_is_malformed(
                 await state.get_pool()
 
                 server.responses["pool.query"] = None
-                await state.get_pool()
+                for _ in range(4):
+                    await state.get_pool()
 
                 server.responses["pool.query"] = [_POOL_TANK]
                 await state.get_pool()
@@ -304,6 +420,7 @@ async def test_get_pool_logs_warning_when_pool_query_is_malformed(
     ]
     assert len(warnings) == 1
     assert "pool.query" in warnings[0].getMessage()
+    assert "dataset" in warnings[0].getMessage()
     assert len(recoveries) == 1
 
 
@@ -5531,6 +5648,369 @@ async def test_stale_endpoints_ignores_detect_version_malformed_system_info() ->
     assert state_module._KEY_SYSTEM_INFO not in state._fallback_failing
     assert "system_info" not in state.stale_endpoints
     assert state.stale_endpoints == frozenset()
+
+
+async def test_stale_endpoints_reports_dataset_then_recovers() -> None:
+    """``pool.dataset.query`` had no fallback tracking at all before -- a
+    malformed/failed response silently kept the previous dataset snapshot
+    with no signal anywhere. Gap #3 from PR #44's known-gaps list.
+    """
+    async with FakeTrueNASServer(
+        valid_api_key=API_KEY,
+        responses={"pool.dataset.query": [_ROOT_DATASET]},
+    ) as server:
+        async with make_client(server) as client:
+            await client.connect()
+            state = TrueNASState(client)
+            await state.get_dataset()
+            assert "dataset" not in state.stale_endpoints
+
+            server.responses["pool.dataset.query"] = None
+            await state.get_dataset()
+            assert "dataset" in state.stale_endpoints
+
+            server.responses["pool.dataset.query"] = [_ROOT_DATASET]
+            await state.get_dataset()
+            assert "dataset" not in state.stale_endpoints
+
+
+async def test_stale_endpoints_reports_pool_for_stale_dataset_capacity() -> None:
+    """A pool whose capacity is derived from its root dataset (see
+    ``_apply_pool_capacity()``) must flag ``"pool"`` stale when
+    ``pool.dataset.query`` falls back to cached data, even though
+    ``pool.query`` itself refreshed cleanly -- a field-level fallback
+    sourced from a different endpoint's RPC call.
+    """
+    async with FakeTrueNASServer(
+        valid_api_key=API_KEY,
+        responses={
+            "pool.dataset.query": [_ROOT_DATASET],
+            "pool.query": [_POOL_TANK],
+            "boot.get_state": _BOOT_POOL,
+        },
+    ) as server:
+        async with make_client(server) as client:
+            await client.connect()
+            state = TrueNASState(client)
+            await state.get_pool()
+            assert "pool" not in state.stale_endpoints
+
+            server.responses["pool.dataset.query"] = None
+            await state.get_pool()
+            assert "dataset" in state.stale_endpoints
+            assert "pool" in state.stale_endpoints
+            # pool.query's own fields are unaffected -- only the dependency
+            # key fired, not _KEY_POOL_QUERY itself.
+            import aiotruenas.domain.state as state_module
+
+            assert state._fallback_failing.get(state_module._KEY_POOL_QUERY) is not True
+
+            server.responses["pool.dataset.query"] = [_ROOT_DATASET]
+            await state.get_pool()
+            assert "pool" not in state.stale_endpoints
+            assert "dataset" not in state.stale_endpoints
+
+
+async def test_stale_endpoints_ignores_stale_dataset_without_root_dataset() -> None:
+    """A stale ``pool.dataset.query`` must not flag ``"pool"`` when no pool
+    in this refresh actually has a root dataset to depend on -- e.g. a
+    boot-pool-only system. Flagging it anyway would be a false positive:
+    the boot-pool's capacity always falls back to its own free/size, never
+    to dataset data.
+    """
+    async with FakeTrueNASServer(
+        valid_api_key=API_KEY,
+        responses={
+            "pool.dataset.query": None,
+            "pool.query": [],
+            "boot.get_state": _BOOT_POOL,
+        },
+    ) as server:
+        async with make_client(server) as client:
+            await client.connect()
+            state = TrueNASState(client)
+            await state.get_pool()
+
+    assert "dataset" in state.stale_endpoints
+    assert "pool" not in state.stale_endpoints
+
+
+async def test_add_boot_pool_keeps_previous_entry_on_malformed_response() -> None:
+    """A malformed/empty ``boot.get_state()`` response must not silently
+    drop the boot-pool from ``ds["pool"]`` -- the previously cached entry is
+    carried over instead, and ``"pool"`` is reported stale. Gap #2 from PR
+    #44's known-gaps list: this call site previously had no
+    ``_note_fallback_outcome()`` call at all, and dropped the entity
+    outright rather than keeping the last known snapshot like every other
+    primary RPC result in this module.
+    """
+    async with FakeTrueNASServer(
+        valid_api_key=API_KEY,
+        responses={
+            "pool.dataset.query": [_ROOT_DATASET],
+            "pool.query": [_POOL_TANK],
+            "boot.get_state": _BOOT_POOL,
+        },
+    ) as server:
+        async with make_client(server) as client:
+            await client.connect()
+            state = TrueNASState(client)
+            await state.get_pool()
+            assert "boot-pool" in state.ds["pool"]
+            previous_boot = state.ds["pool"]["boot-pool"]
+            assert "pool" not in state.stale_endpoints
+
+            server.responses["boot.get_state"] = None
+            result = await state.get_pool()
+            assert "boot-pool" in result
+            assert result["boot-pool"] == previous_boot
+            assert "pool" in state.stale_endpoints
+
+            server.responses["boot.get_state"] = _BOOT_POOL
+            await state.get_pool()
+            assert "pool" not in state.stale_endpoints
+
+
+async def test_add_boot_pool_treats_unhashable_guid_as_malformed() -> None:
+    """A ``boot.get_state()`` response whose (possibly name-derived) ``guid``
+    is unhashable (e.g. a list) must be treated the same as a malformed
+    response -- carrying over the previous boot-pool entry -- rather than
+    being stored in ``self._boot_pool_uid``, which would raise ``TypeError``
+    from ``dict.get()`` the next time a carry-over is attempted.
+    """
+    async with FakeTrueNASServer(
+        valid_api_key=API_KEY,
+        responses={
+            "pool.dataset.query": [_ROOT_DATASET],
+            "pool.query": [_POOL_TANK],
+            "boot.get_state": _BOOT_POOL,
+        },
+    ) as server:
+        async with make_client(server) as client:
+            await client.connect()
+            state = TrueNASState(client)
+            await state.get_pool()
+            previous_boot = state.ds["pool"]["boot-pool"]
+
+            server.responses["boot.get_state"] = {
+                **_BOOT_POOL,
+                "name": ["not", "hashable"],
+            }
+            result = await state.get_pool()
+            assert result["boot-pool"] == previous_boot
+            assert "pool" in state.stale_endpoints
+
+            # A second consecutive unhashable-guid response must still carry
+            # the same previous entry over -- self._boot_pool_uid must not
+            # have been corrupted by the first failed attempt.
+            result = await state.get_pool()
+            assert result["boot-pool"] == previous_boot
+
+            server.responses["boot.get_state"] = _BOOT_POOL
+            await state.get_pool()
+            assert "pool" not in state.stale_endpoints
+
+
+async def test_add_boot_pool_treats_none_guid_as_malformed() -> None:
+    """A ``boot.get_state()`` response with an explicit ``None`` "name" (and
+    thus a ``None``-derived ``guid``) must also be treated as malformed --
+    ``isinstance(None, Hashable)`` is ``True``, so a bare hashability check
+    alone would accept it, silently drop the boot-pool from ``ds["pool"]``,
+    report a false "recovered", and overwrite ``self._boot_pool_uid`` with
+    ``None``, permanently breaking every later carry-over attempt.
+    """
+    async with FakeTrueNASServer(
+        valid_api_key=API_KEY,
+        responses={
+            "pool.dataset.query": [_ROOT_DATASET],
+            "pool.query": [_POOL_TANK],
+            "boot.get_state": _BOOT_POOL,
+        },
+    ) as server:
+        async with make_client(server) as client:
+            await client.connect()
+            state = TrueNASState(client)
+            await state.get_pool()
+            previous_boot = state.ds["pool"]["boot-pool"]
+
+            server.responses["boot.get_state"] = {**_BOOT_POOL, "name": None}
+            result = await state.get_pool()
+            assert result["boot-pool"] == previous_boot
+            assert "pool" in state.stale_endpoints
+
+            server.responses["boot.get_state"] = _BOOT_POOL
+            result = await state.get_pool()
+            assert result["boot-pool"]["name"] == "boot-pool"
+            assert "pool" not in state.stale_endpoints
+
+
+async def test_add_boot_pool_does_not_flag_pool_stale_without_prior_entry() -> None:
+    """A malformed ``boot.get_state()`` response must not flag "pool" stale
+    when there is no previously cached boot-pool entry to carry over (e.g.
+    ``boot.get_state`` has never once succeeded) -- there is nothing stale
+    to report, matching ``stale_endpoints``'s "carried the corresponding
+    prior value over" contract and ``ups_stale_graphs``'s precedent that a
+    value which has never existed has nothing stale to report. Otherwise a
+    persistently failing ``boot.get_state`` would pin "pool" permanently
+    stale even while ``pool.query`` itself keeps refreshing cleanly.
+    """
+    async with FakeTrueNASServer(
+        valid_api_key=API_KEY,
+        responses={
+            "pool.dataset.query": [_ROOT_DATASET],
+            "pool.query": [_POOL_TANK],
+            "boot.get_state": None,
+        },
+    ) as server:
+        async with make_client(server) as client:
+            await client.connect()
+            state = TrueNASState(client)
+            result = await state.get_pool()
+            assert "boot-pool" not in result
+            assert "pool" not in state.stale_endpoints
+
+            result = await state.get_pool()
+            assert "boot-pool" not in result
+            assert "pool" not in state.stale_endpoints
+
+            server.responses["boot.get_state"] = _BOOT_POOL
+            result = await state.get_pool()
+            assert "boot-pool" in result
+            assert "pool" not in state.stale_endpoints
+
+
+async def test_stale_endpoints_reports_interface_then_recovers() -> None:
+    raw_interfaces = [
+        {"id": "eno1", "name": "eno1", "state": {"link_state": "LINK_STATE_UP"}}
+    ]
+    async with FakeTrueNASServer(
+        valid_api_key=API_KEY,
+        responses={"interface.query": raw_interfaces},
+    ) as server:
+        async with make_client(server) as client:
+            await client.connect()
+            state = TrueNASState(client)
+            await state.get_interface()
+            assert "interface" not in state.stale_endpoints
+
+            server.responses["interface.query"] = None
+            await state.get_interface()
+            assert "interface" in state.stale_endpoints
+
+            server.responses["interface.query"] = raw_interfaces
+            await state.get_interface()
+            assert "interface" not in state.stale_endpoints
+
+
+async def test_stale_endpoints_reports_scrub_then_recovers() -> None:
+    raw_scrubs = [{"id": 1, "pool_name": "tank", "enabled": True}]
+    async with FakeTrueNASServer(
+        valid_api_key=API_KEY,
+        responses={"pool.scrub.query": raw_scrubs},
+    ) as server:
+        async with make_client(server) as client:
+            await client.connect()
+            state = TrueNASState(client)
+            await state.get_scrub()
+            assert "scrub" not in state.stale_endpoints
+
+            server.responses["pool.scrub.query"] = None
+            await state.get_scrub()
+            assert "scrub" in state.stale_endpoints
+
+            server.responses["pool.scrub.query"] = raw_scrubs
+            await state.get_scrub()
+            assert "scrub" not in state.stale_endpoints
+
+
+async def test_stale_endpoints_reports_service_then_recovers() -> None:
+    raw_services = [
+        {"id": 1, "service": "cifs", "name": "SMB", "enable": True, "state": "RUNNING"}
+    ]
+    async with FakeTrueNASServer(
+        valid_api_key=API_KEY,
+        responses={"service.query": raw_services},
+    ) as server:
+        async with make_client(server) as client:
+            await client.connect()
+            state = TrueNASState(client)
+            await state.get_service()
+            assert "service" not in state.stale_endpoints
+
+            server.responses["service.query"] = None
+            await state.get_service()
+            assert "service" in state.stale_endpoints
+
+            server.responses["service.query"] = raw_services
+            await state.get_service()
+            assert "service" not in state.stale_endpoints
+
+
+@pytest.mark.parametrize("unusable_service_query", [[None], [{}]])
+async def test_stale_endpoints_reports_service_for_unusable_entries(
+    unusable_service_query: list[Any],
+) -> None:
+    """A non-empty ``service.query`` response containing no id-bearing
+    entries is just as untrustworthy as ``None``: ``parse_api()`` leaves the
+    cached snapshot untouched either way (its pruning guard only fires once
+    at least one entry resolves to a uid), so ``_note_primary_query_outcome``
+    must flag it too instead of reporting a false "fresh". An empty list
+    ([]) is exempt -- that legitimately means "no services left", covered by
+    ``test_stale_endpoints_reports_service_then_recovers``.
+    """
+    raw_services = [
+        {"id": 1, "service": "cifs", "name": "SMB", "enable": True, "state": "RUNNING"}
+    ]
+    async with FakeTrueNASServer(
+        valid_api_key=API_KEY,
+        responses={"service.query": raw_services},
+    ) as server:
+        async with make_client(server) as client:
+            await client.connect()
+            state = TrueNASState(client)
+            result = await state.get_service()
+            assert "service" not in state.stale_endpoints
+
+            server.responses["service.query"] = unusable_service_query
+            result2 = await state.get_service()
+            assert result2 == result
+            assert "service" in state.stale_endpoints
+
+            server.responses["service.query"] = raw_services
+            await state.get_service()
+            assert "service" not in state.stale_endpoints
+
+
+async def test_stale_endpoints_reports_vm_then_recovers() -> None:
+    raw_vms = [
+        {
+            "id": 1,
+            "name": "vm1",
+            "type": "KVM",
+            "vcpus": 2,
+            "memory": 2097152,
+            "autostart": True,
+            "description": "Debian",
+            "status": {"state": "RUNNING"},
+        }
+    ]
+    async with FakeTrueNASServer(
+        valid_api_key=API_KEY,
+        responses={"vm.query": raw_vms},
+    ) as server:
+        async with make_client(server) as client:
+            await client.connect()
+            state = TrueNASState(client)
+            await state.get_vm()
+            assert "vm" not in state.stale_endpoints
+
+            server.responses["vm.query"] = None
+            await state.get_vm()
+            assert "vm" in state.stale_endpoints
+
+            server.responses["vm.query"] = raw_vms
+            await state.get_vm()
+            assert "vm" not in state.stale_endpoints
 
 
 def test_stale_endpoints_fallback_keys_are_classified_exactly_once() -> None:
