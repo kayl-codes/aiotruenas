@@ -91,8 +91,10 @@ produced a reading has no field in the result at all, so a failure on it is not 
 Several other `get_*` methods return the previous cached snapshot (logging once) instead of raising
 when their *primary* RPC result cannot be freshly fetched: `get_smb()` and `get_ups()` swallow an
 actual RPC error this way, and all six of `get_smb()`, `get_pool()`, `get_directoryservices()`,
-`get_alerts()`, `get_systeminfo()`, `get_ups()` swallow a malformed/unusable payload.
-`state.stale_endpoints` is a `frozenset` of the `ds` endpoint names currently in that
+`get_alerts()`, `get_systeminfo()`, `get_ups()` swallow a malformed/unusable payload — though
+`get_systeminfo()` only treats a *non-dict* `system.info` response as malformed, so a
+structurally-empty `{}` response is accepted as-is (a known pre-existing gap; it will not show up in
+`stale_endpoints`). `state.stale_endpoints` is a `frozenset` of the `ds` endpoint names currently in that
 fell-back-to-cache state; the reachable names are `"pool"`, `"ups"`, `"system_info"`,
 `"directoryservices"`, `"alerts"`, `"smb"`. It is the coarse counterpart to the per-graph
 `*_stale_graphs` sets, meant for a consumer that marks an endpoint's entities unavailable when its

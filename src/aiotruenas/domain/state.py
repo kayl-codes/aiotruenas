@@ -563,9 +563,14 @@ class TrueNASState:
         ``entity-unavailable`` / ``log-when-unavailable`` quality-scale
         rules): the ``get_*`` methods for these endpoints do **not** raise
         when the primary RPC errors (``get_smb()`` / ``get_ups()``) or
-        returns a malformed payload (all six) -- they log once via
+        returns a malformed payload -- they log once via
         :meth:`_note_fallback_outcome` and return the previous snapshot -- so
         this property is the only signal that the data went stale.
+        ``get_systeminfo()`` is narrower here than the other five: it only
+        treats a *non-dict* ``system.info`` response as malformed, so a
+        structurally-empty ``{}`` response is accepted as-is and will not be
+        reflected in ``stale_endpoints`` -- a known pre-existing gap, not
+        introduced by this property.
 
         ``"arc"`` is deliberately absent: :meth:`get_arc` does not swallow a
         failure into a cached value -- a ``TrueNASError`` propagates to the
