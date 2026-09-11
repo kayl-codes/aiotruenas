@@ -110,7 +110,13 @@ fell-back-to-cache state; the reachable names are `"pool"`, `"dataset"`, `"ups"`
 coarse counterpart to the per-graph `*_stale_graphs` sets, meant for a consumer that marks an
 endpoint's entities unavailable when its data source stops being freshly reachable. It is a one-way
 signal — a name in the set really is stale, but a primary `get_*` that fails by *raising* is not
-listed (the caller sees that itself).
+listed (the caller sees that itself). `"dataset"` has one known exception to that one-way
+guarantee: a malformed `pool.query` response always (re-)flags `"dataset"` too, even if a direct
+`get_dataset()` call already republished a fully fresh dataset map earlier in the very same refresh
+cycle — a consumer that calls both every cycle (e.g. a coordinator's poll loop) would see
+`"dataset"` reported stale for the whole `pool.query` outage regardless, even though the data it
+points at is in fact current. This is a deliberate over-report, not a fixed defect: distinguishing
+the two cases would need its own cross-call tracking for a signal no current consumer reads yet.
 
 `"pool"` also covers a field-level dependency, not just `pool.query` itself: pool capacity
 (available/total/usage/size/allocated) is derived from the pool's root dataset, so when

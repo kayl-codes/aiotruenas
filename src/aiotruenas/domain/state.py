@@ -234,8 +234,35 @@ _KEY_POOL_CAPACITY_DATASET = "pool_capacity_dataset"
 # get_pool()'s early-return branch below would re-warn on every single poll
 # of a persistent 'pool.query' outage instead of once per transition,
 # breaking _note_fallback_outcome()'s "warn only on the failing transition"
-# contract. This key instead tracks, independently, whether get_pool()
-# itself actually published a freshly computed dataset map this poll.
+# contract. This key instead tracks whether "dataset" was actually
+# (re-)published this refresh -- by *either* get_pool() (whose early-return
+# branch sets it) or get_dataset() (which clears it on every call,
+# regardless of whether the underlying 'pool.dataset.query' itself
+# succeeded -- _KEY_DATASET_QUERY tracks that outcome separately -- since
+# get_dataset() is the only other call site that ever writes
+# self._ds["dataset"]).
+#
+# Both get_pool() and get_dataset() write self._fallback_failing[this key]
+# directly rather than through _note_fallback_outcome(): a real consumer
+# (e.g. a coordinator's poll loop) calls both every single poll, in a fixed
+# get_dataset()-then-get_pool() order, so this key's own value flips on
+# every poll of a persistent 'pool.query' outage regardless of whether the
+# underlying condition ever actually changes -- it is not a meaningful
+# "transition" to warn or recover-log on. The warning/recovery log lines
+# for this condition are instead driven entirely by _KEY_POOL_QUERY's own
+# transition (checked explicitly in get_pool()), which does reflect the
+# real, once-per-outage event.
+#
+# Known over-reporting tradeoff: get_pool()'s early-return branch sets this
+# key unconditionally, without checking whether a get_dataset() call already
+# republished "dataset" earlier in the same poll (the real coordinator order)
+# -- so "dataset" can show up in stale_endpoints for the whole 'pool.query'
+# outage even though the data it points at is, in fact, current. Accepted
+# rather than chased further: distinguishing "truly never republished" from
+# "republished moments ago by a sibling call" would need its own generation
+# counter across two call sites, for a signal no current consumer reads yet
+# (see stale_endpoints's own docstring for the equivalent, deliberate
+# get_systeminfo() gap).
 _KEY_DATASET_NOT_PUBLISHED = "dataset_not_published"
 # Prefix for get_ups()'s dynamic per-graph fallback keys (e.g.
 # "ups_graph:upscharge") -- a module-level constant rather than a fixed
@@ -604,6 +631,20 @@ class TrueNASState:
         boot.get_state that never once works would falsely mark every pool
         entity unavailable even while ``pool.query`` itself stays fresh.
 
+        ``"dataset"`` has one known exception to the one-way guarantee
+        above: a malformed ``pool.query`` response always (re-)flags
+        ``"dataset"`` too (see :meth:`get_pool`'s malformed-``pool.query``
+        branch, and ``_KEY_DATASET_NOT_PUBLISHED``'s own module-level
+        comment), even if a direct
+        :meth:`get_dataset` call already republished a fully fresh dataset
+        map earlier in the very same refresh cycle -- a real consumer
+        (e.g. a coordinator's poll loop) that calls both every cycle would
+        see ``"dataset"`` reported stale for the whole ``pool.query``
+        outage regardless, even though the data it points at is in fact
+        current. Distinguishing that case would need its own cross-call
+        tracking for a signal no current consumer reads yet, so it is left
+        as a deliberate over-report rather than a silent gap.
+
         Best-effort *enrichment* layered onto an otherwise-fresh primary
         result does **not** count: disk temperatures (``"disk"`` stays out --
         ``disk.query`` is the primary result and raises on a real failure),
@@ -671,6 +712,13 @@ class TrueNASState:
         """Refresh and return normalized ZFS datasets (``pool.dataset.query``)."""
         async with self._lock:
             self._ds["dataset"] = await self._compute_dataset()
+            # This call just published a dataset map directly, so any
+            # earlier _KEY_DATASET_NOT_PUBLISHED (set by get_pool()'s
+            # early-return branch) no longer applies -- cleared directly,
+            # bypassing _note_fallback_outcome()'s own log-on-transition
+            # tracking, for the reasons given at that key's own definition
+            # above.
+            self._fallback_failing.pop(_KEY_DATASET_NOT_PUBLISHED, None)
             return self._ds["dataset"]
 
     async def _compute_dataset(self) -> _EndpointMap:
@@ -708,11 +756,19 @@ class TrueNASState:
         which requires up-to-date dataset data.
 
         Both the dataset and pool maps are built up on local (deep-copied)
-        snapshots and only published to ``self._ds`` once every step --
-        including the fallible boot-pool lookup -- has succeeded, so a
-        failure partway through leaves the previous, fully-consistent
-        snapshot of both endpoints in place instead of a dataset/pool pair
-        that no longer agree with each other.
+        snapshots and only published to ``self._ds`` once the primary
+        ``pool.query`` step has succeeded, so a malformed response there
+        leaves the previous, fully-consistent snapshot of both endpoints in
+        place instead of a dataset/pool pair that no longer agree with each
+        other. The boot-pool lookup (``_add_boot_pool()``) is handled more
+        leniently: a malformed/empty ``boot.get_state()`` response there
+        does not block publishing -- if a previously cached boot-pool entry
+        exists, it carries that entry over instead (see
+        ``_add_boot_pool()``) and flags ``"pool"`` in ``stale_endpoints`` to
+        reflect the carry-over; if none exists yet (``boot.get_state`` has
+        never once succeeded), the boot-pool is simply left out and nothing
+        is flagged. Either way this method still publishes the resulting
+        snapshot normally.
         """
         async with self._lock:
             datasets = await self._compute_dataset()
@@ -732,38 +788,25 @@ class TrueNASState:
                 self._note_fallback_outcome(
                     _KEY_POOL_QUERY,
                     failed=True,
-                    warning="Malformed 'pool.query' response: %s",
-                    reason=raw_pools,
-                )
-                # self._ds["dataset"] is never reassigned below on this path,
-                # so "dataset" must be (re-)flagged stale here too, even if
-                # pool.dataset.query itself just succeeded above --
-                # _compute_dataset()'s own outcome tracking (_KEY_DATASET_
-                # QUERY) already assumed its freshly computed result would
-                # end up published, which doesn't hold once this early
-                # return discards it. A dedicated key (rather than reusing
-                # _KEY_DATASET_QUERY here) keeps this a once-per-transition
-                # warning even while pool.dataset.query itself keeps
-                # succeeding every poll -- see _KEY_DATASET_NOT_PUBLISHED's
-                # own comment for why.
-                self._note_fallback_outcome(
-                    _KEY_DATASET_NOT_PUBLISHED,
-                    failed=True,
                     warning=(
-                        "'dataset' not refreshed: preceding 'pool.query' "
-                        "response was malformed: %s"
+                        "Malformed 'pool.query' response: %s -- 'dataset' "
+                        "not refreshed either"
                     ),
                     reason=raw_pools,
                 )
+                # self._ds["dataset"] is never reassigned below on this path,
+                # so "dataset" must be (re-)flagged stale here too -- see
+                # _KEY_DATASET_NOT_PUBLISHED's own comment above for why
+                # this is written directly rather than through a second
+                # _note_fallback_outcome() call.
+                self._fallback_failing[_KEY_DATASET_NOT_PUBLISHED] = True
                 return self._ds["pool"]
             self._note_fallback_outcome(
-                _KEY_POOL_QUERY, failed=False, recovered="'pool.query' recovered"
-            )
-            self._note_fallback_outcome(
-                _KEY_DATASET_NOT_PUBLISHED,
+                _KEY_POOL_QUERY,
                 failed=False,
-                recovered="'dataset' publishing recovered after 'pool.query' recovery",
+                recovered="'pool.query' recovered; 'dataset' recovered with it",
             )
+            self._fallback_failing.pop(_KEY_DATASET_NOT_PUBLISHED, None)
 
             pools = parse_api(
                 data=copy.deepcopy(self._ds["pool"]),
