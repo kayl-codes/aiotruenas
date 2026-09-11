@@ -261,8 +261,8 @@ _KEY_POOL_CAPACITY_DATASET = "pool_capacity_dataset"
 # rather than chased further: distinguishing "truly never republished" from
 # "republished moments ago by a sibling call" would need its own generation
 # counter across two call sites, for a signal no current consumer reads yet
-# (see stale_endpoints's own docstring for the equivalent, deliberate
-# get_systeminfo() gap).
+# (see stale_endpoints's own docstring for the equivalent "dataset"
+# exception it documents).
 _KEY_DATASET_NOT_PUBLISHED = "dataset_not_published"
 # Prefix for get_ups()'s dynamic per-graph fallback keys (e.g.
 # "ups_graph:upscharge") -- a module-level constant rather than a fixed
@@ -676,11 +676,10 @@ class TrueNASState:
         returns a malformed payload -- they log once via
         :meth:`_note_fallback_outcome` and return the previous snapshot -- so
         this property is the only signal that the data went stale.
-        ``get_systeminfo()`` is narrower here than the other five: it only
-        treats a *non-dict* ``system.info`` response as malformed, so a
-        structurally-empty ``{}`` response is accepted as-is and will not be
-        reflected in ``stale_endpoints`` -- a known pre-existing gap, not
-        introduced by this property.
+        ``get_systeminfo()`` rejects a structurally-empty ``{}`` response
+        too, not just a non-dict one -- like ``get_smb()`` does on its own
+        flat-dict shape, though for a different structural reason (see
+        :meth:`get_systeminfo`'s own docstring).
 
         ``"arc"`` is deliberately absent: :meth:`get_arc` does not swallow a
         failure into a cached value -- a ``TrueNASError`` propagates to the
@@ -1414,6 +1413,12 @@ class TrueNASState:
         with a missing/unparsable ``version`` field both warn once (via
         ``_KEY_DETECT_VERSION``) and are retried on the next call, rather
         than silently defaulting ``get_container()`` to legacy behavior.
+        Unlike :meth:`get_systeminfo`, a structurally empty ``{}`` response
+        is *not* separately rejected here -- it already falls into the
+        missing-``version``-field case below (``raw.get("version")`` is
+        ``None``), which warns and returns ``(0, 0)`` just the same, so a
+        dedicated emptiness check would add nothing this method's own,
+        single field of interest doesn't already cover.
 
         Deliberately does **not** touch ``_KEY_SYSTEM_INFO`` -- the key
         ``get_systeminfo()`` uses for its own primary-refresh tracking, which
@@ -2366,14 +2371,24 @@ class TrueNASState:
         VM) and the parsed ``(major, minor)`` version, sparing
         ``get_container()``'s own ``_detect_version()`` a redundant
         ``system.info`` call once this has already run. A malformed
-        (non-dict) ``system.info`` response warns on its failing transition
-        regardless of whether a version is already cached -- not just before
-        the first successful poll -- under its own key (``_KEY_SYSTEM_INFO``,
-        deliberately *not* shared with ``_detect_version()``'s identical
+        ``system.info`` response -- not a dict at all, or a structurally
+        empty one (``{}``) -- warns on its failing transition regardless of
+        whether a version is already cached -- not just before the first
+        successful poll -- under its own key (``_KEY_SYSTEM_INFO``,
+        deliberately *not* shared with ``_detect_version()``'s own, narrower
         guard -- see that method's docstring for why), since a ``system.info``
         call going from valid to malformed mid-lifetime would otherwise leave
         every other endpoint (uptime, memory, hostname, ...) silently frozen
-        on stale data with no signal. A
+        on stale data with no signal. ``get_smb()`` likewise rejects a
+        ``{}`` response -- there as a side effect of requiring a
+        ``sessions`` list, here as an explicit emptiness check, since
+        ``system.info`` has no single mandatory field to key on instead. A
+        non-empty-but-still-partial response (missing individual fields) is
+        *not* treated as malformed here: it is still applied via
+        :func:`parse_api`, which resets each missing field to its own
+        ``_SYSTEMINFO_VALS`` default (e.g. ``"unknown"``/``0``) rather than
+        carrying the previous value over -- unlike a malformed response,
+        which leaves the entire previous snapshot untouched. A
         missing/unparsable ``version`` field within an otherwise-valid
         response warns once, while no version is yet cached (via
         ``_note_fallback_outcome()``, shared with ``_detect_version()``'s own
@@ -2392,7 +2407,14 @@ class TrueNASState:
         """
         async with self._lock:
             raw = await self._client.call(_SYSTEM_INFO_METHOD)
-            if not isinstance(raw, dict):
+            # A structurally empty dict ({}) is rejected alongside a
+            # non-dict response: unlike the five id-keyed endpoints, "system_
+            # info" has no id concept to check individual entries against, so
+            # emptiness of the top-level dict itself is the narrowest
+            # available signal (see this method's docstring for how this
+            # compares to get_smb()'s own flat-dict check). A non-empty dict
+            # missing individual fields falls through normally.
+            if not isinstance(raw, dict) or not raw:
                 self._note_fallback_outcome(
                     _KEY_SYSTEM_INFO,
                     failed=True,
