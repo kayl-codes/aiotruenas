@@ -405,7 +405,7 @@ async def test_falsy_empty_error_is_treated_as_success() -> None:
 
 
 async def test_explicit_small_call_timeout_is_not_replaced_by_default() -> None:
-    """A short explicit ``timeout=`` must be honored, not `or`-ed away.
+    """A falsy explicit ``timeout=`` (here: 0) must be honored, not `or`-ed away.
 
     Regression test: ``timeout or self._query_timeout`` would silently fall
     back to the (here: much larger) default for any falsy explicit value.
@@ -417,9 +417,9 @@ async def test_explicit_small_call_timeout_is_not_replaced_by_default() -> None:
     ) as server:
         async with make_client(server, query_timeout=30.0) as client:
             await client.connect()
-            with pytest.raises(TrueNASCallTimeoutError):
-                async with asyncio.timeout(2.0):
-                    await client.call("system.info", timeout=0.1)
+            async with asyncio.timeout(2.0):
+                with pytest.raises(TrueNASCallTimeoutError):
+                    await client.call("system.info", timeout=0)
 
 
 async def test_concurrent_connect_calls_do_not_race() -> None:
