@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import itertools
 import logging
 from datetime import UTC, datetime
 from typing import Any
@@ -625,6 +626,13 @@ async def test_ds_property_starts_empty_for_all_endpoints() -> None:
             "info": 0,
             "disk_issues": False,
             "uuids": [],
+            "notice": 0,
+            "error": 0,
+            "alert": 0,
+            "emergency": 0,
+            "unknown": 0,
+            "levels": [],
+            "highest_level": None,
         },
         "update": {
             "update_available": False,
@@ -1922,6 +1930,201 @@ async def test_get_alerts_logs_warning_across_both_failure_modes(
     assert len(warnings) == 1
     assert "alert.list" in warnings[0].getMessage()
     assert len(recoveries) == 1
+
+
+_ALL_ALERT_LEVELS = (
+    "INFO",
+    "NOTICE",
+    "WARNING",
+    "ERROR",
+    "CRITICAL",
+    "ALERT",
+    "EMERGENCY",
+)
+_ALERT_COUNTER_KEYS = (*(level.lower() for level in _ALL_ALERT_LEVELS), "unknown")
+_NEW_ALERT_KEYS = (
+    "notice",
+    "error",
+    "alert",
+    "emergency",
+    "unknown",
+    "levels",
+    "highest_level",
+)
+
+
+async def _fetch_alerts(raw_alerts: Any) -> dict[str, Any]:
+    async with FakeTrueNASServer(
+        valid_api_key=API_KEY,
+        responses={"alert.list": raw_alerts},
+    ) as server:
+        async with make_client(server) as client:
+            await client.connect()
+            return await TrueNASState(client).get_alerts()
+
+
+async def test_get_alerts_counts_every_truenas_level() -> None:
+    raw_alerts = [
+        {"uuid": f"u{i}", "level": level, "formatted": level}
+        for i, level in enumerate(_ALL_ALERT_LEVELS)
+    ]
+    # A second CRITICAL plus a dismissed EMERGENCY, which must not count.
+    raw_alerts.extend(
+        [
+            {"uuid": "c2", "level": "CRITICAL", "formatted": "c2"},
+            {"uuid": "d1", "level": "EMERGENCY", "formatted": "d1", "dismissed": True},
+        ]
+    )
+
+    result = await _fetch_alerts(raw_alerts)
+
+    assert result["count"] == 8
+    expected = {level.lower(): 1 for level in _ALL_ALERT_LEVELS} | {
+        "critical": 2,
+        "unknown": 0,
+    }
+    assert {key: result[key] for key in expected} == expected
+    assert result["highest_level"] == "EMERGENCY"
+
+
+@pytest.mark.parametrize(
+    ("levels", "expected_highest"),
+    [
+        # Every adjacent pair in both orders pins the full severity order.
+        *(
+            (pair, higher)
+            for lower, higher in itertools.pairwise(_ALL_ALERT_LEVELS)
+            for pair in ([lower, higher], [higher, lower])
+        ),
+        # Lexicographic max() would pick WARNING here.
+        (["WARNING", "ERROR", "NOTICE"], "ERROR"),
+    ],
+)
+async def test_get_alerts_highest_level_follows_truenas_severity_order(
+    levels: list[str], expected_highest: str
+) -> None:
+    raw_alerts = [{"uuid": f"u{i}", "level": lvl} for i, lvl in enumerate(levels)]
+
+    result = await _fetch_alerts(raw_alerts)
+
+    assert result["highest_level"] == expected_highest
+
+
+async def test_get_alerts_highest_level_none_without_active_alerts() -> None:
+    result = await _fetch_alerts([])
+    assert result["count"] == 0
+    assert result["highest_level"] is None
+    assert result["levels"] == []
+
+    only_dismissed = [{"uuid": "a1", "level": "EMERGENCY", "dismissed": True}]
+    result = await _fetch_alerts(only_dismissed)
+    assert result["count"] == 0
+    assert result["emergency"] == 0
+    assert result["highest_level"] is None
+    assert result["levels"] == []
+
+
+async def test_get_alerts_unknown_or_missing_level_never_outranks_known() -> None:
+    raw_alerts = [
+        {"uuid": "a1", "level": "BOGUS", "formatted": "bogus"},
+        {"uuid": "a2", "formatted": "missing"},
+        {"uuid": "a3", "level": ["CRITICAL"], "formatted": "unhashable"},
+        # Matching is exact, as for the pre-existing counters.
+        {"uuid": "a4", "level": "critical", "formatted": "lower-case"},
+        {"uuid": "a5", "level": "INFO", "formatted": "info"},
+    ]
+
+    result = await _fetch_alerts(raw_alerts)
+
+    assert result["count"] == 5
+    assert result["levels"] == ["UNKNOWN"] * 4 + ["INFO"]
+    assert result["highest_level"] == "INFO"
+    expected = dict.fromkeys(_ALERT_COUNTER_KEYS, 0) | {"info": 1, "unknown": 4}
+    assert {key: result[key] for key in expected} == expected
+
+
+async def test_get_alerts_highest_level_unknown_when_no_known_level() -> None:
+    result = await _fetch_alerts([{"uuid": "a1", "level": "bogus"}])
+
+    assert result["count"] == 1
+    assert result["levels"] == ["UNKNOWN"]
+    assert result["highest_level"] == "UNKNOWN"
+    assert result["unknown"] == 1
+
+
+async def test_get_alerts_level_counters_sum_to_count() -> None:
+    raw_alerts = [
+        {"uuid": "a1", "level": "INFO"},
+        {"uuid": "a2", "level": "WARNING"},
+        {"uuid": "a3", "level": "WARNING"},
+        {"uuid": "a4", "level": "ERROR"},
+        {"uuid": "a5", "level": "CRITICAL"},
+        {"uuid": "a6", "level": "EMERGENCY"},
+        {"uuid": "a7", "level": "BOGUS"},
+        {"uuid": "a8", "level": "ALERT", "dismissed": True},
+    ]
+
+    result = await _fetch_alerts(raw_alerts)
+
+    assert result["count"] == 7
+    assert result["unknown"] == 1
+    assert result["alert"] == 0
+    assert sum(result[key] for key in _ALERT_COUNTER_KEYS) == result["count"]
+
+
+async def test_get_alerts_levels_index_aligned_with_messages_and_uuids() -> None:
+    raw_alerts = [
+        {"uuid": "a1", "level": "WARNING", "formatted": "first"},
+        {
+            "uuid": "a2",
+            "level": "CRITICAL",
+            "formatted": "dismissed",
+            "dismissed": True,
+        },
+        {"level": "ERROR", "formatted": "no uuid"},
+        {"uuid": "a3", "level": "NOTICE"},
+        {"uuid": "a4", "level": "EMERGENCY", "formatted": "last"},
+    ]
+
+    result = await _fetch_alerts(raw_alerts)
+
+    assert result["uuids"] == ["a1", "a3", "a4"]
+    assert result["messages"] == ["first", "Unknown alert", "last"]
+    assert result["levels"] == ["WARNING", "NOTICE", "EMERGENCY"]
+    assert result["count"] == len(result["levels"])
+
+
+async def test_get_alerts_new_keys_present_on_fallback_paths() -> None:
+    """Before any successful poll the malformed/unusable fallback returns the
+    initial default, which must already carry the new keys; after a
+    successful poll the fallback keeps the previous level data.
+    """
+    async with FakeTrueNASServer(
+        valid_api_key=API_KEY,
+        responses={"alert.list": None},
+    ) as server:
+        async with make_client(server) as client:
+            await client.connect()
+            state = TrueNASState(client)
+
+            initial = await state.get_alerts()
+            server.responses["alert.list"] = [{}]
+            unusable = await state.get_alerts()
+
+            server.responses["alert.list"] = [{"uuid": "a1", "level": "ERROR"}]
+            await state.get_alerts()
+            server.responses["alert.list"] = None
+            kept = await state.get_alerts()
+
+    for result in (initial, unusable, kept):
+        assert sum(result[key] for key in _ALERT_COUNTER_KEYS) == result["count"]
+    for result in (initial, unusable):
+        assert all(key in result for key in _NEW_ALERT_KEYS)
+        assert result["highest_level"] is None
+        assert result["levels"] == []
+    assert kept["error"] == 1
+    assert kept["levels"] == ["ERROR"]
+    assert kept["highest_level"] == "ERROR"
 
 
 async def test_get_ups_keeps_previous_reading_when_discovery_raises() -> None:
