@@ -431,6 +431,69 @@ def _is_valid_pool_entry(entry: Any) -> bool:
     return get_uid(entry, "guid", None, None, None) is not None
 
 
+#: TrueNAS alert levels, ordered from least to most severe. Each one gets a
+#: lower-cased counter key in get_alerts() (e.g. "critical").
+_ALERT_LEVELS = (
+    "INFO",
+    "NOTICE",
+    "WARNING",
+    "ERROR",
+    "CRITICAL",
+    "ALERT",
+    "EMERGENCY",
+)
+_ALERT_LEVEL_RANK = {level: rank for rank, level in enumerate(_ALERT_LEVELS)}
+#: Stand-in for a missing/unrecognized alert level. Ranks below every known
+#: level, so it only becomes highest_level when no active alert has a known
+#: level -- keeping highest_level non-None whenever count > 0.
+_ALERT_LEVEL_UNKNOWN = "UNKNOWN"
+_DISK_ALERT_TERMS = ("disk", "pool", "smart")
+
+
+def _alert_level(alert: dict[str, Any]) -> str:
+    """Return the alert's level, or _ALERT_LEVEL_UNKNOWN if missing/unknown."""
+    level = alert.get("level")
+    if isinstance(level, str) and level in _ALERT_LEVEL_RANK:
+        return level
+    _LOGGER.debug(
+        "Unrecognized level %r on alert %s, treating as %s",
+        level,
+        alert.get("uuid"),
+        _ALERT_LEVEL_UNKNOWN,
+    )
+    return _ALERT_LEVEL_UNKNOWN
+
+
+def _is_disk_alert(alert: dict[str, Any]) -> bool:
+    """Heuristic: does the alert's klass/title mention disk/pool/smart?"""
+    klass = str(alert.get("klass", "")).lower()
+    title = str(alert.get("title", "")).lower()
+    return any(term in klass or term in title for term in _DISK_ALERT_TERMS)
+
+
+def _aggregate_alerts(active: list[dict[str, Any]]) -> _AlertsMap:
+    """Build the get_alerts() map from the active (non-dismissed) alerts.
+
+    ``messages``, ``uuids`` and ``levels`` are index-aligned: entry ``i`` of
+    each belongs to ``active[i]``.
+    """
+    levels = [_alert_level(alert) for alert in active]
+    result: _AlertsMap = {
+        "count": len(active),
+        "messages": [alert.get("formatted", "Unknown alert") for alert in active],
+    }
+    # Includes "unknown", so the per-level counters always sum to "count".
+    for level in (*_ALERT_LEVELS, _ALERT_LEVEL_UNKNOWN):
+        result[level.lower()] = levels.count(level)
+    result["disk_issues"] = any(_is_disk_alert(alert) for alert in active)
+    result["uuids"] = [alert.get("uuid") for alert in active]
+    result["levels"] = levels
+    result["highest_level"] = max(
+        levels, key=lambda level: _ALERT_LEVEL_RANK.get(level, -1), default=None
+    )
+    return result
+
+
 class TrueNASState:
     """Normalized TrueNAS domain state, refreshed one endpoint at a time.
 
@@ -462,15 +525,7 @@ class TrueNASState:
             "scrub": {},
             "arc": {},
             "ups": {},
-            "alerts": {
-                "count": 0,
-                "messages": [],
-                "critical": 0,
-                "warning": 0,
-                "info": 0,
-                "disk_issues": False,
-                "uuids": [],
-            },
+            "alerts": _aggregate_alerts([]),
             "update": self._no_update_pending(),
             "smb": {"connections": 0},
             "system_info": {
@@ -1767,10 +1822,15 @@ class TrueNASState:
 
         Unlike the other endpoints, this has no natural object id and is not
         run through ``parse_api()`` -- the entire result is derived by hand:
-        dismissed alerts are excluded, counts are aggregated by ``level``,
-        and ``disk_issues`` is a heuristic match on ``klass``/``title``
-        substrings (disk/pool/smart) flagging disk-related alerts
-        specifically.
+        dismissed alerts are excluded, counts are aggregated per TrueNAS
+        ``level`` (``info`` ... ``emergency``, plus ``unknown``, so they sum
+        to ``count``), ``levels`` lists each active
+        alert's level index-aligned with ``messages``/``uuids``,
+        ``highest_level`` is the most severe one (``None`` without active
+        alerts; a missing/unknown level reads as ``"UNKNOWN"`` and ranks
+        below every known level), and ``disk_issues`` is a heuristic match
+        on ``klass``/``title`` substrings (disk/pool/smart) flagging
+        disk-related alerts specifically.
         """
         async with self._lock:
             raw = await self._client.call("alert.list")
@@ -1804,28 +1864,7 @@ class TrueNASState:
             )
 
             active = [alert for alert in usable if not alert.get("dismissed", False)]
-
-            disk_issues = False
-            for alert in active:
-                klass = str(alert.get("klass", "")).lower()
-                title = str(alert.get("title", "")).lower()
-                if any(
-                    term in klass or term in title for term in ("disk", "pool", "smart")
-                ):
-                    disk_issues = True
-                    break
-
-            self._ds["alerts"] = {
-                "count": len(active),
-                "messages": [
-                    alert.get("formatted", "Unknown alert") for alert in active
-                ],
-                "critical": sum(alert.get("level") == "CRITICAL" for alert in active),
-                "warning": sum(alert.get("level") == "WARNING" for alert in active),
-                "info": sum(alert.get("level") == "INFO" for alert in active),
-                "disk_issues": disk_issues,
-                "uuids": [alert.get("uuid") for alert in active if alert.get("uuid")],
-            }
+            self._ds["alerts"] = _aggregate_alerts(active)
             return self._ds["alerts"]
 
     async def get_interface(self) -> _EndpointMap:
