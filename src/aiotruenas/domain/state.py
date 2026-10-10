@@ -42,6 +42,7 @@ from ._helpers import (
     _parse_version_tuple,
     _stable_uptime_epoch,
     _to_int,
+    _to_optional_int,
     _ups_value,
 )
 from ._normalize import get_uid, parse_api
@@ -431,6 +432,23 @@ def _is_valid_pool_entry(entry: Any) -> bool:
     return get_uid(entry, "guid", None, None, None) is not None
 
 
+#: Pool fields derived by _apply_pool_capacity(); all set to None together
+#: when the capacity is unknown. "free" (pool.query's raw figure) is included
+#: so a FAULTED pool can't keep reporting a stale or bogus free figure.
+_POOL_CAPACITY_KEYS = ("available", "total", "usage", "size", "allocated", "free")
+
+
+def _is_plausible_capacity(available: int, total: int, used: int | None) -> bool:
+    """Return True if the figures form a usable pool capacity: total > 0,
+    0 <= available <= total and (if known) used >= 0."""
+    return 0 < total and 0 <= available <= total and (used is None or used >= 0)
+
+
+def _sum_or_none(first: int | None, second: int | None) -> int | None:
+    """Return first + second, or None if either is None."""
+    return None if first is None or second is None else first + second
+
+
 #: TrueNAS alert levels, ordered from least to most severe. Each one gets a
 #: lower-cased counter key in get_alerts() (e.g. "critical").
 _ALERT_LEVELS = (
@@ -448,19 +466,40 @@ _ALERT_LEVEL_RANK = {level: rank for rank, level in enumerate(_ALERT_LEVELS)}
 #: level -- keeping highest_level non-None whenever count > 0.
 _ALERT_LEVEL_UNKNOWN = "UNKNOWN"
 _DISK_ALERT_TERMS = ("disk", "pool", "smart")
+#: repr() of every unrecognized alert level already warned about in this
+#: process, so a new TrueNAS level is reported once instead of on every poll.
+#: Keyed by repr() since the raw value may be unhashable (e.g. a list),
+#: truncated so a large malformed value can't bloat the set or the log.
+_WARNED_ALERT_LEVELS: set[str] = set()
+_ALERT_LEVEL_REPR_MAX = 100
 
 
 def _alert_level(alert: dict[str, Any]) -> str:
-    """Return the alert's level, or _ALERT_LEVEL_UNKNOWN if missing/unknown."""
+    """Return the alert's level, or _ALERT_LEVEL_UNKNOWN if missing/unknown.
+
+    The first occurrence of each unrecognized value per process is logged
+    as a WARNING; repeats only at DEBUG level.
+    """
     level = alert.get("level")
     if isinstance(level, str) and level in _ALERT_LEVEL_RANK:
         return level
-    _LOGGER.debug(
-        "Unrecognized level %r on alert %s, treating as %s",
-        level,
-        alert.get("uuid"),
-        _ALERT_LEVEL_UNKNOWN,
-    )
+    level_repr = repr(level)[:_ALERT_LEVEL_REPR_MAX]
+    if level_repr in _WARNED_ALERT_LEVELS:
+        _LOGGER.debug(
+            "Unrecognized level %s on alert %s, treating as %s",
+            level_repr,
+            alert.get("uuid"),
+            _ALERT_LEVEL_UNKNOWN,
+        )
+    else:
+        _WARNED_ALERT_LEVELS.add(level_repr)
+        _LOGGER.warning(
+            "Unrecognized TrueNAS alert level %s (alert %s), treating as %s; "
+            "please report this at https://github.com/kayl-codes/aiotruenas/issues",
+            level_repr,
+            alert.get("uuid"),
+            _ALERT_LEVEL_UNKNOWN,
+        )
     return _ALERT_LEVEL_UNKNOWN
 
 
@@ -1024,28 +1063,62 @@ class TrueNASState:
         the usable figures too, so they match the UI for parity layouts
         (raidz) instead of the raw pool.query capacity that counts parity
         disks.
-        """
-        # _to_int() also doubles as safety here: a malformed non-numeric
-        # value (str, list, dict, ...) would otherwise either raise from the
-        # arithmetic below or, worse, silently produce nonsense via string
-        # concatenation instead of addition.
-        if root_dataset:
-            available = _to_int(root_dataset.get("available"))
-            used = _to_int(root_dataset.get("used"))
-            total = available + used
-            pools[uid]["size"] = total
-            pools[uid]["allocated"] = used
-        else:
-            available = _to_int(vals.get("free"))
-            total = _to_int(vals.get("size")) or (
-                _to_int(vals.get("allocated")) + available
-            )
 
-        pools[uid]["available"] = available
-        pools[uid]["total"] = total
-        pools[uid]["usage"] = (
-            round((total - available) / total * 100) if total > 0 else 0
-        )
+        When the capacity is unknown or implausible -- available or total
+        missing/non-numeric, total <= 0 (e.g. a FAULTED/OFFLINE pool), a
+        negative figure, or available > total -- all of
+        available/total/usage/size/allocated/free are set to ``None`` rather
+        than 0, so a consumer can't mistake "no data" for a real reading
+        (implausible figures are logged at DEBUG level). An implausible root
+        dataset does not fall back to pool.query's figures: those count
+        parity and would silently change what the sensors mean.
+
+        Otherwise available/total/size/allocated are ``int`` and usage is an
+        ``int`` percentage. Without a root dataset, size is the total actually
+        used for the percentage and allocated is pool.query's own figure
+        (total - available when it reports none).
+        """
+        # _to_optional_int() also doubles as safety here: a malformed
+        # non-numeric value (str, list, dict, ...) would otherwise either
+        # raise from the arithmetic below or, worse, silently produce
+        # nonsense via string concatenation instead of addition.
+        used: int | None = None
+        if root_dataset:
+            available = _to_optional_int(root_dataset.get("available"))
+            used = _to_optional_int(root_dataset.get("used"))
+            total = _sum_or_none(available, used)
+        else:
+            available = _to_optional_int(vals.get("free"))
+            used = _to_optional_int(vals.get("allocated"))
+            size = _to_optional_int(vals.get("size"))
+            total = size if size is not None and size > 0 else None
+            if total is None:
+                total = _sum_or_none(used, available)
+
+        pool = pools[uid]
+        if (
+            available is None
+            or total is None
+            or not _is_plausible_capacity(available, total, used)
+        ):
+            if available is not None and total is not None:
+                _LOGGER.debug(
+                    "Implausible capacity for pool %s (available=%s, total=%s, "
+                    "used=%s), reporting it as unknown",
+                    uid,
+                    available,
+                    total,
+                    used,
+                )
+            for key in _POOL_CAPACITY_KEYS:
+                pool[key] = None
+            return
+
+        pool["size"] = total
+        pool["allocated"] = used if used is not None else total - available
+        pool["available"] = available
+        pool["total"] = total
+        pool["usage"] = round((total - available) / total * 100)
 
     def _apply_pool_errors(self, pools: _EndpointMap, raw_pools: Any) -> None:
         """Aggregate read/write/checksum errors from each pool's topology."""

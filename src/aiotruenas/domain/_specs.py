@@ -21,9 +21,12 @@ _POOL_VALS: list[ApiValueSpec] = [
     {"name": "status", "default": "unknown"},
     {"name": "healthy", "type": "bool", "default": False},
     {"name": "is_decrypted", "type": "bool", "default": False},
-    {"name": "size", "default": 0},
-    {"name": "allocated", "default": 0},
-    {"name": "free", "default": 0},
+    # None (not 0) when TrueNAS omits them, e.g. for a FAULTED/OFFLINE pool:
+    # a missing capacity must read as unknown, not as a real 0-byte reading
+    # (see TrueNASState._apply_pool_capacity()).
+    {"name": "size", "default": None},
+    {"name": "allocated", "default": None},
+    {"name": "free", "default": None},
     {"name": "fragmentation", "default": 0},
     {
         "name": "autotrim",
