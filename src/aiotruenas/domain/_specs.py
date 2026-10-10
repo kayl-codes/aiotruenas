@@ -132,8 +132,12 @@ _DATASET_VALS: list[ApiValueSpec] = [
     },
     {"name": "encrypted", "type": "bool", "default": False},
     {"name": "locked", "type": "bool", "default": False},
-    {"name": "used", "source": "used/parsed", "default": 0},
-    {"name": "available", "source": "available/parsed", "default": 0},
+    # None (not 0) when TrueNAS omits them: a pool's capacity is derived from
+    # its root dataset's used/available, so a missing field must read as
+    # unknown rather than as a real 0-byte reading (see
+    # TrueNASState._apply_pool_capacity()).
+    {"name": "used", "source": "used/parsed", "default": None},
+    {"name": "available", "source": "available/parsed", "default": None},
 ]
 
 # Job-progress fields shared by the cloudsync, replication and rsync queries.

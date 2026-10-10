@@ -501,6 +501,35 @@ async def test_get_pool_without_matching_dataset_falls_back_to_own_free_size() -
     assert other["allocated"] == 400
 
 
+@pytest.mark.parametrize("missing_field", ["used", "available"])
+async def test_get_pool_capacity_unknown_for_missing_dataset_capacity(
+    missing_field: str,
+) -> None:
+    """A root dataset omitting used or available must not have the missing
+    field defaulted to 0 -- that would fabricate a plausible 0%/100% reading
+    from the other field alone. The capacity is unknown (None) instead."""
+    partial_dataset = {
+        key: value for key, value in _ROOT_DATASET.items() if key != missing_field
+    }
+    async with FakeTrueNASServer(
+        valid_api_key=API_KEY,
+        responses={
+            "pool.dataset.query": [partial_dataset],
+            "pool.query": [_POOL_TANK],
+            "boot.get_state": {},
+        },
+    ) as server:
+        async with make_client(server) as client:
+            await client.connect()
+            state = TrueNASState(client)
+            result = await state.get_pool()
+            datasets = await state.get_dataset()
+
+    tank = result["111"]
+    assert {key: tank[key] for key in _POOL_CAPACITY_FIELDS} == _UNKNOWN_CAPACITY
+    assert datasets["tank"][missing_field] is None
+
+
 @pytest.mark.parametrize(
     "bad_fields",
     [
