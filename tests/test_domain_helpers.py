@@ -27,6 +27,7 @@ from aiotruenas.domain._helpers import (
     _stable_uptime_epoch,
     _stat_name_similar,
     _to_int,
+    _to_optional_int,
     _ups_value,
 )
 
@@ -103,6 +104,16 @@ def test_to_int_falls_back_to_default_on_invalid() -> None:
 def test_to_int_rejects_bool() -> None:
     assert _to_int(True, default=7) == 7
     assert _to_int(False, default=7) == 7
+
+
+@pytest.mark.parametrize(
+    ("value", "expected"),
+    [("48", 48), (12, 12), (0, 0), (None, None), ("x", None), (True, None)],
+)
+def test_to_optional_int_returns_none_instead_of_a_default(
+    value: object, expected: int | None
+) -> None:
+    assert _to_optional_int(value) == expected
 
 
 def test_to_int_falls_back_to_default_on_overflow() -> None:

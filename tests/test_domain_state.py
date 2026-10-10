@@ -12,6 +12,7 @@ import pytest
 from fake_server import FakeTrueNASServer
 
 from aiotruenas import TrueNASClient, TrueNASError, TrueNASState
+from aiotruenas.domain import state as state_module
 
 API_KEY = "1-valid-key"
 
@@ -40,9 +41,11 @@ _POOL_TANK = {
     "status": "ONLINE",
     "healthy": True,
     "is_decrypted": True,
-    "size": 999999,
-    "allocated": 400,
-    "free": 600,
+    # Raw pool-level figures count parity (raidz), so they exceed the root
+    # dataset's usable 400/600 but still reconcile: allocated + free == size.
+    "size": 1500,
+    "allocated": 600,
+    "free": 900,
     "fragmentation": "12",
     "autotrim": {"parsed": True},
     "scan": {
@@ -148,7 +151,7 @@ async def test_get_pool_derives_capacity_from_root_dataset() -> None:
     tank = result["111"]
     assert tank["name"] == "tank"
     # Root dataset's available/used (600/400) win over pool.query's raw
-    # size/allocated/free (999999/400/600) so figures match the WebUI.
+    # size/allocated/free (1500/600/900) so figures match the WebUI.
     assert tank["available"] == 600
     assert tank["total"] == 1000
     assert tank["size"] == 1000
@@ -473,8 +476,8 @@ async def test_get_pool_falls_back_to_own_free_size_for_unhashable_path_and_name
     pool = result["222"]
     # An unhashable path/name can't even be looked up against the dataset
     # maps: falls back to the pool's own free/size instead of crashing.
-    assert pool["available"] == 600
-    assert pool["total"] == 999999
+    assert pool["available"] == 900
+    assert pool["total"] == 1500
 
 
 async def test_get_pool_without_matching_dataset_falls_back_to_own_free_size() -> None:
@@ -495,20 +498,61 @@ async def test_get_pool_without_matching_dataset_falls_back_to_own_free_size() -
     other = result["111"]
     # No matching root dataset (mountpoint/name mismatch): falls back to the
     # pool's own free/size instead of being derived from a dataset.
-    assert other["available"] == 600
-    assert other["total"] == 999999
-    assert other["allocated"] == 400
+    assert other["available"] == 900
+    assert other["total"] == 1500
+    assert other["allocated"] == 600
 
 
-async def test_get_pool_falls_back_to_zero_for_non_numeric_dataset_capacity() -> None:
+@pytest.mark.parametrize("missing_field", ["used", "available"])
+async def test_get_pool_capacity_unknown_for_missing_dataset_capacity(
+    missing_field: str,
+) -> None:
+    """A root dataset omitting used or available must not have the missing
+    field defaulted to 0 -- that would fabricate a plausible 0%/100% reading
+    from the other field alone. The capacity is unknown (None) instead."""
+    partial_dataset = {
+        key: value for key, value in _ROOT_DATASET.items() if key != missing_field
+    }
+    async with FakeTrueNASServer(
+        valid_api_key=API_KEY,
+        responses={
+            "pool.dataset.query": [partial_dataset],
+            "pool.query": [_POOL_TANK],
+            "boot.get_state": {},
+        },
+    ) as server:
+        async with make_client(server) as client:
+            await client.connect()
+            state = TrueNASState(client)
+            result = await state.get_pool()
+            datasets = await state.get_dataset()
+
+    tank = result["111"]
+    assert {key: tank[key] for key in _POOL_CAPACITY_FIELDS} == _UNKNOWN_CAPACITY
+    assert datasets["tank"][missing_field] is None
+
+
+@pytest.mark.parametrize(
+    "bad_fields",
+    [
+        # One malformed field next to a valid one: a parser that turned the
+        # malformed value into 0 would yield a plausible 0%/100% reading here.
+        {"used": {"parsed": "not-a-number"}},
+        {"available": {"parsed": ["not", "a", "number"]}},
+        {
+            "used": {"parsed": "not-a-number"},
+            "available": {"parsed": ["not", "a", "number"]},
+        },
+    ],
+    ids=["used", "available", "both"],
+)
+async def test_get_pool_capacity_unknown_for_non_numeric_dataset_capacity(
+    bad_fields: dict[str, Any],
+) -> None:
     """A malformed (non-numeric) root-dataset available/used value must not
     crash capacity arithmetic with a TypeError, nor silently concatenate
-    strings instead of adding numbers."""
-    bad_dataset = {
-        **_ROOT_DATASET,
-        "used": {"parsed": "not-a-number"},
-        "available": {"parsed": ["not", "a", "number"]},
-    }
+    strings instead of adding numbers -- the capacity is unknown (None)."""
+    bad_dataset = {**_ROOT_DATASET, **bad_fields}
     async with FakeTrueNASServer(
         valid_api_key=API_KEY,
         responses={
@@ -523,23 +567,26 @@ async def test_get_pool_falls_back_to_zero_for_non_numeric_dataset_capacity() ->
             result = await state.get_pool()
 
     tank = result["111"]
-    assert tank["available"] == 0
-    assert tank["allocated"] == 0
-    assert tank["total"] == 0
-    assert tank["usage"] == 0
+    assert {key: tank[key] for key in _POOL_CAPACITY_FIELDS} == _UNKNOWN_CAPACITY
 
 
-async def test_get_pool_falls_back_to_zero_for_non_numeric_pool_capacity() -> None:
+@pytest.mark.parametrize(
+    "bad_fields",
+    [
+        # Only "free" malformed, with valid size/allocated: a parser that
+        # turned it into 0 would yield a plausible 100% reading here.
+        {"free": "not-a-number"},
+        {"free": "not-a-number", "size": None, "allocated": ["not", "a", "number"]},
+    ],
+    ids=["free", "all"],
+)
+async def test_get_pool_capacity_unknown_for_non_numeric_pool_capacity(
+    bad_fields: dict[str, Any],
+) -> None:
     """A malformed (non-numeric) pool free/size/allocated value must not
-    crash the no-matching-dataset capacity fallback."""
-    bad_pool = {
-        **_POOL_TANK,
-        "path": "/mnt/other",
-        "name": "other",
-        "free": "not-a-number",
-        "size": None,
-        "allocated": ["not", "a", "number"],
-    }
+    crash the no-matching-dataset capacity fallback -- the capacity is
+    unknown (None)."""
+    bad_pool = {**_POOL_TANK, "path": "/mnt/other", "name": "other", **bad_fields}
     async with FakeTrueNASServer(
         valid_api_key=API_KEY,
         responses={
@@ -554,8 +601,199 @@ async def test_get_pool_falls_back_to_zero_for_non_numeric_pool_capacity() -> No
             result = await state.get_pool()
 
     other = result["111"]
-    assert other["available"] == 0
-    assert other["total"] == 0
+    assert {key: other[key] for key in _POOL_CAPACITY_FIELDS} == _UNKNOWN_CAPACITY
+
+
+_POOL_CAPACITY_FIELDS = ("available", "total", "usage", "size", "allocated", "free")
+_UNKNOWN_CAPACITY = dict.fromkeys(_POOL_CAPACITY_FIELDS)
+#: Sentinel for _fetch_pool_without_root_dataset(): drop this field entirely.
+_MISSING = object()
+
+
+async def _fetch_pool_without_root_dataset(**pool_fields: Any) -> dict[str, Any]:
+    """get_pool() for a single pool with no matching root dataset, so its
+    capacity comes from its own free/size/allocated fields."""
+    pool = {**_POOL_TANK, "path": "/mnt/other", "name": "other", **pool_fields}
+    for key in [key for key, value in pool.items() if value is _MISSING]:
+        del pool[key]
+    async with FakeTrueNASServer(
+        valid_api_key=API_KEY,
+        responses={
+            "pool.dataset.query": [_ROOT_DATASET],
+            "pool.query": [pool],
+            "boot.get_state": {},
+        },
+    ) as server:
+        async with make_client(server) as client:
+            await client.connect()
+            result = await TrueNASState(client).get_pool()
+    return result["111"]
+
+
+async def test_get_pool_capacity_unknown_when_truenas_reports_none() -> None:
+    """A FAULTED/OFFLINE pool without any capacity fields must read as
+    unknown (None), not as a real 0-byte / 0 % reading."""
+    pool = await _fetch_pool_without_root_dataset(
+        status="FAULTED", free=_MISSING, size=_MISSING, allocated=_MISSING
+    )
+    assert {key: pool[key] for key in _POOL_CAPACITY_FIELDS} == _UNKNOWN_CAPACITY
+
+
+@pytest.mark.parametrize(
+    "fields",
+    [
+        {"size": 0, "allocated": 0, "free": 0},
+        {"size": None, "allocated": None, "free": None},
+        {"size": -100, "allocated": 0, "free": 0},
+        # A valid total but no free figure: usage can't be derived either --
+        # whether the key is null or absent altogether.
+        {"size": 1000, "allocated": 400, "free": None},
+        {"size": 1000, "allocated": 400, "free": _MISSING},
+        # Negative or impossible figures.
+        {"size": 1000, "allocated": 400, "free": -100},
+        {"size": 1000, "allocated": 0, "free": 5000},
+        {"size": 1000, "allocated": -5, "free": 750},
+        {"size": 1000, "allocated": 2000, "free": 500},
+    ],
+)
+async def test_get_pool_capacity_unknown_for_zero_or_missing_total(
+    fields: dict[str, Any],
+) -> None:
+    pool = await _fetch_pool_without_root_dataset(**fields)
+    assert {key: pool[key] for key in _POOL_CAPACITY_FIELDS} == _UNKNOWN_CAPACITY
+
+
+async def test_get_pool_capacity_unknown_for_empty_root_dataset_capacity() -> None:
+    empty_dataset = {
+        **_ROOT_DATASET,
+        "used": {"parsed": 0},
+        "available": {"parsed": 0},
+    }
+    async with FakeTrueNASServer(
+        valid_api_key=API_KEY,
+        responses={
+            "pool.dataset.query": [empty_dataset],
+            "pool.query": [_POOL_TANK],
+            "boot.get_state": {},
+        },
+    ) as server:
+        async with make_client(server) as client:
+            await client.connect()
+            result = await TrueNASState(client).get_pool()
+
+    tank = result["111"]
+    assert {key: tank[key] for key in _POOL_CAPACITY_FIELDS} == _UNKNOWN_CAPACITY
+
+
+async def test_get_pool_capacity_valid_figures_without_root_dataset() -> None:
+    """Valid own free/size figures are reported unchanged; a zero size
+    still falls back to allocated + free as before."""
+    pool = await _fetch_pool_without_root_dataset(size=1000, allocated=250, free=750)
+    assert {key: pool[key] for key in _POOL_CAPACITY_FIELDS} == {
+        "available": 750,
+        "total": 1000,
+        "usage": 25,
+        "size": 1000,
+        "allocated": 250,
+        "free": 750,
+    }
+
+    # A zero, negative or missing size still falls back to allocated + free,
+    # and size reports that total instead of the raw bogus value.
+    for size in (0, -100, _MISSING):
+        pool = await _fetch_pool_without_root_dataset(
+            size=size, allocated=250, free=750
+        )
+        assert pool["total"] == 1000
+        assert pool["size"] == 1000
+        assert pool["usage"] == 25
+
+
+async def test_get_pool_capacity_normalizes_figures_without_root_dataset() -> None:
+    """Numeric strings are parsed to int; a missing allocated is derived."""
+    pool = await _fetch_pool_without_root_dataset(
+        size="1000", allocated="250", free="750"
+    )
+    assert pool["size"] == 1000
+    assert pool["allocated"] == 250
+    assert pool["usage"] == 25
+
+    pool = await _fetch_pool_without_root_dataset(
+        size=1000, allocated=_MISSING, free=750
+    )
+    assert pool["allocated"] == 250
+    assert pool["usage"] == 25
+
+
+@pytest.mark.parametrize("allocated", [100, 400])
+async def test_get_pool_capacity_derives_allocated_when_figures_disagree(
+    allocated: int,
+) -> None:
+    """In-range figures that don't reconcile (allocated + free != size,
+    short of or over it) report allocated as size - free, consistent with
+    available/usage, rather than a contradictory pool.query figure."""
+    pool = await _fetch_pool_without_root_dataset(
+        size=1000, allocated=allocated, free=650
+    )
+    assert {key: pool[key] for key in _POOL_CAPACITY_FIELDS} == {
+        "available": 650,
+        "total": 1000,
+        "usage": 35,
+        "size": 1000,
+        "allocated": 350,
+        "free": 650,
+    }
+
+
+async def test_get_pool_capacity_full_pool_is_a_valid_reading() -> None:
+    """available == 0 with total > 0 is a real 100 % reading, not unknown."""
+    pool = await _fetch_pool_without_root_dataset(size=1000, allocated=1000, free=0)
+    assert pool["available"] == 0
+    assert pool["usage"] == 100
+
+    full_dataset = {
+        **_ROOT_DATASET,
+        "used": {"parsed": 1000},
+        "available": {"parsed": 0},
+    }
+    async with FakeTrueNASServer(
+        valid_api_key=API_KEY,
+        responses={
+            "pool.dataset.query": [full_dataset],
+            "pool.query": [_POOL_TANK],
+            "boot.get_state": {},
+        },
+    ) as server:
+        async with make_client(server) as client:
+            await client.connect()
+            result = await TrueNASState(client).get_pool()
+
+    tank = result["111"]
+    assert tank["available"] == 0
+    assert tank["total"] == 1000
+    assert tank["usage"] == 100
+
+
+async def test_get_pool_capacity_unknown_for_negative_root_dataset_used() -> None:
+    bad_dataset = {
+        **_ROOT_DATASET,
+        "used": {"parsed": -500},
+        "available": {"parsed": 600},
+    }
+    async with FakeTrueNASServer(
+        valid_api_key=API_KEY,
+        responses={
+            "pool.dataset.query": [bad_dataset],
+            "pool.query": [_POOL_TANK],
+            "boot.get_state": {},
+        },
+    ) as server:
+        async with make_client(server) as client:
+            await client.connect()
+            result = await TrueNASState(client).get_pool()
+
+    tank = result["111"]
+    assert {key: tank[key] for key in _POOL_CAPACITY_FIELDS} == _UNKNOWN_CAPACITY
 
 
 async def test_get_cloudsync_normalizes_job_status_and_progress() -> None:
@@ -2125,6 +2363,161 @@ async def test_get_alerts_new_keys_present_on_fallback_paths() -> None:
     assert kept["error"] == 1
     assert kept["levels"] == ["ERROR"]
     assert kept["highest_level"] == "ERROR"
+
+
+@pytest.fixture(autouse=True)
+def fresh_alert_level_warnings(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Isolate the process-wide "already warned" set per test, so no test's
+    log assertions depend on which unknown levels earlier tests used."""
+    monkeypatch.setattr(state_module, "_WARNED_ALERT_LEVELS", set())
+
+
+def _alert_level_warnings(caplog: pytest.LogCaptureFixture) -> list[str]:
+    return [
+        r.getMessage()
+        for r in caplog.records
+        if r.name == "aiotruenas.domain.state"
+        and r.levelno == logging.WARNING
+        and "Unrecognized TrueNAS alert level" in r.getMessage()
+    ]
+
+
+async def test_get_alerts_warns_once_per_unrecognized_level(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    async with FakeTrueNASServer(
+        valid_api_key=API_KEY,
+        responses={"alert.list": [{"uuid": "a1", "level": "SEVERE"}]},
+    ) as server:
+        async with make_client(server) as client:
+            await client.connect()
+            state = TrueNASState(client)
+            with caplog.at_level(logging.DEBUG, logger="aiotruenas.domain.state"):
+                await state.get_alerts()
+                await state.get_alerts()
+                server.responses["alert.list"] = [
+                    {"uuid": "a1", "level": "SEVERE"},
+                    {"uuid": "a2", "level": "SEVERE"},
+                    {"uuid": "a3", "level": ["unhashable"]},
+                ]
+                result = await state.get_alerts()
+
+    warnings = _alert_level_warnings(caplog)
+    assert len(warnings) == 2
+    assert "'SEVERE'" in warnings[0]
+    assert "please report" in warnings[0]
+    assert "['unhashable']" in warnings[1]
+    # Repeats are still visible at DEBUG level, just not as WARNING.
+    assert any(
+        r.levelno == logging.DEBUG and "'SEVERE'" in r.getMessage()
+        for r in caplog.records
+    )
+    # The mapping itself is unchanged.
+    assert result["levels"] == ["UNKNOWN"] * 3
+    assert result["unknown"] == 3
+
+
+async def test_get_alerts_known_levels_log_no_warning(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    raw_alerts = [
+        {"uuid": f"u{i}", "level": level} for i, level in enumerate(_ALL_ALERT_LEVELS)
+    ]
+    with caplog.at_level(logging.DEBUG, logger="aiotruenas.domain.state"):
+        await _fetch_alerts(raw_alerts)
+
+    # Neither a WARNING (of any wording) nor the DEBUG repeat line.
+    assert not [
+        r
+        for r in caplog.records
+        if r.name == "aiotruenas.domain.state"
+        and (r.levelno >= logging.WARNING or "Unrecognized" in r.getMessage())
+    ]
+
+
+async def test_get_alerts_truncates_huge_unrecognized_level(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """A huge malformed level can't bloat the warned-set or the log line."""
+    with caplog.at_level(logging.DEBUG, logger="aiotruenas.domain.state"):
+        await _fetch_alerts([{"uuid": "u1", "level": "X" * 5000}])
+
+    (warning,) = _alert_level_warnings(caplog)
+    assert "X" * 5000 not in warning
+    assert repr("X" * 5000)[: state_module._ALERT_LEVEL_REPR_MAX] in warning
+
+
+async def test_get_alerts_warns_for_levels_sharing_a_long_prefix(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """Dedup uses the full value, not the truncated log representation."""
+    prefix = "X" * 500
+    with caplog.at_level(logging.DEBUG, logger="aiotruenas.domain.state"):
+        await _fetch_alerts(
+            [
+                {"uuid": "u1", "level": f"{prefix}A"},
+                {"uuid": "u2", "level": f"{prefix}B"},
+            ]
+        )
+
+    assert len(_alert_level_warnings(caplog)) == 2
+
+
+async def test_get_alerts_warns_for_levels_with_colliding_hash(
+    caplog: pytest.LogCaptureFixture, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Dedup can't merge distinct levels whose built-in hash() collides."""
+    monkeypatch.setattr(state_module, "hash", lambda _value: 0, raising=False)
+    with caplog.at_level(logging.DEBUG, logger="aiotruenas.domain.state"):
+        await _fetch_alerts(
+            [{"uuid": "u1", "level": "BOGUS_A"}, {"uuid": "u2", "level": "BOGUS_B"}]
+        )
+
+    assert len(_alert_level_warnings(caplog)) == 2
+
+
+def test_alert_level_survives_unrepresentable_nesting(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """A level nested too deeply for repr() is UNKNOWN, not a RecursionError."""
+
+    class DeeplyNested:
+        # Stands in for a value nested past the interpreter's recursion
+        # limit; how deep that is varies by Python version and stack size.
+        def __repr__(self) -> str:
+            raise RecursionError
+
+    with caplog.at_level(logging.DEBUG, logger="aiotruenas.domain.state"):
+        result = state_module._alert_level({"uuid": "u1", "level": DeeplyNested()})
+
+    assert result == state_module._ALERT_LEVEL_UNKNOWN
+    warnings = _alert_level_warnings(caplog)
+    assert len(warnings) == 1
+    assert "<deeply nested DeeplyNested>" in warnings[0]
+
+
+async def test_get_alerts_caps_distinct_level_warnings(
+    caplog: pytest.LogCaptureFixture, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Beyond the cap, new unrecognized levels only log at DEBUG."""
+    monkeypatch.setattr(state_module, "_WARNED_ALERT_LEVELS_MAX", 2)
+    with caplog.at_level(logging.DEBUG, logger="aiotruenas.domain.state"):
+        result = await _fetch_alerts(
+            [{"uuid": f"u{i}", "level": f"BOGUS{i}"} for i in range(3)]
+        )
+
+    assert len(_alert_level_warnings(caplog)) == 2
+    assert len(state_module._WARNED_ALERT_LEVELS) == 2
+    assert result["unknown"] == 3
+    # Reaching the cap is announced once, so suppression isn't silent ...
+    capped = [r for r in caplog.records if "DEBUG level only" in r.getMessage()]
+    assert len(capped) == 1
+    assert capped[0].levelno == logging.WARNING
+    # ... and the value beyond the cap still shows up at DEBUG.
+    assert any(
+        r.levelno == logging.DEBUG and "'BOGUS2'" in r.getMessage()
+        for r in caplog.records
+    )
 
 
 async def test_get_ups_keeps_previous_reading_when_discovery_raises() -> None:

@@ -53,17 +53,26 @@ def _as_int(value: Any) -> int:
     return value if isinstance(value, int) and not isinstance(value, bool) else 0
 
 
+def _to_optional_int(value: Any) -> int | None:
+    """Parse value into an int (also from strings like "48"), else None.
+
+    Booleans are rejected (see ``_as_int``) rather than parsed to 0/1.
+    """
+    if isinstance(value, bool):
+        return None
+    try:
+        return int(value)
+    except (TypeError, ValueError, OverflowError):
+        return None
+
+
 def _to_int(value: Any, default: int = 0) -> int:
     """Parse value into an int (also from strings like "48"), else default.
 
     Booleans are rejected (see ``_as_int``) rather than parsed to 0/1.
     """
-    if isinstance(value, bool):
-        return default
-    try:
-        return int(value)
-    except (TypeError, ValueError, OverflowError):
-        return default
+    parsed = _to_optional_int(value)
+    return default if parsed is None else parsed
 
 
 def _is_finite_number(value: Any) -> bool:
