@@ -2441,6 +2441,19 @@ async def test_get_alerts_warns_for_levels_sharing_a_long_prefix(
     assert len(_alert_level_warnings(caplog)) == 2
 
 
+async def test_get_alerts_warns_for_levels_with_colliding_hash(
+    caplog: pytest.LogCaptureFixture, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Dedup can't merge distinct levels whose built-in hash() collides."""
+    monkeypatch.setattr(state_module, "hash", lambda _value: 0, raising=False)
+    with caplog.at_level(logging.DEBUG, logger="aiotruenas.domain.state"):
+        await _fetch_alerts(
+            [{"uuid": "u1", "level": "BOGUS_A"}, {"uuid": "u2", "level": "BOGUS_B"}]
+        )
+
+    assert len(_alert_level_warnings(caplog)) == 2
+
+
 def test_alert_level_survives_unrepresentable_nesting(
     caplog: pytest.LogCaptureFixture,
 ) -> None:

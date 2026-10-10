@@ -18,6 +18,7 @@ from __future__ import annotations
 
 import asyncio
 import copy
+import hashlib
 from collections.abc import Callable, Hashable, Mapping
 from datetime import UTC, datetime
 from logging import getLogger
@@ -468,13 +469,15 @@ _ALERT_LEVEL_RANK = {level: rank for rank, level in enumerate(_ALERT_LEVELS)}
 #: level -- keeping highest_level non-None whenever count > 0.
 _ALERT_LEVEL_UNKNOWN = "UNKNOWN"
 _DISK_ALERT_TERMS = ("disk", "pool", "smart")
-#: hash(repr()) of every unrecognized alert level already warned about in
-#: this process, so a new TrueNAS level is reported once instead of on every
-#: poll. Keyed by the full repr() (the raw value may be unhashable, e.g. a
-#: list) but stored as a hash, so a large malformed value can't bloat the set;
-#: capped so a stream of distinct malformed values can't grow it (or the
-#: WARNING volume) without bound -- beyond the cap, new values log at DEBUG.
-_WARNED_ALERT_LEVELS: set[int] = set()
+#: SHA-256 digest of the repr() of every unrecognized alert level already
+#: warned about in this process, so a new TrueNAS level is reported once
+#: instead of on every poll. Keyed by the full repr() (the raw value may be
+#: unhashable, e.g. a list) but stored as a fixed-size digest, so a large
+#: malformed value can't bloat the set and two distinct values can't collide
+#: the way a 64-bit hash() could; capped so a stream of distinct malformed
+#: values can't grow it (or the WARNING volume) without bound -- beyond the
+#: cap, new values log at DEBUG.
+_WARNED_ALERT_LEVELS: set[bytes] = set()
 _WARNED_ALERT_LEVELS_MAX = 64
 #: Longest level repr() put into a log line.
 _ALERT_LEVEL_REPR_MAX = 100
@@ -496,7 +499,7 @@ def _alert_level(alert: dict[str, Any]) -> str:
         # A pathologically nested value must not abort get_alerts().
         full_repr = f"<deeply nested {type(level).__name__}>"
     level_repr = full_repr[:_ALERT_LEVEL_REPR_MAX]
-    key = hash(full_repr)
+    key = hashlib.sha256(full_repr.encode("utf-8", "surrogatepass")).digest()
     if key in _WARNED_ALERT_LEVELS or (
         len(_WARNED_ALERT_LEVELS) >= _WARNED_ALERT_LEVELS_MAX
     ):
