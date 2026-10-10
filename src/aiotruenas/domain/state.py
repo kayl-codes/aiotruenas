@@ -452,6 +452,19 @@ def _sum_or_none(first: int | None, second: int | None) -> int | None:
     return None if first is None or second is None else first + second
 
 
+def _pool_query_capacity(
+    vals: dict[str, Any],
+) -> tuple[int | None, int | None, int | None]:
+    """Return (available, total, used) from pool.query's own free/size/
+    allocated figures; total falls back to allocated + free when size is
+    missing, non-numeric or <= 0."""
+    available = _to_optional_int(vals.get("free"))
+    used = _to_optional_int(vals.get("allocated"))
+    size = _to_optional_int(vals.get("size"))
+    total = size if size is not None and size > 0 else _sum_or_none(used, available)
+    return available, total, used
+
+
 #: TrueNAS alert levels, ordered from least to most severe. Each one gets a
 #: lower-cased counter key in get_alerts() (e.g. "critical").
 _ALERT_LEVELS = (
@@ -1100,7 +1113,8 @@ class TrueNASState:
         Otherwise available/total/size/allocated are ``int`` and usage is an
         ``int`` percentage. Without a root dataset, size is the total actually
         used for the percentage and allocated is pool.query's own figure
-        (total - available when it reports none).
+        (total - available when it reports none, or when its figures don't
+        reconcile, i.e. allocated + free != size).
         """
         # _to_optional_int() also doubles as safety here: a malformed
         # non-numeric value (str, list, dict, ...) would otherwise either
@@ -1112,12 +1126,7 @@ class TrueNASState:
             used = _to_optional_int(root_dataset.get("used"))
             total = _sum_or_none(available, used)
         else:
-            available = _to_optional_int(vals.get("free"))
-            used = _to_optional_int(vals.get("allocated"))
-            size = _to_optional_int(vals.get("size"))
-            total = size if size is not None and size > 0 else None
-            if total is None:
-                total = _sum_or_none(used, available)
+            available, total, used = _pool_query_capacity(vals)
 
         pool = pools[uid]
         if (
@@ -1138,6 +1147,19 @@ class TrueNASState:
                 pool[key] = None
             return
 
+        if used is not None and used + available != total:
+            # Only possible on the pool.query fallback (the root-dataset total
+            # is available + used by construction): derive allocated so it
+            # can't contradict available/usage instead of reporting both.
+            _LOGGER.debug(
+                "Inconsistent capacity for pool %s (allocated=%s + free=%s != "
+                "size=%s), deriving allocated from size - free",
+                uid,
+                used,
+                available,
+                total,
+            )
+            used = None
         pool["size"] = total
         pool["allocated"] = used if used is not None else total - available
         pool["available"] = available

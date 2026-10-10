@@ -41,9 +41,11 @@ _POOL_TANK = {
     "status": "ONLINE",
     "healthy": True,
     "is_decrypted": True,
-    "size": 999999,
-    "allocated": 400,
-    "free": 600,
+    # Raw pool-level figures count parity (raidz), so they exceed the root
+    # dataset's usable 400/600 but still reconcile: allocated + free == size.
+    "size": 1500,
+    "allocated": 600,
+    "free": 900,
     "fragmentation": "12",
     "autotrim": {"parsed": True},
     "scan": {
@@ -149,7 +151,7 @@ async def test_get_pool_derives_capacity_from_root_dataset() -> None:
     tank = result["111"]
     assert tank["name"] == "tank"
     # Root dataset's available/used (600/400) win over pool.query's raw
-    # size/allocated/free (999999/400/600) so figures match the WebUI.
+    # size/allocated/free (1500/600/900) so figures match the WebUI.
     assert tank["available"] == 600
     assert tank["total"] == 1000
     assert tank["size"] == 1000
@@ -474,8 +476,8 @@ async def test_get_pool_falls_back_to_own_free_size_for_unhashable_path_and_name
     pool = result["222"]
     # An unhashable path/name can't even be looked up against the dataset
     # maps: falls back to the pool's own free/size instead of crashing.
-    assert pool["available"] == 600
-    assert pool["total"] == 999999
+    assert pool["available"] == 900
+    assert pool["total"] == 1500
 
 
 async def test_get_pool_without_matching_dataset_falls_back_to_own_free_size() -> None:
@@ -496,9 +498,9 @@ async def test_get_pool_without_matching_dataset_falls_back_to_own_free_size() -
     other = result["111"]
     # No matching root dataset (mountpoint/name mismatch): falls back to the
     # pool's own free/size instead of being derived from a dataset.
-    assert other["available"] == 600
-    assert other["total"] == 999999
-    assert other["allocated"] == 400
+    assert other["available"] == 900
+    assert other["total"] == 1500
+    assert other["allocated"] == 600
 
 
 @pytest.mark.parametrize("missing_field", ["used", "available"])
@@ -721,6 +723,26 @@ async def test_get_pool_capacity_normalizes_figures_without_root_dataset() -> No
     )
     assert pool["allocated"] == 250
     assert pool["usage"] == 25
+
+
+@pytest.mark.parametrize("allocated", [100, 400])
+async def test_get_pool_capacity_derives_allocated_when_figures_disagree(
+    allocated: int,
+) -> None:
+    """In-range figures that don't reconcile (allocated + free != size,
+    short of or over it) report allocated as size - free, consistent with
+    available/usage, rather than a contradictory pool.query figure."""
+    pool = await _fetch_pool_without_root_dataset(
+        size=1000, allocated=allocated, free=650
+    )
+    assert {key: pool[key] for key in _POOL_CAPACITY_FIELDS} == {
+        "available": 650,
+        "total": 1000,
+        "usage": 35,
+        "size": 1000,
+        "allocated": 350,
+        "free": 650,
+    }
 
 
 async def test_get_pool_capacity_full_pool_is_a_valid_reading() -> None:
