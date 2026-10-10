@@ -839,7 +839,13 @@ class TrueNASState:
         return _FALLBACK_KEY_ENDPOINTS.get(key)
 
     async def get_dataset(self) -> _EndpointMap:
-        """Refresh and return normalized ZFS datasets (``pool.dataset.query``)."""
+        """Refresh and return normalized ZFS datasets (``pool.dataset.query``).
+
+        Each dataset's ``used`` and ``available`` are ``int`` byte counts, or
+        ``None`` when TrueNAS omits the field -- "unknown", never a stand-in
+        0 -- so consumers must check for ``None`` before doing arithmetic on
+        them (the same contract as get_pool()'s capacity fields).
+        """
         async with self._lock:
             self._ds["dataset"] = await self._compute_dataset()
             # This call just published a dataset map directly, so any
