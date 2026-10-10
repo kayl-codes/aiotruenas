@@ -442,7 +442,7 @@ def _is_plausible_capacity(available: int, total: int, used: int | None) -> bool
     """Return True if the figures form a usable pool capacity: total > 0,
     0 <= available <= total and (if known) 0 <= used <= total."""
     return (
-        0 < total and 0 <= available <= total and (used is None or 0 <= used <= total)
+        total > 0 and 0 <= available <= total and (used is None or 0 <= used <= total)
     )
 
 
@@ -490,7 +490,11 @@ def _alert_level(alert: dict[str, Any]) -> str:
     level = alert.get("level")
     if isinstance(level, str) and level in _ALERT_LEVEL_RANK:
         return level
-    full_repr = repr(level)
+    try:
+        full_repr = repr(level)
+    except RecursionError:
+        # A pathologically nested value must not abort get_alerts().
+        full_repr = f"<deeply nested {type(level).__name__}>"
     level_repr = full_repr[:_ALERT_LEVEL_REPR_MAX]
     key = hash(full_repr)
     if key in _WARNED_ALERT_LEVELS or (

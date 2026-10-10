@@ -501,15 +501,27 @@ async def test_get_pool_without_matching_dataset_falls_back_to_own_free_size() -
     assert other["allocated"] == 400
 
 
-async def test_get_pool_capacity_unknown_for_non_numeric_dataset_capacity() -> None:
+@pytest.mark.parametrize(
+    "bad_fields",
+    [
+        # One malformed field next to a valid one: a parser that turned the
+        # malformed value into 0 would yield a plausible 0%/100% reading here.
+        {"used": {"parsed": "not-a-number"}},
+        {"available": {"parsed": ["not", "a", "number"]}},
+        {
+            "used": {"parsed": "not-a-number"},
+            "available": {"parsed": ["not", "a", "number"]},
+        },
+    ],
+    ids=["used", "available", "both"],
+)
+async def test_get_pool_capacity_unknown_for_non_numeric_dataset_capacity(
+    bad_fields: dict[str, Any],
+) -> None:
     """A malformed (non-numeric) root-dataset available/used value must not
     crash capacity arithmetic with a TypeError, nor silently concatenate
     strings instead of adding numbers -- the capacity is unknown (None)."""
-    bad_dataset = {
-        **_ROOT_DATASET,
-        "used": {"parsed": "not-a-number"},
-        "available": {"parsed": ["not", "a", "number"]},
-    }
+    bad_dataset = {**_ROOT_DATASET, **bad_fields}
     async with FakeTrueNASServer(
         valid_api_key=API_KEY,
         responses={
@@ -527,18 +539,23 @@ async def test_get_pool_capacity_unknown_for_non_numeric_dataset_capacity() -> N
     assert {key: tank[key] for key in _POOL_CAPACITY_FIELDS} == _UNKNOWN_CAPACITY
 
 
-async def test_get_pool_capacity_unknown_for_non_numeric_pool_capacity() -> None:
+@pytest.mark.parametrize(
+    "bad_fields",
+    [
+        # Only "free" malformed, with valid size/allocated: a parser that
+        # turned it into 0 would yield a plausible 100% reading here.
+        {"free": "not-a-number"},
+        {"free": "not-a-number", "size": None, "allocated": ["not", "a", "number"]},
+    ],
+    ids=["free", "all"],
+)
+async def test_get_pool_capacity_unknown_for_non_numeric_pool_capacity(
+    bad_fields: dict[str, Any],
+) -> None:
     """A malformed (non-numeric) pool free/size/allocated value must not
     crash the no-matching-dataset capacity fallback -- the capacity is
     unknown (None)."""
-    bad_pool = {
-        **_POOL_TANK,
-        "path": "/mnt/other",
-        "name": "other",
-        "free": "not-a-number",
-        "size": None,
-        "allocated": ["not", "a", "number"],
-    }
+    bad_pool = {**_POOL_TANK, "path": "/mnt/other", "name": "other", **bad_fields}
     async with FakeTrueNASServer(
         valid_api_key=API_KEY,
         responses={
@@ -2393,6 +2410,26 @@ async def test_get_alerts_warns_for_levels_sharing_a_long_prefix(
         )
 
     assert len(_alert_level_warnings(caplog)) == 2
+
+
+def test_alert_level_survives_unrepresentable_nesting(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """A level nested too deeply for repr() is UNKNOWN, not a RecursionError."""
+
+    class DeeplyNested:
+        # Stands in for a value nested past the interpreter's recursion
+        # limit; how deep that is varies by Python version and stack size.
+        def __repr__(self) -> str:
+            raise RecursionError
+
+    with caplog.at_level(logging.DEBUG, logger="aiotruenas.domain.state"):
+        result = state_module._alert_level({"uuid": "u1", "level": DeeplyNested()})
+
+    assert result == state_module._ALERT_LEVEL_UNKNOWN
+    warnings = _alert_level_warnings(caplog)
+    assert len(warnings) == 1
+    assert "<deeply nested DeeplyNested>" in warnings[0]
 
 
 async def test_get_alerts_caps_distinct_level_warnings(
