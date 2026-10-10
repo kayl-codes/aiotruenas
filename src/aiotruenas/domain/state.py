@@ -440,8 +440,10 @@ _POOL_CAPACITY_KEYS = ("available", "total", "usage", "size", "allocated", "free
 
 def _is_plausible_capacity(available: int, total: int, used: int | None) -> bool:
     """Return True if the figures form a usable pool capacity: total > 0,
-    0 <= available <= total and (if known) used >= 0."""
-    return 0 < total and 0 <= available <= total and (used is None or used >= 0)
+    0 <= available <= total and (if known) 0 <= used <= total."""
+    return (
+        0 < total and 0 <= available <= total and (used is None or 0 <= used <= total)
+    )
 
 
 def _sum_or_none(first: int | None, second: int | None) -> int | None:
@@ -466,11 +468,15 @@ _ALERT_LEVEL_RANK = {level: rank for rank, level in enumerate(_ALERT_LEVELS)}
 #: level -- keeping highest_level non-None whenever count > 0.
 _ALERT_LEVEL_UNKNOWN = "UNKNOWN"
 _DISK_ALERT_TERMS = ("disk", "pool", "smart")
-#: repr() of every unrecognized alert level already warned about in this
-#: process, so a new TrueNAS level is reported once instead of on every poll.
-#: Keyed by repr() since the raw value may be unhashable (e.g. a list),
-#: truncated so a large malformed value can't bloat the set or the log.
-_WARNED_ALERT_LEVELS: set[str] = set()
+#: hash(repr()) of every unrecognized alert level already warned about in
+#: this process, so a new TrueNAS level is reported once instead of on every
+#: poll. Keyed by the full repr() (the raw value may be unhashable, e.g. a
+#: list) but stored as a hash, so a large malformed value can't bloat the set;
+#: capped so a stream of distinct malformed values can't grow it (or the
+#: WARNING volume) without bound -- beyond the cap, new values log at DEBUG.
+_WARNED_ALERT_LEVELS: set[int] = set()
+_WARNED_ALERT_LEVELS_MAX = 64
+#: Longest level repr() put into a log line.
 _ALERT_LEVEL_REPR_MAX = 100
 
 
@@ -478,13 +484,18 @@ def _alert_level(alert: dict[str, Any]) -> str:
     """Return the alert's level, or _ALERT_LEVEL_UNKNOWN if missing/unknown.
 
     The first occurrence of each unrecognized value per process is logged
-    as a WARNING; repeats only at DEBUG level.
+    as a WARNING (up to _WARNED_ALERT_LEVELS_MAX distinct values); repeats
+    only at DEBUG level.
     """
     level = alert.get("level")
     if isinstance(level, str) and level in _ALERT_LEVEL_RANK:
         return level
-    level_repr = repr(level)[:_ALERT_LEVEL_REPR_MAX]
-    if level_repr in _WARNED_ALERT_LEVELS:
+    full_repr = repr(level)
+    level_repr = full_repr[:_ALERT_LEVEL_REPR_MAX]
+    key = hash(full_repr)
+    if key in _WARNED_ALERT_LEVELS or (
+        len(_WARNED_ALERT_LEVELS) >= _WARNED_ALERT_LEVELS_MAX
+    ):
         _LOGGER.debug(
             "Unrecognized level %s on alert %s, treating as %s",
             level_repr,
@@ -492,7 +503,7 @@ def _alert_level(alert: dict[str, Any]) -> str:
             _ALERT_LEVEL_UNKNOWN,
         )
     else:
-        _WARNED_ALERT_LEVELS.add(level_repr)
+        _WARNED_ALERT_LEVELS.add(key)
         _LOGGER.warning(
             "Unrecognized TrueNAS alert level %s (alert %s), treating as %s; "
             "please report this at https://github.com/kayl-codes/aiotruenas/issues",
@@ -500,6 +511,12 @@ def _alert_level(alert: dict[str, Any]) -> str:
             alert.get("uuid"),
             _ALERT_LEVEL_UNKNOWN,
         )
+        if len(_WARNED_ALERT_LEVELS) >= _WARNED_ALERT_LEVELS_MAX:
+            _LOGGER.warning(
+                "Seen %d distinct unrecognized TrueNAS alert levels; further "
+                "new ones are logged at DEBUG level only",
+                _WARNED_ALERT_LEVELS_MAX,
+            )
     return _ALERT_LEVEL_UNKNOWN
 
 

@@ -605,6 +605,7 @@ async def test_get_pool_capacity_unknown_when_truenas_reports_none() -> None:
         {"size": 1000, "allocated": 400, "free": -100},
         {"size": 1000, "allocated": 0, "free": 5000},
         {"size": 1000, "allocated": -5, "free": 750},
+        {"size": 1000, "allocated": 2000, "free": 500},
     ],
 )
 async def test_get_pool_capacity_unknown_for_zero_or_missing_total(
@@ -2309,7 +2310,7 @@ def _alert_level_warnings(caplog: pytest.LogCaptureFixture) -> list[str]:
         for r in caplog.records
         if r.name == "aiotruenas.domain.state"
         and r.levelno == logging.WARNING
-        and "alert level" in r.getMessage()
+        and "Unrecognized TrueNAS alert level" in r.getMessage()
     ]
 
 
@@ -2357,8 +2358,13 @@ async def test_get_alerts_known_levels_log_no_warning(
     with caplog.at_level(logging.DEBUG, logger="aiotruenas.domain.state"):
         await _fetch_alerts(raw_alerts)
 
-    # Neither a WARNING nor the DEBUG repeat line for any known level.
-    assert not [r for r in caplog.records if "Unrecognized" in r.getMessage()]
+    # Neither a WARNING (of any wording) nor the DEBUG repeat line.
+    assert not [
+        r
+        for r in caplog.records
+        if r.name == "aiotruenas.domain.state"
+        and (r.levelno >= logging.WARNING or "Unrecognized" in r.getMessage())
+    ]
 
 
 async def test_get_alerts_truncates_huge_unrecognized_level(
@@ -2368,10 +2374,49 @@ async def test_get_alerts_truncates_huge_unrecognized_level(
     with caplog.at_level(logging.DEBUG, logger="aiotruenas.domain.state"):
         await _fetch_alerts([{"uuid": "u1", "level": "X" * 5000}])
 
-    (warned,) = state_module._WARNED_ALERT_LEVELS
-    assert len(warned) == state_module._ALERT_LEVEL_REPR_MAX
     (warning,) = _alert_level_warnings(caplog)
     assert "X" * 5000 not in warning
+    assert repr("X" * 5000)[: state_module._ALERT_LEVEL_REPR_MAX] in warning
+
+
+async def test_get_alerts_warns_for_levels_sharing_a_long_prefix(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """Dedup uses the full value, not the truncated log representation."""
+    prefix = "X" * 500
+    with caplog.at_level(logging.DEBUG, logger="aiotruenas.domain.state"):
+        await _fetch_alerts(
+            [
+                {"uuid": "u1", "level": f"{prefix}A"},
+                {"uuid": "u2", "level": f"{prefix}B"},
+            ]
+        )
+
+    assert len(_alert_level_warnings(caplog)) == 2
+
+
+async def test_get_alerts_caps_distinct_level_warnings(
+    caplog: pytest.LogCaptureFixture, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Beyond the cap, new unrecognized levels only log at DEBUG."""
+    monkeypatch.setattr(state_module, "_WARNED_ALERT_LEVELS_MAX", 2)
+    with caplog.at_level(logging.DEBUG, logger="aiotruenas.domain.state"):
+        result = await _fetch_alerts(
+            [{"uuid": f"u{i}", "level": f"BOGUS{i}"} for i in range(3)]
+        )
+
+    assert len(_alert_level_warnings(caplog)) == 2
+    assert len(state_module._WARNED_ALERT_LEVELS) == 2
+    assert result["unknown"] == 3
+    # Reaching the cap is announced once, so suppression isn't silent ...
+    capped = [r for r in caplog.records if "DEBUG level only" in r.getMessage()]
+    assert len(capped) == 1
+    assert capped[0].levelno == logging.WARNING
+    # ... and the value beyond the cap still shows up at DEBUG.
+    assert any(
+        r.levelno == logging.DEBUG and "'BOGUS2'" in r.getMessage()
+        for r in caplog.records
+    )
 
 
 async def test_get_ups_keeps_previous_reading_when_discovery_raises() -> None:
