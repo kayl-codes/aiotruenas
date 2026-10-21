@@ -460,8 +460,9 @@ async def test_get_system_stats_rejects_malformed_graph_items(
 ) -> None:
     graphs = dict(_GRAPHS)
     graphs[graph] = [*graphs[graph], item]
+    responses = {NETDATA: _netdata(graphs)}
     with pytest.raises(TrueNASMalformedResponseError, match=match) as excinfo:
-        await _run({NETDATA: _netdata(graphs)}, lambda s: s.get_system_stats())
+        await _run(responses, lambda s: s.get_system_stats())
     assert f"graph '{graph}'" in str(excinfo.value)
 
 
@@ -515,16 +516,18 @@ async def test_get_system_stats_memory_usage_percent(
 async def test_get_system_stats_raises_on_malformed_graph(graph: str) -> None:
     graphs = dict(_GRAPHS)
     graphs[graph] = {"not": "a list"}
+    responses = {NETDATA: _netdata(graphs)}
     with pytest.raises(TrueNASMalformedResponseError, match=f"graph '{graph}'"):
-        await _run({NETDATA: _netdata(graphs)}, lambda s: s.get_system_stats())
+        await _run(responses, lambda s: s.get_system_stats())
 
 
 @pytest.mark.parametrize("graph", ["cpu", "memory", "arcsize", "interface"])
 async def test_get_system_stats_propagates_graph_call_error(graph: str) -> None:
     graphs = dict(_GRAPHS)
     graphs[graph] = _CALL_ERROR
+    responses = {NETDATA: _netdata(graphs)}
     with pytest.raises(TrueNASCallError) as excinfo:
-        await _run({NETDATA: _netdata(graphs)}, lambda s: s.get_system_stats())
+        await _run(responses, lambda s: s.get_system_stats())
     assert f"while fetching netdata graph '{graph}'" in excinfo.value.__notes__
 
 
