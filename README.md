@@ -154,10 +154,10 @@ from aiotruenas import TrueNASClient, TrueNASSystem
 
 async with TrueNASClient("truenas.local", "1-abcdef...") as client:
     system = TrueNASSystem(client)
-    system_id = await system.get_system_id()          # str, "system.global.id"
-    info = await system.get_system_info()             # SystemInfo
+    system_id = await system.get_system_id()  # str, "system.global.id"
+    info = await system.get_system_info()  # SystemInfo
     interfaces = await system.get_network_interfaces()  # dict[str, NetworkInterface]
-    stats = await system.get_system_stats(info)       # SystemStats
+    stats = await system.get_system_stats(info)  # SystemStats
     if (eno1 := stats.interfaces.get("eno1")) is not None:
         print(info.boot_time, stats.cpu_usage_percent, eno1.rx_kbps)
 ```

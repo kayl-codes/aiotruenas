@@ -771,3 +771,96 @@ async def test_get_network_interfaces_skip_warning_is_bounded(
     await _run({"interface.query": payload}, lambda s: s.get_network_interfaces())
     (record,) = [r for r in caplog.records if r.name == "aiotruenas.system"]
     assert len(record.getMessage()) < 300
+
+
+async def test_get_system_info_negative_physmem_is_none() -> None:
+    result = await _run(
+        {"system.info": {"hostname": "nas", "physmem": -1}},
+        lambda s: s.get_system_info(),
+    )
+    assert result.physical_memory is None
+
+
+async def test_get_network_interfaces_negative_mtu_is_none() -> None:
+    result = await _run(
+        {"interface.query": [{"id": "eno1", "mtu": -1500}]},
+        lambda s: s.get_network_interfaces(),
+    )
+    assert result["eno1"].mtu is None
+
+
+async def test_get_system_stats_negative_rates_are_none() -> None:
+    graphs = dict(_GRAPHS)
+    graphs["cpu"] = [_graph(["cpu"], {"cpu": -0.5})]
+    graphs["cputemp"] = [_graph(["cpu0"], {"cpu0": -5.0})]
+    graphs["interface"] = [
+        _graph(["received", "sent"], {"received": -1.0, "sent": 2.0}, identifier="a")
+    ]
+    result = await _run({NETDATA: _netdata(graphs)}, lambda s: s.get_system_stats())
+    assert result.cpu_usage_percent is None
+    # Sub-zero temperatures are physically possible and passed through.
+    assert result.cpu_temperature == -5.0
+    assert result.interfaces == {"a": InterfaceTraffic(rx_kbps=None, tx_kbps=2.0)}
+
+
+async def test_get_system_stats_overflowing_raw_mean_is_none() -> None:
+    graphs = dict(_GRAPHS)
+    graphs["arcsize"] = [_raw_graph(["time", "size"], [[1, 1e308], [2, 1e308]])]
+    result = await _run({NETDATA: _netdata(graphs)}, lambda s: s.get_system_stats())
+    assert result.arc_size is None
+
+
+def test_system_stats_copies_interfaces() -> None:
+    source = {"eno1": InterfaceTraffic(rx_kbps=1.0, tx_kbps=2.0)}
+    stats = SystemStats(
+        cpu_usage_percent=None,
+        cpu_temperature=None,
+        memory_available=None,
+        memory_usage_percent=None,
+        arc_size=None,
+        interfaces=source,
+    )
+    source["eno2"] = InterfaceTraffic(rx_kbps=None, tx_kbps=None)
+    assert set(stats.interfaces) == {"eno1"}
+    with pytest.raises(TypeError):
+        stats.interfaces["eno3"] = source["eno2"]  # type: ignore[index]
+
+
+@pytest.mark.parametrize(("rx_name", "tx_name"), [("received", "sent"), ("rx", "tx")])
+async def test_get_system_stats_negative_tx_is_none(rx_name: str, tx_name: str) -> None:
+    graphs = dict(_GRAPHS)
+    graphs["interface"] = [
+        _graph([rx_name, tx_name], {rx_name: 1.0, tx_name: -2.0}, identifier="a"),
+        _graph([rx_name, tx_name], {rx_name: -1.0, tx_name: 0.0}, identifier="b"),
+    ]
+    result = await _run({NETDATA: _netdata(graphs)}, lambda s: s.get_system_stats())
+    assert result.interfaces == {
+        "a": InterfaceTraffic(rx_kbps=1.0, tx_kbps=None),
+        "b": InterfaceTraffic(rx_kbps=None, tx_kbps=0.0),
+    }
+
+
+async def test_get_system_stats_overflow_only_drops_affected_series() -> None:
+    graphs = dict(_GRAPHS)
+    graphs["interface"] = [
+        _raw_graph(
+            ["time", "received", "sent"],
+            [[1, 1e308, 5.0], [2, 1e308, 7.0]],
+            identifier="a",
+        )
+    ]
+    result = await _run({NETDATA: _netdata(graphs)}, lambda s: s.get_system_stats())
+    assert result.interfaces == {"a": InterfaceTraffic(rx_kbps=None, tx_kbps=6.0)}
+
+
+async def test_zero_counts_are_kept() -> None:
+    info = await _run(
+        {"system.info": {"hostname": "nas", "physmem": 0}},
+        lambda s: s.get_system_info(),
+    )
+    interfaces = await _run(
+        {"interface.query": [{"id": "lo", "mtu": 0}]},
+        lambda s: s.get_network_interfaces(),
+    )
+    assert info.physical_memory == 0
+    assert interfaces["lo"].mtu == 0

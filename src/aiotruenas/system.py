@@ -77,9 +77,11 @@ def _optional_str(value: object) -> str | None:
     return value if isinstance(value, str) and value.strip() else None
 
 
-def _optional_int(value: object) -> int | None:
-    """Return ``value`` if it is an int (not a bool), else ``None``."""
-    return value if isinstance(value, int) and not isinstance(value, bool) else None
+def _optional_count(value: object) -> int | None:
+    """Return ``value`` if it is a non-negative int (not a bool), else ``None``."""
+    if isinstance(value, bool) or not isinstance(value, int) or value < 0:
+        return None
+    return value
 
 
 def _finite_float(value: object) -> float | None:
@@ -130,7 +132,7 @@ def _parse_system_info(raw: Mapping[str, Any]) -> SystemInfo:
         manufacturer=manufacturer,
         product=product,
         serial=_optional_str(raw.get("system_serial")),
-        physical_memory=_optional_int(raw.get("physmem")),
+        physical_memory=_optional_count(raw.get("physmem")),
         boot_time=_parse_boot_time(raw.get("boottime")),
         uptime_seconds=_non_negative(_finite_float(raw.get("uptime_seconds"))),
         load_1m=load_1m,
@@ -156,7 +158,7 @@ def _parse_interface(entry: Mapping[str, Any]) -> NetworkInterface | None:
         id=interface_id,
         name=_optional_str(entry.get("name")),
         description=_optional_str(entry.get("description")),
-        mtu=_optional_int(entry.get("mtu")),
+        mtu=_optional_count(entry.get("mtu")),
         link_state=link_state,
         link_up=_LINK_UP_BY_STATE.get(link_state) if link_state else None,
         active_media_type=_optional_str(state.get("active_media_type")),
@@ -184,7 +186,9 @@ def _raw_series_means(data: object, legend: list[Any]) -> dict[str, float]:
             value = _finite_float(sample)
             if isinstance(name, str) and value is not None:
                 samples[name].append(value)
-    return {name: sum(values) / len(values) for name, values in samples.items()}
+    means = {name: sum(values) / len(values) for name, values in samples.items()}
+    # Individually finite samples can still overflow their sum.
+    return {name: mean for name, mean in means.items() if math.isfinite(mean)}
 
 
 def _series_means(item: object) -> dict[str, float]:
@@ -238,8 +242,8 @@ def _interface_traffic(graph_data: list[Any]) -> Mapping[str, InterfaceTraffic]:
             continue
         means = _series_means(item)
         traffic[identifier] = InterfaceTraffic(
-            rx_kbps=means.get("received", means.get("rx")),
-            tx_kbps=means.get("sent", means.get("tx")),
+            rx_kbps=_non_negative(means.get("received", means.get("rx"))),
+            tx_kbps=_non_negative(means.get("sent", means.get("tx"))),
         )
     return MappingProxyType(traffic)
 
@@ -367,7 +371,9 @@ class TrueNASSystem:
         )
         core_temperatures = _first_item_means(data.get(_GRAPH_CPUTEMP, [])).values()
         return SystemStats(
-            cpu_usage_percent=_first_item_means(data[_GRAPH_CPU]).get("cpu"),
+            cpu_usage_percent=_non_negative(
+                _first_item_means(data[_GRAPH_CPU]).get("cpu")
+            ),
             cpu_temperature=max(core_temperatures, default=None),
             memory_available=memory_available,
             memory_usage_percent=_memory_usage_percent(

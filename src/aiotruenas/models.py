@@ -13,6 +13,7 @@ from __future__ import annotations
 from collections.abc import Mapping
 from dataclasses import dataclass
 from datetime import datetime
+from types import MappingProxyType
 
 
 @dataclass(frozen=True, slots=True, kw_only=True)
@@ -82,5 +83,11 @@ class SystemStats:
     memory_usage_percent: float | None
     #: ZFS ARC size in bytes.
     arc_size: int | None
-    #: Throughput per interface, keyed by interface id (``NetworkInterface.id``).
+    #: Throughput per interface, keyed by interface id (``NetworkInterface.id``);
+    #: a read-only copy of whatever mapping was passed in.
     interfaces: Mapping[str, InterfaceTraffic]
+
+    def __post_init__(self) -> None:
+        # frozen=True blocks normal assignment; copy so the snapshot can't be
+        # changed through the caller's original dict either.
+        object.__setattr__(self, "interfaces", MappingProxyType(dict(self.interfaces)))
