@@ -751,3 +751,56 @@ async def test_subscriptions_cleared_after_server_disconnect() -> None:
         assert client._ws is None
         assert await client._get_subscription_queue(sub_id) is None
         assert not await client.is_subscribed(sub_id)
+
+
+async def test_cancel_while_awaiting_response_does_not_leak_pending_future() -> None:
+    """A cancelled call must unregister its future even if TrueNAS never replies.
+
+    Otherwise each cancellation (e.g. of a gather() over several calls) leaves
+    an entry in ``_pending_calls`` for as long as the connection stays open.
+    """
+    async with FakeTrueNASServer(
+        valid_api_key=API_KEY,
+        drop_response_for={"system.info"},
+        responses={"system.version": "25.04"},
+    ) as server:
+        async with make_client(server, query_timeout=30.0) as client:
+            await client.connect()
+            call_task = asyncio.ensure_future(client.call("system.info"))
+            # Cancel only once the request is on the server, i.e. while the
+            # call is awaiting its (never coming) response.
+            await asyncio.wait_for(server.request_seen["system.info"].wait(), 2)
+            assert len(client._pending_calls) == 1
+            call_task.cancel()
+            with pytest.raises(asyncio.CancelledError):
+                await call_task
+            assert client._pending_calls == {}
+            # The connection stays usable for later calls.
+            assert await client.call("system.version") == "25.04"
+            assert client.connected
+
+
+async def test_cancel_during_send_does_not_leak_pending_future(monkeypatch) -> None:
+    async with FakeTrueNASServer(
+        valid_api_key=API_KEY, responses={"system.version": "25.04"}
+    ) as server:
+        async with make_client(server) as client:
+            await client.connect()
+            real_send = client._ws.send
+            send_started = asyncio.Event()
+
+            async def hanging_send(message: str) -> None:
+                send_started.set()
+                await asyncio.Event().wait()
+
+            monkeypatch.setattr(client._ws, "send", hanging_send)
+            call_task = asyncio.ensure_future(client.call("system.info"))
+            await asyncio.wait_for(send_started.wait(), 2)
+            assert len(client._pending_calls) == 1
+            call_task.cancel()
+            with pytest.raises(asyncio.CancelledError):
+                await call_task
+            assert client._pending_calls == {}
+            assert not client._lock.locked()
+            monkeypatch.setattr(client._ws, "send", real_send)
+            assert await client.call("system.version") == "25.04"

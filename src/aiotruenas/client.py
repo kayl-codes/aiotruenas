@@ -490,6 +490,9 @@ class TrueNASClient:
                 await self._ws.send(json.dumps(payload))
             except (ConnectionClosed, OSError, WebSocketException) as exc:
                 send_error = exc
+            except asyncio.CancelledError:
+                self._pending_calls.pop(rpc_id, None)
+                raise
 
             if send_error is not None:
                 self._pending_calls.pop(rpc_id, None)
@@ -503,7 +506,6 @@ class TrueNASClient:
                 response = await future
         except TimeoutError as e:
             async with self._lock:
-                self._pending_calls.pop(rpc_id, None)
                 await self._close_websocket_locked()
             raise TrueNASCallTimeoutError(
                 f"timed out while waiting for response to {method!r}"
@@ -514,9 +516,14 @@ class TrueNASClient:
             WebSocketException,
         ) as exc:
             async with self._lock:
-                self._pending_calls.pop(rpc_id, None)
                 await self._close_websocket_locked()
             raise TrueNASConnectionClosedError(str(exc), phase="call") from exc
+        finally:
+            # Every exit unregisters the future -- including cancellation
+            # (e.g. a cancelled gather()) and a cancel while waiting for the
+            # lock above -- or it would linger until a reply that may never
+            # come. On success the reader has already popped it (no-op).
+            self._pending_calls.pop(rpc_id, None)
 
         if response.get(_KEY_ERROR):
             raise build_call_error(response[_KEY_ERROR])

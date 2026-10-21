@@ -8,8 +8,10 @@ through its success and failure paths without a real TrueNAS instance.
 
 from __future__ import annotations
 
+import asyncio
 import json
 import ssl
+from collections import defaultdict
 from collections.abc import Callable
 from dataclasses import dataclass, field
 from typing import Any
@@ -46,6 +48,11 @@ class FakeTrueNASServer:
     responses: dict[str, Any | Callable[[list], Any]] = field(default_factory=dict)
     job_states: dict[int, list[dict[str, Any]]] = field(default_factory=dict)
     drop_response_for: set[str] = field(default_factory=set)
+    #: Set once a request for that method has reached the server, for tests
+    #: that must not act before it did.
+    request_seen: defaultdict[str, asyncio.Event] = field(
+        default_factory=lambda: defaultdict(asyncio.Event), init=False
+    )
     close_on_method: set[str] = field(default_factory=set)
     close_before_login_response: bool = False
     ssl_context: ssl.SSLContext | None = None
@@ -145,6 +152,7 @@ class FakeTrueNASServer:
         method = message.get("method")
         rpc_id = message.get("id")
         params = message.get("params") or []
+        self.request_seen[method].set()
 
         if method == "auth.login_with_api_key":
             await self._handle_login(ws, rpc_id, params)
