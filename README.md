@@ -178,7 +178,8 @@ Semantics:
   placeholder like `0`, `"unknown"` or `False`.
 - Values keep TrueNAS's own units (bytes, seconds, kilobits/s, %, °C); no unit conversion.
 - RPC failures propagate as the usual `TrueNASError` subclasses; a response with the wrong
-  shape (e.g. a netdata graph item without `legend`, or an `interface` item without
+  shape (e.g. a netdata graph item with neither a `legend` list nor `aggregations.mean`, or an
+  `interface` item without
   `identifier`) raises `TrueNASMalformedResponseError`. Nothing is swallowed. The one
   exception: a JSON-RPC error for the optional `cputemp` graph (e.g. no temperature chart on that
   hardware) only leaves `cpu_temperature` as `None`.

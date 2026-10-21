@@ -204,6 +204,8 @@ async def test_get_system_info_wrong_loadavg_shape_is_none(loadavg: Any) -> None
         (None, "X11SCH-F", False),
         (None, None, None),
         ("", " ", None),
+        (" QEMU\t", None, True),
+        (None, " VirtualBox ", True),
     ],
 )
 async def test_get_system_info_is_virtual(
@@ -431,28 +433,30 @@ async def test_get_system_stats_missing_series_are_none() -> None:
 @pytest.mark.parametrize(
     ("graph", "item", "match"),
     [
-        ("interface", _graph(["received"], {"received": 1.0}), "without an identifier"),
+        ("interface", _graph(["received"], {"received": 1.0}), "has no identifier"),
         (
             "interface",
             _graph(["received"], {"received": 1.0}, identifier=""),
-            "without an identifier",
+            "has no identifier",
         ),
-        ("interface", "junk", "without a legend list"),
+        ("interface", "junk", "is not an object"),
         (
             "interface",
             _graph(["received"], {"received": 1.0}, identifier="  "),
-            "without an identifier",
+            "has no identifier",
         ),
         (
             "interface",
             _graph(["received"], {"received": 1.0}, identifier=5),
-            "without an identifier",
+            "has no identifier",
         ),
-        ("cputemp", {"legend": "cpu0"}, "without a legend list"),
-        ("cputemp", 42, "without a legend list"),
-        ("cpu", {"aggregations": {"mean": {"cpu": 1.0}}}, "without a legend list"),
-        ("memory", {"legend": "available"}, "without a legend list"),
-        ("arcsize", 42, "without a legend list"),
+        ("cputemp", {"legend": "cpu0"}, "has a non-list legend"),
+        ("cputemp", 42, "is not an object"),
+        ("cpu", {"legend": None}, "has a non-list legend"),
+        ("cpu", {"data": [[0, 5.0]]}, "neither a legend nor aggregations.mean"),
+        ("cputemp", {"aggregations": {}}, "neither a legend nor aggregations.mean"),
+        ("memory", {"legend": "available"}, "has a non-list legend"),
+        ("arcsize", 42, "is not an object"),
     ],
 )
 async def test_get_system_stats_rejects_malformed_graph_items(
@@ -839,6 +843,53 @@ async def test_get_system_info_negative_physmem_is_none() -> None:
         lambda s: s.get_system_info(),
     )
     assert result.physical_memory is None
+
+
+@pytest.mark.parametrize(
+    ("physmem", "expected"),
+    [(8000.0, 8000), (8000.5, None), (10**400, None), (float("inf"), None)],
+)
+async def test_get_system_info_physmem_whole_numbers_only(
+    physmem: Any, expected: int | None
+) -> None:
+    result = await _run(
+        {"system.info": {"hostname": "nas", "physmem": physmem}},
+        lambda s: s.get_system_info(),
+    )
+    assert result.physical_memory == expected
+    assert type(result.physical_memory) is type(expected)
+
+
+async def test_get_system_stats_items_without_legend_use_mean_keys() -> None:
+    graphs = dict(_GRAPHS)
+    graphs["cputemp"] = [{"aggregations": {"mean": {"core0": 40.0, "core1": 45.5}}}]
+    graphs["cpu"] = [{"aggregations": {"mean": {"cpu": 12.5, 7: 1.0}}, "data": [[1]]}]
+    graphs["memory"] = [
+        {"aggregations": {"mean": {"available": float("nan"), "time": 1.0}}}
+    ]
+    graphs["arcsize"] = [{"aggregations": {"mean": {"size": True}}}]
+    graphs["interface"] = [
+        {"identifier": "eno1", "aggregations": {"mean": {"received": 8.0, "tx": 2.0}}}
+    ]
+    result = await _run({NETDATA: _netdata(graphs)}, lambda s: s.get_system_stats())
+    assert result.cpu_temperature == 45.5
+    assert result.cpu_usage_percent == 12.5
+    assert result.memory_available is None
+    assert result.arc_size is None
+    assert result.interfaces == {"eno1": InterfaceTraffic(rx_kbps=8.0, tx_kbps=2.0)}
+
+
+@pytest.mark.parametrize(("mtu", "expected"), [(1500.0, 1500), (1500.5, None)])
+async def test_get_network_interfaces_mtu_whole_numbers_only(
+    mtu: Any, expected: int | None
+) -> None:
+    interfaces = await _run(
+        {"interface.query": [{"id": "eno1", "mtu": mtu}]},
+        lambda s: s.get_network_interfaces(),
+    )
+    result = interfaces["eno1"]
+    assert result.mtu == expected
+    assert type(result.mtu) is type(expected)
 
 
 async def test_get_network_interfaces_negative_mtu_is_none() -> None:

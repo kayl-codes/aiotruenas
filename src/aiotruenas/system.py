@@ -78,10 +78,15 @@ def _optional_str(value: object) -> str | None:
 
 
 def _optional_count(value: object) -> int | None:
-    """Return ``value`` if it is a non-negative int (not a bool), else ``None``."""
-    if isinstance(value, bool) or not isinstance(value, int) or value < 0:
+    """Return ``value`` as an int if it is a non-negative whole number.
+
+    Accepts an int or an integral float (not a bool); an int beyond float
+    range is rejected as corrupt rather than feeding a percentage.
+    """
+    number = _finite_float(value)
+    if number is None or number < 0 or not number.is_integer():
         return None
-    return value
+    return value if isinstance(value, int) else int(number)
 
 
 def _finite_float(value: object) -> float | None:
@@ -141,7 +146,9 @@ def _parse_system_info(raw: Mapping[str, Any]) -> SystemInfo:
         is_virtual=(
             None
             if manufacturer is None and product is None
-            else _is_virtual_machine(manufacturer, product)
+            else _is_virtual_machine(
+                manufacturer and manufacturer.strip(), product and product.strip()
+            )
         ),
     )
 
@@ -199,12 +206,17 @@ def _series_means(item: Mapping[str, Any]) -> dict[str, float]:
     ``aggregations.mean``; falls back to the raw ``data`` points for a series
     it lacks -- TrueNAS's netdata backend returns empty aggregations for an
     all-zero series, which would otherwise turn a real 0 into ``None``.
+    Without a legend the series are the ``aggregations.mean`` keys and there
+    is no raw fallback (raw points cannot be attributed to series).
     """
+    mean = _aggregated_means(item)
+    if "legend" not in item:
+        return {
+            name: value
+            for name, value in ((n, _finite_float(v)) for n, v in mean.items())
+            if isinstance(name, str) and name != _TIME_SERIES and value is not None
+        }
     legend: list[Any] = item["legend"]
-    aggregations = item.get("aggregations")
-    mean = aggregations.get("mean") if isinstance(aggregations, Mapping) else None
-    if not isinstance(mean, Mapping):
-        mean = {}
     raw_means: dict[str, float] | None = None
     means: dict[str, float] = {}
     for name in legend:
@@ -252,24 +264,38 @@ def _first_rate(means: Mapping[str, float], *names: str) -> float | None:
     )
 
 
+def _aggregated_means(item: Mapping[str, Any]) -> Mapping[Any, Any]:
+    aggregations = item.get("aggregations")
+    mean = aggregations.get("mean") if isinstance(aggregations, Mapping) else None
+    return mean if isinstance(mean, Mapping) else {}
+
+
+def _item_shape_error(graph: str, item: object) -> str | None:
+    if not isinstance(item, Mapping):
+        return "is not an object"
+    if "legend" in item:
+        if not isinstance(item["legend"], list):
+            return "has a non-list legend"
+    elif not _aggregated_means(item):
+        return "has neither a legend nor aggregations.mean"
+    if graph == _GRAPH_INTERFACE and _optional_str(item.get("identifier")) is None:
+        return "has no identifier"
+    return None
+
+
 def _graph_shape_error(graph: str, graph_data: object) -> str | None:
     """Describe why a netdata graph response is malformed, or ``None`` if not.
 
-    The response must be a list of objects, each with a ``legend`` list;
-    ``interface`` items also need a string ``identifier``. An empty list (no
-    data in the window) is fine and yields ``None`` readings.
+    The response must be a list of objects with a ``legend`` list or, failing
+    that, a non-empty ``aggregations.mean``; ``interface`` items also need a
+    string ``identifier``. An empty list (no data in the window) is fine and
+    yields ``None`` readings.
     """
     if not isinstance(graph_data, list):
         return f"expected a list for graph '{graph}': {graph_data!r:.{_LOG_REPR_MAX}}"
     for item in graph_data:
-        if not isinstance(item, Mapping) or not isinstance(item.get("legend"), list):
-            return (
-                f"graph '{graph}' item without a legend list: {item!r:.{_LOG_REPR_MAX}}"
-            )
-        if graph == _GRAPH_INTERFACE and _optional_str(item.get("identifier")) is None:
-            return (
-                f"graph '{graph}' item without an identifier: {item!r:.{_LOG_REPR_MAX}}"
-            )
+        if (problem := _item_shape_error(graph, item)) is not None:
+            return f"graph '{graph}' item {problem}: {item!r:.{_LOG_REPR_MAX}}"
     return None
 
 
