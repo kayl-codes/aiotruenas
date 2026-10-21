@@ -191,18 +191,15 @@ def _raw_series_means(data: object, legend: list[Any]) -> dict[str, float]:
     return {name: mean for name, mean in means.items() if math.isfinite(mean)}
 
 
-def _series_means(item: object) -> dict[str, float]:
+def _series_means(item: Mapping[str, Any]) -> dict[str, float]:
     """Return one netdata graph item's mean per legend series.
 
-    Prefers ``aggregations.mean``; falls back to the raw ``data`` points for a
-    series it lacks -- TrueNAS's netdata backend returns empty aggregations
-    for an all-zero series, which would otherwise turn a real 0 into ``None``.
+    ``item`` has passed :func:`_graph_shape_error`. Prefers
+    ``aggregations.mean``; falls back to the raw ``data`` points for a series
+    it lacks -- TrueNAS's netdata backend returns empty aggregations for an
+    all-zero series, which would otherwise turn a real 0 into ``None``.
     """
-    if not isinstance(item, Mapping):
-        return {}
-    legend = item.get("legend")
-    if not isinstance(legend, list):
-        return {}
+    legend: list[Any] = item["legend"]
     aggregations = item.get("aggregations")
     mean = aggregations.get("mean") if isinstance(aggregations, Mapping) else None
     if not isinstance(mean, Mapping):
@@ -234,18 +231,45 @@ def _interface_traffic(graph_data: list[Any]) -> Mapping[str, InterfaceTraffic]:
     """
     traffic: dict[str, InterfaceTraffic] = {}
     for item in graph_data:
-        identifier = (
-            _optional_str(item.get("identifier")) if isinstance(item, Mapping) else None
-        )
-        if identifier is None:
-            _LOGGER.debug("Ignoring interface graph item without identifier")
-            continue
         means = _series_means(item)
-        traffic[identifier] = InterfaceTraffic(
-            rx_kbps=_non_negative(means.get("received", means.get("rx"))),
-            tx_kbps=_non_negative(means.get("sent", means.get("tx"))),
+        traffic[item["identifier"]] = InterfaceTraffic(
+            rx_kbps=_first_rate(means, "received", "rx"),
+            tx_kbps=_first_rate(means, "sent", "tx"),
         )
     return MappingProxyType(traffic)
+
+
+def _first_rate(means: Mapping[str, float], *names: str) -> float | None:
+    """Return the first usable (non-negative) reading among ``names``."""
+    return next(
+        (
+            rate
+            for name in names
+            if (rate := _non_negative(means.get(name))) is not None
+        ),
+        None,
+    )
+
+
+def _graph_shape_error(graph: str, graph_data: object) -> str | None:
+    """Describe why a netdata graph response is malformed, or ``None`` if not.
+
+    The response must be a list of objects, each with a ``legend`` list;
+    ``interface`` items also need a string ``identifier``. An empty list (no
+    data in the window) is fine and yields ``None`` readings.
+    """
+    if not isinstance(graph_data, list):
+        return f"expected a list for graph '{graph}': {graph_data!r:.{_LOG_REPR_MAX}}"
+    for item in graph_data:
+        if not isinstance(item, Mapping) or not isinstance(item.get("legend"), list):
+            return (
+                f"graph '{graph}' item without a legend list: {item!r:.{_LOG_REPR_MAX}}"
+            )
+        if graph == _GRAPH_INTERFACE and _optional_str(item.get("identifier")) is None:
+            return (
+                f"graph '{graph}' item without an identifier: {item!r:.{_LOG_REPR_MAX}}"
+            )
+    return None
 
 
 def _memory_usage_percent(total: int | None, available: int | None) -> float | None:
@@ -357,9 +381,11 @@ class TrueNASSystem:
         is preferred over the connection-closed errors a timeout triggers in
         the other in-flight calls). The one exception is ``cputemp``: a
         JSON-RPC error for it (e.g. no temperature chart on that hardware)
-        only leaves ``cpu_temperature`` ``None``. A graph response that is not
-        a list raises :class:`~aiotruenas.exceptions.TrueNASMalformedResponseError`;
-        one that answers but lacks a series yields ``None`` for that field.
+        only leaves ``cpu_temperature`` ``None``. A graph response of the wrong
+        shape (not a list of items with a ``legend`` list, or an ``interface``
+        item without ``identifier``) raises
+        :class:`~aiotruenas.exceptions.TrueNASMalformedResponseError`; a
+        well-formed one that lacks a series yields ``None`` for that field.
         """
         graphs = [_GRAPH_CPU, _GRAPH_MEMORY, _GRAPH_ARCSIZE, _GRAPH_INTERFACE]
         if system_info is None or system_info.is_virtual is not True:
@@ -411,16 +437,8 @@ class TrueNASSystem:
             elif isinstance(result, BaseException):
                 # Cancellation or a programming error: not a graph failure.
                 raise result
-            elif not isinstance(result, list):
-                errors.append(
-                    (
-                        graph,
-                        _malformed(
-                            _NETDATA_GRAPH_METHOD,
-                            f"expected a list for graph '{graph}': {result!r}",
-                        ),
-                    )
-                )
+            elif (shape_error := _graph_shape_error(graph, result)) is not None:
+                errors.append((graph, _malformed(_NETDATA_GRAPH_METHOD, shape_error)))
             else:
                 data[graph] = result
         if errors:

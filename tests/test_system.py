@@ -419,15 +419,63 @@ async def test_get_system_stats_missing_series_are_none() -> None:
     )
 
 
-async def test_get_system_stats_skips_interface_items_without_identifier() -> None:
+@pytest.mark.parametrize(
+    ("graph", "item", "match"),
+    [
+        ("interface", _graph(["received"], {"received": 1.0}), "without an identifier"),
+        (
+            "interface",
+            _graph(["received"], {"received": 1.0}, identifier=""),
+            "without an identifier",
+        ),
+        ("interface", "junk", "without a legend list"),
+        (
+            "interface",
+            _graph(["received"], {"received": 1.0}, identifier="  "),
+            "without an identifier",
+        ),
+        (
+            "interface",
+            _graph(["received"], {"received": 1.0}, identifier=5),
+            "without an identifier",
+        ),
+        ("cputemp", {"legend": "cpu0"}, "without a legend list"),
+        ("cputemp", 42, "without a legend list"),
+        ("cpu", {"aggregations": {"mean": {"cpu": 1.0}}}, "without a legend list"),
+        ("memory", {"legend": "available"}, "without a legend list"),
+        ("arcsize", 42, "without a legend list"),
+    ],
+)
+async def test_get_system_stats_rejects_malformed_graph_items(
+    graph: str, item: Any, match: str
+) -> None:
     graphs = dict(_GRAPHS)
-    graphs["interface"] = [
-        _graph(["received", "sent"], {"received": 1.0, "sent": 2.0}),
-        "junk",
-        _graph(["received", "sent"], {"received": 3.0, "sent": 4.0}, identifier=""),
-    ]
+    graphs[graph] = [*graphs[graph], item]
+    with pytest.raises(TrueNASMalformedResponseError, match=match) as excinfo:
+        await _run({NETDATA: _netdata(graphs)}, lambda s: s.get_system_stats())
+    assert f"graph '{graph}'" in str(excinfo.value)
+
+
+async def test_get_system_stats_empty_graph_is_not_malformed() -> None:
+    graphs = dict(_GRAPHS)
+    graphs["interface"] = []
+    graphs["cpu"] = []
     result = await _run({NETDATA: _netdata(graphs)}, lambda s: s.get_system_stats())
     assert result.interfaces == {}
+    assert result.cpu_usage_percent is None
+
+
+async def test_get_system_stats_rate_alias_used_when_canonical_unusable() -> None:
+    graphs = dict(_GRAPHS)
+    graphs["interface"] = [
+        _graph(
+            ["received", "sent", "rx", "tx"],
+            {"received": -1.0, "sent": None, "rx": 4.0, "tx": 5.0},
+            identifier="a",
+        )
+    ]
+    result = await _run({NETDATA: _netdata(graphs)}, lambda s: s.get_system_stats())
+    assert result.interfaces == {"a": InterfaceTraffic(rx_kbps=4.0, tx_kbps=5.0)}
 
 
 @pytest.mark.parametrize(
