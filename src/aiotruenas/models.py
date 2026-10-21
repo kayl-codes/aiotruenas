@@ -34,8 +34,10 @@ class SystemInfo:
     load_1m: float | None
     load_5m: float | None
     load_15m: float | None
-    #: Whether the system runs virtualized (VM), derived from manufacturer/
-    #: product; ``None`` if neither is reported.
+    #: Whether the system runs virtualized, by a heuristic over manufacturer/
+    #: product: ``True`` for a recognised hypervisor, ``False`` for any other
+    #: reported hardware (including an unrecognised hypervisor), ``None`` if
+    #: neither is reported.
     is_virtual: bool | None
 
 

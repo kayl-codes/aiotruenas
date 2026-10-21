@@ -170,21 +170,22 @@ def _parse_interface(entry: Mapping[str, Any]) -> NetworkInterface | None:
 def _raw_series_means(data: object, legend: list[Any]) -> dict[str, float]:
     """Average each legend series over a netdata item's raw ``data`` points.
 
-    Points are ``[timestamp, v1, ..., vN]``. The legend may or may not list
-    the timestamp column (``"time"``) first; a point whose width does not
-    match the legend is ignored rather than risking a value being attributed
-    to the wrong series.
+    If the legend lists the timestamp column (``"time"``, at any position),
+    each point is positional to the legend; otherwise points are
+    ``[timestamp, v1, ..., vN]``. A point whose width does not match is
+    ignored rather than risking a value being attributed to the wrong series.
     """
     if not isinstance(data, list):
         return {}
-    names = legend[1:] if legend and legend[0] == _TIME_SERIES else legend
+    has_time = _TIME_SERIES in legend
+    width = len(legend) if has_time else len(legend) + 1
     samples: defaultdict[str, list[float]] = defaultdict(list)
     for point in data:
-        if not isinstance(point, list) or len(point) != len(names) + 1:
+        if not isinstance(point, list) or len(point) != width:
             continue
-        for name, sample in zip(names, point[1:], strict=True):
+        for name, sample in zip(legend, point if has_time else point[1:], strict=True):
             value = _finite_float(sample)
-            if isinstance(name, str) and value is not None:
+            if isinstance(name, str) and name != _TIME_SERIES and value is not None:
                 samples[name].append(value)
     means = {name: sum(values) / len(values) for name, values in samples.items()}
     # Individually finite samples can still overflow their sum.

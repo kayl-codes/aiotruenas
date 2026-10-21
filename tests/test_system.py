@@ -363,10 +363,14 @@ async def test_get_system_stats_queries_aggregated_window() -> None:
         seen.append(params)
         return _GRAPHS[params[0]]
 
+    before = int(datetime.now(UTC).timestamp())
     await _run({NETDATA: handler}, lambda s: s.get_system_stats())
+    after = int(datetime.now(UTC).timestamp())
     assert sorted(p[0] for p in seen) == sorted(_GRAPHS)
     for _, query in seen:
         assert query["aggregate"] is True
+        # The most recent minute, skipping the last 30 s netdata may lack.
+        assert before - 30 <= query["end"] <= after - 30
         assert query["end"] - query["start"] == 60
 
 
@@ -377,11 +381,16 @@ async def test_get_system_stats_without_system_info() -> None:
 
 
 async def test_get_system_stats_skips_cputemp_on_vm() -> None:
-    graphs = {k: v for k, v in _GRAPHS.items() if k != "cputemp"}
+    requested: list[str] = []
+
+    def handler(params: list[Any]) -> Any:
+        requested.append(params[0])
+        return _GRAPHS[params[0]]
+
     result = await _run(
-        {NETDATA: _netdata(graphs)},
-        lambda s: s.get_system_stats(_info(is_virtual=True)),
+        {NETDATA: handler}, lambda s: s.get_system_stats(_info(is_virtual=True))
     )
+    assert "cputemp" not in requested
     assert result.cpu_temperature is None
     assert result.cpu_usage_percent == 12.5
 
@@ -912,3 +921,16 @@ async def test_zero_counts_are_kept() -> None:
     )
     assert info.physical_memory == 0
     assert interfaces["lo"].mtu == 0
+
+
+async def test_get_system_stats_raw_fallback_time_not_first() -> None:
+    graphs = dict(_GRAPHS)
+    graphs["interface"] = [
+        _raw_graph(
+            ["received", "time", "sent"],
+            [[10, 1, 100], [30, 2, 300], [9, 999]],
+            identifier="eno1",
+        )
+    ]
+    result = await _run({NETDATA: _netdata(graphs)}, lambda s: s.get_system_stats())
+    assert result.interfaces == {"eno1": InterfaceTraffic(rx_kbps=20.0, tx_kbps=200.0)}
