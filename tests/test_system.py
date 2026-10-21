@@ -20,6 +20,9 @@ from aiotruenas import (
     TrueNASCallTimeoutError,
     TrueNASClient,
     TrueNASConnectionClosedError,
+    TrueNASConnectionError,
+    TrueNASConnectionRefusedError,
+    TrueNASError,
     TrueNASMalformedResponseError,
     TrueNASSystem,
 )
@@ -720,6 +723,45 @@ async def test_get_system_stats_raises_disconnect_if_only_cause() -> None:
     system = TrueNASSystem(cast(TrueNASClient, _StubClient(outcomes)))
     with pytest.raises(TrueNASConnectionClosedError):
         await system.get_system_stats()
+
+
+async def test_get_system_stats_not_connected_is_a_symptom() -> None:
+    timeout = TrueNASCallTimeoutError("timed out")
+    outcomes: dict[str, Any] = dict(_GRAPHS)
+    outcomes["cpu"] = TrueNASConnectionError("not connected; call connect() first")
+    outcomes["arcsize"] = timeout
+    system = TrueNASSystem(cast(TrueNASClient, _StubClient(outcomes)))
+    with pytest.raises(TrueNASCallTimeoutError) as excinfo:
+        await system.get_system_stats()
+    assert excinfo.value is timeout
+
+
+@pytest.mark.parametrize(
+    "error",
+    [
+        TrueNASConnectionRefusedError("refused"),
+        TrueNASConnectionClosedError("closed", phase="call"),
+    ],
+)
+async def test_get_system_stats_connection_subclasses_are_root_causes(
+    error: TrueNASError,
+) -> None:
+    outcomes: dict[str, Any] = dict(_GRAPHS)
+    outcomes["cpu"] = error
+    outcomes["arcsize"] = TrueNASCallTimeoutError("timed out")
+    system = TrueNASSystem(cast(TrueNASClient, _StubClient(outcomes)))
+    with pytest.raises(TrueNASError) as excinfo:
+        await system.get_system_stats()
+    assert excinfo.value is error
+
+
+async def test_get_system_stats_raises_not_connected_if_only_cause() -> None:
+    error = TrueNASConnectionError("not connected; call connect() first")
+    outcomes: dict[str, Any] = dict.fromkeys(_GRAPHS, error)
+    system = TrueNASSystem(cast(TrueNASClient, _StubClient(outcomes)))
+    with pytest.raises(TrueNASConnectionError) as excinfo:
+        await system.get_system_stats()
+    assert excinfo.value is error
 
 
 async def test_get_system_stats_cputemp_connection_error_propagates() -> None:

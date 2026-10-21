@@ -26,6 +26,7 @@ from .domain._helpers import _is_virtual_machine
 from .exceptions import (
     TrueNASCallError,
     TrueNASConnectionClosedError,
+    TrueNASConnectionError,
     TrueNASError,
     TrueNASMalformedResponseError,
 )
@@ -309,6 +310,14 @@ def _memory_usage_percent(total: int | None, available: int | None) -> float | N
 
 
 def _is_disconnect_symptom(error: TrueNASError) -> bool:
+    """Return True for errors caused by a sibling call closing the socket.
+
+    That is a ``phase="disconnect"`` close for an in-flight call, or the
+    plain ``TrueNASConnectionError`` ("not connected") that ``call()`` raises
+    for a call that only reached the send step after the close.
+    """
+    if type(error) is TrueNASConnectionError:
+        return True
     return isinstance(error, TrueNASConnectionClosedError) and (
         error.phase == "disconnect"
     )
@@ -318,8 +327,9 @@ def _primary_error(errors: list[tuple[str, TrueNASError]]) -> TrueNASError:
     """Pick the error to raise from several failed graph calls.
 
     A timeout closes the shared WebSocket, failing every other in-flight
-    call with a ``phase="disconnect"`` connection-closed error; those are
-    symptoms, so the root cause is preferred. The graph name is attached as
+    call with a ``phase="disconnect"`` connection-closed error (or "not
+    connected" for one that had not sent yet); those are symptoms, so the
+    root cause is preferred. The graph name is attached as
     a note and the remaining errors are logged at DEBUG.
     """
     graph, error = next(

@@ -184,7 +184,7 @@ Semantics:
   exception: a JSON-RPC error for the optional `cputemp` graph (e.g. no temperature chart on that
   hardware) only leaves `cpu_temperature` as `None`.
 - When several graph calls fail at once, the root cause (e.g. the call timeout) is raised rather
-  than the connection-closed errors it triggers in the other in-flight calls.
+  than the connection-closed / "not connected" errors it triggers in the other graph calls.
 
 ## Status
 
