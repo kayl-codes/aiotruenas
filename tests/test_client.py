@@ -770,6 +770,11 @@ async def test_cancel_while_awaiting_response_does_not_leak_pending_future() -> 
             # Cancel only once the request is on the server, i.e. while the
             # call is awaiting its (never coming) response.
             await asyncio.wait_for(server.request_seen["system.info"].wait(), 2)
+            # The server can see the request while send() is still draining;
+            # the call holds the lock until send() returns, so taking it here
+            # proves the call has moved on to awaiting its response.
+            async with asyncio.timeout(2), client._lock:
+                pass
             assert len(client._pending_calls) == 1
             call_task.cancel()
             with pytest.raises(asyncio.CancelledError):
