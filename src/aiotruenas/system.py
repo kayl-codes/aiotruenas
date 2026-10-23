@@ -360,9 +360,10 @@ class TrueNASSystem:
         suitable as a unique device identifier.
         """
         raw = await self._client.call(_SYSTEM_ID_METHOD)
-        if not isinstance(raw, str) or not raw.strip():
+        if not isinstance(raw, str) or not (system_id := raw.strip()):
             raise _malformed(_SYSTEM_ID_METHOD, f"expected a non-empty string: {raw!r}")
-        return raw
+        # Stripped, so the same installation always maps to one identifier.
+        return system_id
 
     async def get_system_info(self) -> SystemInfo:
         """Return hostname, version, hardware, boot time and load (``system.info``)."""

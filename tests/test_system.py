@@ -117,6 +117,13 @@ async def test_get_system_id_returns_uuid() -> None:
     assert result == "a1b2c3"
 
 
+async def test_get_system_id_strips_surrounding_whitespace() -> None:
+    result = await _run(
+        {"system.global.id": " a1b2c3\n"}, lambda system: system.get_system_id()
+    )
+    assert result == "a1b2c3"
+
+
 @pytest.mark.parametrize("payload", [None, "", "   ", 42, {"id": "x"}])
 async def test_get_system_id_rejects_non_string(payload: Any) -> None:
     with pytest.raises(TrueNASMalformedResponseError, match="system.global.id"):
