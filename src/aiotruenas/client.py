@@ -178,6 +178,7 @@ class TrueNASClient:
                 raise classify_connect_exception(exc) from exc
             except (OSError, WebSocketException) as exc:
                 raise classify_connect_exception(exc) from exc
+        raise AssertionError("unreachable: the last attempt returns or raises")
 
     async def _await_response(
         self, ws: ClientConnection, rpc_id: int

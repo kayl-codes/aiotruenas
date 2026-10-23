@@ -208,8 +208,8 @@ def _cpuset_size(cpuset: Any) -> int:
     if not isinstance(cpuset, str) or not cpuset.strip():
         return 0
     count = 0
-    for part in cpuset.split(","):
-        part = part.strip()
+    for raw_part in cpuset.split(","):
+        part = raw_part.strip()
         if not part:
             continue
         try:

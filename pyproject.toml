@@ -52,7 +52,8 @@ line-length = 88
 target-version = "py313"
 
 [tool.ruff.lint]
-select = ["E", "F", "W", "I", "UP", "ASYNC"]
+# FURB/PERF/PIE/PLE/PLW/RET/RSE: a local pre-check for Sourcery-style refactorings (PLR/TRY left out as noise).
+select = ["E", "F", "W", "I", "UP", "ASYNC", "FURB", "PERF", "PIE", "PLE", "PLW", "RET", "RSE"]
 
 [tool.pytest.ini_options]
 asyncio_mode = "auto"

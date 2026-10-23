@@ -122,7 +122,7 @@ guess the wire format from the legacy client alone.
   round-trip test per RPC method category listed above (can be table-driven against a fake server
   that echoes canned JSON-RPC responses).
 - GitHub Actions CI mirroring the pattern used in kayl-codes/homeassistant-truenas's `ci.yml`:
-  `ruff check .` (rules E, F, W, I, UP, ASYNC; line-length 88) + `ruff format --check .` + `pytest`.
+  `ruff check .` (rules E, F, W, I, UP, ASYNC, FURB, PERF, PIE, PLE, PLW, RET, RSE; line-length 88) + `ruff format --check .` + `pytest`.
 - `pyproject.toml`: package name `aiotruenas` (import as `import aiotruenas`), Apache-2.0 license
   metadata matching the repo's LICENSE file, `requires-python = ">=3.13"`, single runtime dependency
   `websockets>=15.0.1`.

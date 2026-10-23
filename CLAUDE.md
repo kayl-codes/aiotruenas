@@ -27,7 +27,7 @@ into the `truenas_ce` Home Assistant custom integration.
 Mirrors `kayl-codes/homeassistant-truenas`'s CI pattern ([.github/workflows/ci.yml](.github/workflows/ci.yml)):
 
 ```bash
-ruff check .            # lint (rules E, F, W, I, UP, ASYNC; py313, line-length 88)
+ruff check .            # lint (rules E, F, W, I, UP, ASYNC, FURB, PERF, PIE, PLE, PLW, RET, RSE; py313, line-length 88)
 ruff format --check .   # formatting check; drop --check to auto-format
 pytest                  # unit tests against a fake websockets server (tests/fake_server.py)
 ```
