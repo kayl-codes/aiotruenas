@@ -143,10 +143,53 @@ reported when the graph *discovery* call fails outright or when `ups_stale_graph
 failed graph query (and writes `None`, not a stale value, for a malformed-but-non-raising one), so
 there is no silent fallback to report.
 
+### Typed system models
+
+`TrueNASSystem` wraps a `TrueNASClient` and returns immutable, fully typed dataclasses
+(`aiotruenas.models`) for system info, network interfaces and current stats. It is stateless: every
+call queries TrueNAS afresh, there is no cache and no fallback to previous values.
+
+```python
+from aiotruenas import TrueNASClient, TrueNASSystem
+
+async with TrueNASClient("truenas.local", "1-abcdef...") as client:
+    system = TrueNASSystem(client)
+    system_id = await system.get_system_id()  # str, "system.global.id"
+    info = await system.get_system_info()  # SystemInfo
+    interfaces = await system.get_network_interfaces()  # dict[str, NetworkInterface]
+    stats = await system.get_system_stats(info)  # SystemStats
+    if (eno1 := stats.interfaces.get("eno1")) is not None:
+        print(info.boot_time, stats.cpu_usage_percent, eno1.rx_kbps)
+```
+
+| Method | RPC | Returns |
+|---|---|---|
+| `get_system_id()` | `system.global.id` | `str` |
+| `get_system_info()` | `system.info` | `SystemInfo`: hostname, version, manufacturer, product, serial, `physical_memory` (bytes), `boot_time` (UTC `datetime`), `uptime_seconds`, `load_1m`/`load_5m`/`load_15m`, `is_virtual` |
+| `get_network_interfaces()` | `interface.query` | `dict[id, NetworkInterface]`: name, description, mtu, `link_state`, `link_up`, media type/subtype, link address |
+| `get_system_stats(system_info=None)` | `reporting.netdata_graph` (`cpu`, `cputemp`, `memory`, `arcsize`, `interface`) | `SystemStats`: `cpu_usage_percent`, `cpu_temperature` (°C), `memory_available` (bytes), `memory_usage_percent`, `arc_size` (bytes), `interfaces` (read-only `Mapping[id, InterfaceTraffic]` with `rx_kbps`/`tx_kbps` in kilobits/s) |
+
+Passing the `SystemInfo` to `get_system_stats()` enables `memory_usage_percent` (needs the physical
+memory size) and skips the `cputemp` graph on a virtual machine.
+
+Semantics:
+
+- A field TrueNAS does not deliver (missing, `null`, blank, wrong type) is `None` — never a
+  placeholder like `0`, `"unknown"` or `False`.
+- Values keep TrueNAS's own units (bytes, seconds, kilobits/s, %, °C); no unit conversion.
+- RPC failures propagate as the usual `TrueNASError` subclasses; a response with the wrong
+  shape (e.g. a netdata graph item with neither a `legend` list nor `aggregations.mean`, or an
+  `interface` item without
+  `identifier`) raises `TrueNASMalformedResponseError`. Nothing is swallowed. The one
+  exception: a JSON-RPC error for the optional `cputemp` graph (e.g. no temperature chart on that
+  hardware) only leaves `cpu_temperature` as `None`.
+- When several graph calls fail at once, the root cause (e.g. the call timeout) is raised rather
+  than the connection-closed / "not connected" errors it triggers in the other graph calls.
+
 ## Status
 
 Early development. Generic `call()` RPC surface plus a growing set of normalized `TrueNASState`
-endpoints (no typed per-domain convenience methods elsewhere yet). See [PROMPT.md](PROMPT.md) for
+endpoints and the typed `TrueNASSystem` models. See [PROMPT.md](PROMPT.md) for
 the full design brief and [CLAUDE.md](CLAUDE.md) for repo guidance.
 
 ## License
