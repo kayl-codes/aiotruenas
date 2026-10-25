@@ -739,6 +739,9 @@ async def test_connect_after_a_call_timeout_opens_a_fresh_connection(
                 # takes the other call and the subscription down with it.
                 async with asyncio.timeout(5):
                     await entered.wait()
+                # Both requests reached the server; only the response wait
+                # has a timeout.
+                assert server.request_seen["system.info"].is_set()
                 assert not client.connected
                 with pytest.raises(
                     TrueNASConnectionClosedError, match="timed out"
@@ -789,6 +792,9 @@ async def test_call_cancelled_while_closing_after_timeout_releases_the_socket(
             try:
                 async with asyncio.timeout(5):
                     await close_entered.wait()
+                # The request reached the server; only the response wait has
+                # a timeout.
+                assert server.request_seen["system.info"].is_set()
                 call_task.cancel()
                 with pytest.raises(asyncio.CancelledError):
                     async with asyncio.timeout(5):
@@ -1093,8 +1099,35 @@ async def test_unsubscribe_timeout_ends_the_subscription(monkeypatch) -> None:
             monkeypatch.setattr(server, "_handle_unsubscribe", never_answer)
             with pytest.raises(TrueNASCallTimeoutError):
                 await client.unsubscribe(sub_id)
+            assert server.request_seen["core.unsubscribe"].is_set()
             # The timeout closed the connection, which ended the subscription.
             assert not client.connected
+            assert not await client.is_subscribed(sub_id)
+            assert queue.get_nowait() is client._QUEUE_TERMINATOR
+
+
+async def test_unsubscribe_cancelled_after_sending_ends_the_subscription(
+    monkeypatch,
+) -> None:
+    async with FakeTrueNASServer(valid_api_key=API_KEY) as server:
+        async with make_client(server, query_timeout=30) as client:
+            await client.connect()
+            sub_id, queue = await client.subscribe("app.stats")
+
+            async def drop_then_never_answer(ws, rpc_id, params):
+                server._subscriptions.pop(params[0], None)
+
+            monkeypatch.setattr(server, "_handle_unsubscribe", drop_then_never_answer)
+            task = asyncio.ensure_future(client.unsubscribe(sub_id))
+            async with asyncio.timeout(5):
+                await server.request_seen["core.unsubscribe"].wait()
+            task.cancel()
+            with pytest.raises(asyncio.CancelledError):
+                async with asyncio.timeout(5):
+                    await task
+            # The server may have dropped it: the subscription ends locally,
+            # and the connection stays up.
+            assert client.connected
             assert not await client.is_subscribed(sub_id)
             assert queue.get_nowait() is client._QUEUE_TERMINATOR
 

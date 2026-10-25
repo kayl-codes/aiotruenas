@@ -16,6 +16,7 @@ from websockets.protocol import State
 from ._errors import build_call_error, classify_connect_exception
 from .exceptions import (
     TrueNASAuthenticationError,
+    TrueNASCallError,
     TrueNASCallTimeoutError,
     TrueNASConnectionClosedError,
     TrueNASConnectionError,
@@ -719,7 +720,9 @@ class TrueNASClient:
         with the connection. If the server rejects the request
         (:class:`~aiotruenas.exceptions.TrueNASCallError`), the error is
         raised and the subscription stays tracked, so the call can be
-        retried; :meth:`close` ends it in any case.
+        retried; :meth:`close` ends it in any case. On every other outcome
+        (success, a malformed response, cancellation), the subscription ends
+        locally: the server may already have dropped it.
         """
         async with self._lock:
             if subscription_id not in self._subscriptions:
@@ -729,9 +732,22 @@ class TrueNASClient:
                 )
                 return
             ws = self._ws
-        await self._call_on_connection(
-            "core.unsubscribe", [subscription_id], expected_ws=ws
-        )
+        rejected = False
+        try:
+            await self._call_on_connection(
+                "core.unsubscribe", [subscription_id], expected_ws=ws
+            )
+        except TrueNASCallError:
+            rejected = True
+            raise
+        finally:
+            if not rejected:
+                await self._forget_subscription(ws, subscription_id)
+
+    async def _forget_subscription(
+        self, ws: ClientConnection | None, subscription_id: str
+    ) -> None:
+        """End the local subscription ``subscription_id`` while ``ws`` is current."""
         queue = None
         async with self._lock:
             # After a reconnect the id may name a newer connection's
