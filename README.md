@@ -47,6 +47,18 @@ Connection and protocol failures are raised as typed exceptions (see `aiotruenas
 rather than returned as an error code/string, so callers can `except TrueNASAuthenticationError`,
 `except TrueNASConnectionError`, etc.
 
+### Connection lifecycle
+
+- `close()` ends the connection at once: pending calls fail with `TrueNASConnectionClosedError`
+  (`phase="disconnect"`), and every subscription queue ends. A call that times out or fails to send
+  closes the connection the same way.
+- `connect()` then opens a new connection, also when it waited for a `close()` still in progress.
+  Subscriptions do not carry over to the new connection: subscribe again.
+- `subscribe()` raises `TrueNASConnectionClosedError` if its connection closes before the
+  subscription is registered.
+- `unsubscribe()` sends `core.unsubscribe` only for a subscription of the current connection. For a
+  subscription that already ended with its connection, it returns without a request.
+
 ### Normalized domain state
 
 `TrueNASState` wraps a `TrueNASClient` and exposes one `async def get_<endpoint>()` method per

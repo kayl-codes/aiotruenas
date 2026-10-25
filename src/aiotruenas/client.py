@@ -298,9 +298,7 @@ class TrueNASClient:
         params = candidate.get("params")
 
         if isinstance(msg_id, int):
-            # RPC ids never repeat across connections: a late reply from an
-            # old one finds no pending call.
-            await self._handle_rpc_response(msg_id, candidate)
+            await self._handle_rpc_response(ws, msg_id, candidate)
             return
 
         if isinstance(msg_id, str):
@@ -310,10 +308,14 @@ class TrueNASClient:
         await self._handle_collection_notification(ws, candidate, params)
 
     async def _handle_rpc_response(
-        self, msg_id: int, candidate: dict[str, Any]
+        self, ws: ClientConnection, msg_id: int, candidate: dict[str, Any]
     ) -> None:
-        """Complete a pending RPC call with the response payload."""
+        """Complete a pending RPC call of ``ws`` with the response payload."""
         async with self._lock:
+            # Pending calls belong to the current connection: a detach fails
+            # and clears those of the old one.
+            if self._ws is not ws:
+                return
             future = self._pending_calls.pop(msg_id, None)
         if future is not None and not future.done():
             future.set_result(candidate)
@@ -540,10 +542,34 @@ class TrueNASClient:
         :func:`json.dumps` (e.g. ``TypeError``, ``ValueError``) before anything
         is sent; the connection stays usable.
         """
-        effective_timeout = self._query_timeout if timeout is None else timeout
+        result, _ = await self._call_on_connection(method, params, call_timeout=timeout)
+        return await self._wait_for_job(result) if job else result
+
+    async def _call_on_connection(
+        self,
+        method: str,
+        params: list | dict | None,
+        *,
+        call_timeout: float | None = None,
+        expected_ws: ClientConnection | None = None,
+    ) -> tuple[Any, ClientConnection]:
+        """Send one request and return its ``result`` and the connection used.
+
+        ``call_timeout`` defaults to the client's query timeout. With
+        ``expected_ws``, the request is sent only on that connection: if it
+        was closed or replaced meanwhile, this raises
+        :class:`~aiotruenas.exceptions.TrueNASConnectionClosedError` instead.
+        """
+        effective_timeout = (
+            self._query_timeout if call_timeout is None else call_timeout
+        )
 
         async with self._lock:
             ws = self._ws
+            if expected_ws is not None and ws is not expected_ws:
+                raise TrueNASConnectionClosedError(
+                    f"connection closed before {method!r} was sent", phase="call"
+                )
             if ws is None:
                 raise TrueNASConnectionError("not connected; call connect() first")
 
@@ -615,8 +641,7 @@ class TrueNASClient:
                 f"response for {method!r} has no result"
             )
 
-        result = response[_KEY_RESULT]
-        return await self._wait_for_job(result) if job else result
+        return response[_KEY_RESULT], ws
 
     async def _wait_for_job(self, job_id: Any) -> Any:
         if not isinstance(job_id, int) or isinstance(job_id, bool):
@@ -658,11 +683,12 @@ class TrueNASClient:
         when done.
 
         Raises :class:`~aiotruenas.exceptions.TrueNASConnectionClosedError` if
-        the connection closes (or is replaced by a reconnect) before the
-        subscription is registered: its queue would never be fed or ended.
+        the connection ``core.subscribe`` ran on closes (or is replaced by a
+        reconnect) before the subscription is registered: its queue would
+        never be fed or ended, and the server dropped the subscription with
+        that connection.
         """
-        ws = self._ws
-        result = await self.call("core.subscribe", [event])
+        result, ws = await self._call_on_connection("core.subscribe", [event])
         if not isinstance(result, str):
             raise TrueNASMalformedResponseError(
                 f"core.subscribe returned non-string subscription id: {result!r}"
@@ -679,15 +705,42 @@ class TrueNASClient:
         return result, queue
 
     async def unsubscribe(self, subscription_id: str) -> None:
-        """Unsubscribe from a TrueNAS event."""
-        try:
-            await self.call("core.unsubscribe", [subscription_id])
-        finally:
-            async with self._lock:
+        """Unsubscribe from a TrueNAS event.
+
+        Only a subscription of the current connection is unsubscribed on the
+        server. For an unknown id, or a subscription that already ended with
+        its connection, this returns without a request: the server dropped
+        that subscription with its connection.
+
+        Raises :class:`~aiotruenas.exceptions.TrueNASConnectionClosedError`
+        or :class:`~aiotruenas.exceptions.TrueNASCallTimeoutError` if the
+        connection closes, is replaced or times out before
+        ``core.unsubscribe`` is answered; the subscription has then ended
+        with the connection. If the server rejects the request
+        (:class:`~aiotruenas.exceptions.TrueNASCallError`), the error is
+        raised and the subscription stays tracked, so the call can be
+        retried; :meth:`close` ends it in any case.
+        """
+        async with self._lock:
+            if subscription_id not in self._subscriptions:
+                _LOGGER.debug(
+                    "Not unsubscribing %r: no subscription of the current connection",
+                    subscription_id,
+                )
+                return
+            ws = self._ws
+        await self._call_on_connection(
+            "core.unsubscribe", [subscription_id], expected_ws=ws
+        )
+        queue = None
+        async with self._lock:
+            # After a reconnect the id may name a newer connection's
+            # subscription; the detach already ended this one.
+            if self._ws is ws:
                 queue = self._subscriptions.pop(subscription_id, None)
                 self._subscription_events.pop(subscription_id, None)
-            if queue is not None:
-                queue.put_nowait(self._QUEUE_TERMINATOR)
+        if queue is not None:
+            queue.put_nowait(self._QUEUE_TERMINATOR)
 
     async def _get_subscription_queue(
         self, subscription_id: str
