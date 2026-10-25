@@ -445,6 +445,59 @@ async def test_close_while_call_in_flight_does_not_raise_attribute_error() -> No
             assert not client.connected
 
 
+async def _inert_read_loop() -> None:
+    """Stand-in reader that never ends and never tears anything down."""
+    await asyncio.Event().wait()
+
+
+async def test_close_cancelled_by_caller_propagates_and_tears_down(
+    monkeypatch,
+) -> None:
+    async with FakeTrueNASServer(valid_api_key=API_KEY) as server:
+        client = make_client(server)
+        # Only close() itself can tear down: this reader neither ends on the
+        # socket close nor runs any cleanup.
+        monkeypatch.setattr(client, "_read_loop", _inert_read_loop)
+        async with client:
+            await client.connect()
+            reader = client._reader_task
+            call_task = asyncio.ensure_future(client.call("system.info"))
+            await server.request_seen["system.info"].wait()
+            real_ws_close = client._ws.close
+            ws_closed = asyncio.Event()
+
+            async def recording_close() -> None:
+                await real_ws_close()
+                ws_closed.set()
+
+            monkeypatch.setattr(client._ws, "close", recording_close)
+            close_task = asyncio.ensure_future(client.close())
+            await ws_closed.wait()
+
+            close_task.cancel()
+            with pytest.raises(asyncio.CancelledError):
+                await close_task
+            # The cancel reached close() while it awaited the reader.
+            assert reader.cancelled()
+            async with asyncio.timeout(5):
+                with pytest.raises(TrueNASConnectionClosedError):
+                    await call_task
+            assert client._pending_calls == {}
+            assert not client.connected
+
+
+async def test_close_tolerates_an_already_cancelled_reader(monkeypatch) -> None:
+    async with FakeTrueNASServer(valid_api_key=API_KEY) as server:
+        client = make_client(server)
+        monkeypatch.setattr(client, "_read_loop", _inert_read_loop)
+        async with client:
+            await client.connect()
+            client._reader_task.cancel()
+
+            await client.close()
+            assert not client.connected
+
+
 async def test_job_polling_rejects_bool_job_id() -> None:
     async with FakeTrueNASServer(
         valid_api_key=API_KEY, responses={"service.start": True}

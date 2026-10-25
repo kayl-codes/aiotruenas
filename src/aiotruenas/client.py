@@ -424,24 +424,37 @@ class TrueNASClient:
         """Close the WebSocket connection, if any. Safe to call repeatedly.
 
         The lifecycle is intentionally split into two lock acquisitions:
-        1. close the websocket and cancel the reader task
+        1. close the websocket, which ends the reader task
         2. await the reader task outside the lock
         3. run shared teardown under the lock again
 
         This avoids deadlock while keeping connection state mutations serialized.
+        A cancelled ``close()`` re-raises, but still stops the reader and tears
+        the connection down.
         """
         reader_task = None
-        async with self._lock:
-            if self._ws is None:
-                return
-            reader_task = self._reader_task
-            self._reader_task = None
-            with contextlib.suppress(WebSocketException, OSError):
-                await self._ws.close()
-        if reader_task is not None:
-            with contextlib.suppress(asyncio.CancelledError):
-                await reader_task
-        await self._teardown_connection()
+        try:
+            async with self._lock:
+                if self._ws is None:
+                    return
+                reader_task = self._reader_task
+                self._reader_task = None
+                with contextlib.suppress(WebSocketException, OSError):
+                    await self._ws.close()
+            if reader_task is not None:
+                try:
+                    await reader_task
+                except asyncio.CancelledError:
+                    # Only the reader's own cancellation (e.g. at loop
+                    # shutdown) is expected; a cancel of close()'s caller
+                    # propagates.
+                    current = asyncio.current_task()
+                    if current is not None and current.cancelling():
+                        raise
+        finally:
+            if reader_task is not None and not reader_task.done():
+                reader_task.cancel()
+            await self._teardown_connection()
 
     async def _close_websocket_locked(self) -> None:
         """Close ``self._ws``. Caller must already hold ``self._lock``."""
