@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import contextlib
 import json
 import logging
 import socket
@@ -11,6 +12,7 @@ import ssl
 import pytest
 import trustme
 from fake_server import NO_RESULT, FakeTrueNASServer, RawEnvelope
+from websockets.protocol import State
 
 from aiotruenas import (
     TrueNASAuthenticationError,
@@ -495,6 +497,86 @@ async def test_close_tolerates_an_already_cancelled_reader(monkeypatch) -> None:
             client._reader_task.cancel()
 
             await client.close()
+            assert not client.connected
+
+
+async def test_close_cancelled_before_the_lock_leaves_the_connection_intact() -> None:
+    async with FakeTrueNASServer(
+        valid_api_key=API_KEY, responses={"system.info": {"hostname": "nas"}}
+    ) as server:
+        async with make_client(server) as client:
+            await client.connect()
+            ws = client._ws
+            async with client._lock:
+                close_task = asyncio.ensure_future(client.close())
+                await asyncio.sleep(0)
+                # close() is queued on the lock, not finished or unstarted.
+                assert len(client._lock._waiters) == 1
+                close_task.cancel()
+                # Bounded: a close() that tears down here would wait for the
+                # lock this test holds.
+                with pytest.raises(asyncio.CancelledError):
+                    async with asyncio.timeout(5):
+                        await close_task
+
+            assert client._ws is ws
+            assert ws.state is State.OPEN
+            assert await client.call("system.info") == {"hostname": "nas"}
+
+
+async def test_close_cancelled_during_the_handshake_aborts_the_socket(
+    monkeypatch,
+) -> None:
+    async with FakeTrueNASServer(valid_api_key=API_KEY) as server:
+        async with make_client(server) as client:
+            await client.connect()
+            ws = client._ws
+            close_entered = asyncio.Event()
+
+            async def hanging_close() -> None:
+                close_entered.set()
+                await asyncio.Event().wait()
+
+            monkeypatch.setattr(ws, "close", hanging_close)
+            close_task = asyncio.ensure_future(client.close())
+            await close_entered.wait()
+
+            close_task.cancel()
+            with pytest.raises(asyncio.CancelledError):
+                async with asyncio.timeout(5):
+                    await close_task
+            assert ws.transport.is_closing()
+            assert not client.connected
+
+
+async def test_close_in_cancel_cleanup_tolerates_a_cancelled_reader(
+    monkeypatch,
+) -> None:
+    async with FakeTrueNASServer(valid_api_key=API_KEY) as server:
+        client = make_client(server)
+        monkeypatch.setattr(client, "_read_loop", _inert_read_loop)
+        async with client:
+            await client.connect()
+            reader = client._reader_task
+            waiting = asyncio.Event()
+
+            async def cleanup_after_cancel() -> int:
+                with contextlib.suppress(asyncio.CancelledError):
+                    waiting.set()
+                    await asyncio.Event().wait()
+                # Caught but not uncancelled: the count stays at 1. The reader
+                # is cancelled on its own, so close() sees its CancelledError.
+                reader.cancel()
+                await client.close()
+                return asyncio.current_task().cancelling()
+
+            cleanup = asyncio.ensure_future(cleanup_after_cancel())
+            await waiting.wait()
+            cleanup.cancel()
+
+            async with asyncio.timeout(5):
+                assert await cleanup == 1
+            assert reader.cancelled()
             assert not client.connected
 
 
