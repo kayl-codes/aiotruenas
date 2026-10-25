@@ -21,6 +21,10 @@ published on the [GitHub releases page](https://github.com/kayl-codes/aiotruenas
   RPC failures and malformed responses are raised, not swallowed. The only tolerated error is an
   unknown `cputemp` graph (errname `ENOENT`, live-verified on TrueNAS 25.10), which leaves just
   `cpu_temperature` as `None` (#56).
+- `TrueNASState.get_pool()` parses a pool's scrub pause time as `scrub_pause` (UTC `datetime`
+  from `scan.pause`, `None` when the scrub is not paused) and its progress as `scrub_percentage`
+  (`scan.percentage`, raw percent as TrueNAS reports it, `0` without scan data). A paused scrub keeps
+  `scrub_state` at `SCANNING`, so `scrub_pause` is what tells paused from running.
 - `mypy` in the dev dependencies, with strict checking for the new modules.
 
 ### Fixed

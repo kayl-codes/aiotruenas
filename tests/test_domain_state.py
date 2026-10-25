@@ -164,6 +164,82 @@ async def test_get_pool_derives_capacity_from_root_dataset() -> None:
     assert tank["errors"] == 1
     assert tank["scrub_start"] == datetime.fromtimestamp(1700000000, tz=UTC)
     assert tank["scrub_end"] == datetime.fromtimestamp(1700003600, tz=UTC)
+    # No "pause" or "percentage" key in the scan data: both stay at their default.
+    assert tank["scrub_pause"] is None
+    assert tank["scrub_percentage"] == 0
+
+
+@pytest.mark.parametrize(
+    ("pause", "expected_pause"),
+    [
+        # Paused scrub: TrueNAS sends the pause time, scan/state stays SCANNING.
+        ({"$date": 1700001800000}, datetime.fromtimestamp(1700001800, tz=UTC)),
+        # Running scrub: pause is null.
+        (None, None),
+    ],
+    ids=["paused", "running"],
+)
+async def test_get_pool_parses_scrub_pause_and_percentage(
+    pause: dict[str, int] | None, expected_pause: datetime | None
+) -> None:
+    pool = {
+        **_POOL_TANK,
+        "scan": {
+            "function": "SCRUB",
+            "state": "SCANNING",
+            "start_time": {"$date": 1700000000000},
+            "end_time": None,
+            "percentage": 42.5,
+            "pause": pause,
+            "total_secs_left": 1800,
+        },
+    }
+    async with FakeTrueNASServer(
+        valid_api_key=API_KEY,
+        responses={
+            "pool.dataset.query": [_ROOT_DATASET],
+            "pool.query": [pool],
+            "boot.get_state": _BOOT_POOL,
+        },
+    ) as server:
+        async with make_client(server) as client:
+            await client.connect()
+            state = TrueNASState(client)
+            result = await state.get_pool()
+
+    tank = result["111"]
+    assert tank["scrub_state"] == "SCANNING"
+    assert tank["scrub_pause"] == expected_pause
+    assert tank["scrub_percentage"] == 42.5
+    assert tank["scrub_end"] is None
+
+
+async def test_get_pool_clears_scrub_pause_when_the_scrub_resumes() -> None:
+    def pool_with_pause(pause: dict[str, int] | None) -> dict[str, Any]:
+        return {
+            **_POOL_TANK,
+            "scan": {"function": "SCRUB", "state": "SCANNING", "pause": pause},
+        }
+
+    async with FakeTrueNASServer(
+        valid_api_key=API_KEY,
+        responses={
+            "pool.dataset.query": [_ROOT_DATASET],
+            "pool.query": [pool_with_pause({"$date": 1700001800000})],
+            "boot.get_state": _BOOT_POOL,
+        },
+    ) as server:
+        async with make_client(server) as client:
+            await client.connect()
+            state = TrueNASState(client)
+            paused = (await state.get_pool())["111"]["scrub_pause"]
+
+            server.responses["pool.query"] = [pool_with_pause(None)]
+            resumed = (await state.get_pool())["111"]["scrub_pause"]
+
+    assert paused == datetime.fromtimestamp(1700001800, tz=UTC)
+    # The cached pause time must not survive the refresh after a resume.
+    assert resumed is None
 
 
 async def test_get_pool_merges_boot_pool_without_dropping_regular_pools() -> None:

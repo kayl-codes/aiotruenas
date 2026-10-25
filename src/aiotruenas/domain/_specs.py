@@ -52,6 +52,17 @@ _POOL_VALS: list[ApiValueSpec] = [
         "default": 0,
         "convert": "utc_from_timestamp",
     },
+    # Pause time of a paused scrub; scan/state stays SCANNING while paused.
+    # TrueNAS sends pause = null otherwise, which ends up as None.
+    {
+        "name": "scrub_pause",
+        "source": "scan/pause/$date",
+        "default": 0,
+        "convert": "utc_from_timestamp",
+    },
+    # Raw progress in percent, as TrueNAS reports it (a finished scrub can
+    # read 99.99).
+    {"name": "scrub_percentage", "source": "scan/percentage", "default": 0},
     {
         "name": "scrub_secs_left",
         "source": "scan/total_secs_left",
