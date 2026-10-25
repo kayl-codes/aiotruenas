@@ -12,9 +12,9 @@ permissions:
 # A new push to a PR cancels its older, still running Build: that run then
 # never concludes 'success', so sonar-pr.yml does not scan an outdated head.
 # Every push to main gets its own group (run_id), so none is cancelled or
-# replaced while pending.
+# replaced while pending. The event name keeps a PR number and a run_id apart.
 concurrency:
-  group: build-${{ github.event.pull_request.number || github.run_id }}
+  group: build-${{ github.event_name }}-${{ github.event.pull_request.number || github.run_id }}
   cancel-in-progress: ${{ github.event_name == 'pull_request' }}
 
 jobs:
