@@ -89,9 +89,14 @@ guess the wire format from the legacy client alone.
 - Python >= 3.13, asyncio-native throughout. Use `websockets`'s asyncio client (the modern
   `websockets.asyncio.client.connect`, NOT `websockets.sync.client`), matching the
   `websockets>=15.0.1` version already used elsewhere in this project family.
-- No threads, no `RLock` — use a single `asyncio.Lock` to serialize send/recv on the shared
-  connection (asyncio is single-threaded, so the dual-lock scheme in the old sync client, needed
-  there to order I/O-lock vs. fast-state-lock across OS threads, can collapse to one lock here).
+- No threads, no `RLock` — use a single `asyncio.Lock` on the shared connection (asyncio is
+  single-threaded, so the dual-lock scheme in the old sync client, needed there to order I/O-lock
+  vs. fast-state-lock across OS threads, can collapse to one lock here). The lock serializes sends
+  and guards the shared state; a background read loop receives and routes replies to the waiting
+  calls. On an established connection the lock must **not** be held across `recv()` or while
+  waiting for a response — that would block every other call. Connection setup is the exception:
+  `connect()` holds the lock through the login handshake, so concurrent `connect()` calls cannot
+  open competing sockets (see `CLAUDE.md` and `.github/review-checklist.md`).
 - Public API shape (adjust names as you see fit, but keep this shape):
   ```python
   async with TrueNASClient(host, api_key, verify_ssl=True) as client:
