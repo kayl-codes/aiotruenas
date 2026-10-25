@@ -106,8 +106,9 @@ jobs:
           if [[ "$base_ref" != "$PR_BASE_REF" || "$head_ref" != "$PR_HEAD_REF" ]]; then
             echo "::warning::pr.env names $PR_HEAD_REF -> $PR_BASE_REF, the PR API $head_ref -> $base_ref; using the API values"
           fi
-          echo "PR_BASE_REF=$base_ref" >> "$GITHUB_ENV"
-          echo "PR_HEAD_REF=$head_ref" >> "$GITHUB_ENV"
+          # Step outputs, not $GITHUB_ENV: later steps read the refs explicitly.
+          echo "base_ref=$base_ref" >> "$GITHUB_OUTPUT"
+          echo "head_ref=$head_ref" >> "$GITHUB_OUTPUT"
           if [[ "$current_sha" == "$RUN_HEAD_SHA" ]]; then
             echo "current=true" >> "$GITHUB_OUTPUT"
           else
@@ -127,6 +128,7 @@ jobs:
         if: steps.head.outputs.current == 'true'
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          BASE_REF: ${{ steps.head.outputs.base_ref }}
         run: |
           set -euo pipefail
           coverage="$RUNNER_TEMP/sonar-pr-data/coverage.xml"
@@ -135,11 +137,21 @@ jobs:
             exit 1
           fi
           settings="$RUNNER_TEMP/sonar-project.properties"
-          gh api -H "Accept: application/vnd.github.raw" \
-            "repos/$GITHUB_REPOSITORY/contents/sonar-project.properties?ref=$PR_BASE_REF" > "$settings"
+          for attempt in 1 2 3; do
+            if gh api -H "Accept: application/vnd.github.raw" \
+              "repos/$GITHUB_REPOSITORY/contents/sonar-project.properties?ref=$BASE_REF" > "$settings"; then
+              break
+            fi
+            echo "::warning::fetching sonar-project.properties of $BASE_REF failed (attempt $attempt of 3)"
+            if (( attempt == 3 )); then
+              echo "::error::could not fetch sonar-project.properties of $BASE_REF"
+              exit 1
+            fi
+            sleep $((attempt * 10))
+          done
           # Deliberately strict: our file uses plain `key=value` lines.
           for key in sonar.projectKey sonar.sources; do
-            grep -q "^$key=[^[:space:]]" "$settings" || { echo "::error::sonar-project.properties of $PR_BASE_REF has no $key value"; exit 1; }
+            grep -q "^$key=[^[:space:]]" "$settings" || { echo "::error::sonar-project.properties of $BASE_REF has no $key value"; exit 1; }
           done
 
       - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
@@ -179,5 +191,5 @@ jobs:
             -Dsonar.host.url=https://sonarcloud.io
             -Dsonar.projectBaseDir=${{ github.workspace }}
             -Dsonar.pullrequest.key=${{ env.PR_NUMBER }}
-            -Dsonar.pullrequest.branch=${{ env.PR_HEAD_REF }}
-            -Dsonar.pullrequest.base=${{ env.PR_BASE_REF }}
+            -Dsonar.pullrequest.branch=${{ steps.head.outputs.head_ref }}
+            -Dsonar.pullrequest.base=${{ steps.head.outputs.base_ref }}
