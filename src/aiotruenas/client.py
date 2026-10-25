@@ -413,9 +413,16 @@ class TrueNASClient:
             ws = await self._open_websocket(quiet=quiet)
             try:
                 await self._login(ws)
-            except Exception:
-                with contextlib.suppress(WebSocketException, OSError):
-                    await ws.close()
+            except BaseException as exc:
+                # Nothing tracks this socket yet: release it on any failure,
+                # and drop it outright if the login or its graceful close is
+                # interrupted (cancel or any other BaseException).
+                try:
+                    if isinstance(exc, Exception):
+                        with contextlib.suppress(WebSocketException, OSError):
+                            await ws.close()
+                finally:
+                    ws.transport.abort()
                 raise
 
             self._ws = ws

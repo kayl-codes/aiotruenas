@@ -12,6 +12,7 @@ import ssl
 import pytest
 import trustme
 from fake_server import NO_RESULT, FakeTrueNASServer, RawEnvelope
+from websockets.asyncio.client import ClientConnection
 from websockets.protocol import State
 
 from aiotruenas import (
@@ -208,6 +209,70 @@ async def test_connection_lost_mid_login() -> None:
         with pytest.raises(TrueNASConnectionClosedError) as exc_info:
             await client.connect()
         assert exc_info.value.phase == "login"
+
+
+def _record_client_sockets(monkeypatch) -> list[ClientConnection]:
+    """Record every client websocket ``connect()`` opens."""
+    opened: list[ClientConnection] = []
+    real_open = TrueNASClient._open_websocket
+
+    async def recording_open(self, *, quiet: bool = False) -> ClientConnection:
+        ws = await real_open(self, quiet=quiet)
+        opened.append(ws)
+        return ws
+
+    monkeypatch.setattr(TrueNASClient, "_open_websocket", recording_open)
+    return opened
+
+
+async def test_connect_cancelled_mid_login_closes_the_socket(monkeypatch) -> None:
+    opened = _record_client_sockets(monkeypatch)
+    async with FakeTrueNASServer(valid_api_key=API_KEY, hang_login=True) as server:
+        client = make_client(server)
+        connect_task = asyncio.ensure_future(client.connect())
+        async with asyncio.timeout(5):
+            await server.request_seen["auth.login_with_api_key"].wait()
+
+        connect_task.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            async with asyncio.timeout(5):
+                await connect_task
+        async with asyncio.timeout(5):
+            await opened[0].wait_closed()
+        assert not client.connected
+        assert not client._lock.locked()
+
+        server.hang_login = False
+        async with client:
+            await client.connect()
+            assert client.connected
+
+
+async def test_connect_cancelled_while_closing_after_failed_login(
+    monkeypatch,
+) -> None:
+    opened = _record_client_sockets(monkeypatch)
+    close_entered = asyncio.Event()
+
+    async def hanging_close(self, *args, **kwargs) -> None:
+        close_entered.set()
+        await asyncio.Event().wait()
+
+    # Only client connections: the server side keeps its real close().
+    monkeypatch.setattr(ClientConnection, "close", hanging_close)
+    async with FakeTrueNASServer(valid_api_key="another-key") as server:
+        client = make_client(server)
+        connect_task = asyncio.ensure_future(client.connect())
+        async with asyncio.timeout(5):
+            await close_entered.wait()
+
+        connect_task.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            async with asyncio.timeout(5):
+                await connect_task
+        async with asyncio.timeout(5):
+            await opened[0].wait_closed()
+        assert not client.connected
 
 
 async def test_reconnect_after_disconnect() -> None:
