@@ -9,7 +9,8 @@ name: SonarQube (PR analysis)
 # using the workflow file from the base repo's default branch - a fork PR
 # cannot alter what this job does. It only ever downloads the artifact and
 # checks out the PR's already-tested source for static analysis; it never
-# installs dependencies from or executes code from the fork.
+# installs dependencies from or executes code from the fork. All `run:` steps
+# come before that checkout (see the warning there).
 on:
   workflow_run:
     workflows: ["Build"]
@@ -72,71 +73,51 @@ jobs:
           echo "PR_HEAD_REF=$pr_head_ref" >> "$GITHUB_ENV"
           echo "PR_BASE_REF=$pr_base_ref" >> "$GITHUB_ENV"
 
-      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
-        with:
-          fetch-depth: 0  # Shallow clones should be disabled for a better relevancy of analysis
-          # The exact commit build.yml measured coverage on (its PR head), not
-          # the moving refs/pull/N/head: after a further push that ref would
-          # pair newer sources with the older run's coverage.xml.
-          ref: ${{ github.event.workflow_run.head_sha }}
-          persist-credentials: false
-          # checkout refuses fork-PR refs in a workflow_run job by default (the
-          # "pwn request" guard - see https://gh.io/securely-using-pull_request_target),
-          # since a fork's sonar-project.properties is PR-author-controlled and
-          # could otherwise redirect this job's SONAR_TOKEN-bearing traffic
-          # (e.g. via sonar.host.url) to an attacker's server. We neutralize
-          # that below by pinning the properties file to the trusted base ref
-          # and hard-forcing sonar.host.url via -D (which always outranks the
-          # properties file), so allow-unsafe-pr-checkout only ever exposes
-          # the PR's source *text* to the (non-executing) scanner, never its
-          # config.
-          #
-          # WARNING for future editors: this safety argument holds only as
-          # long as no step in this job installs dependencies from, builds,
-          # or otherwise executes the checked-out PR code (the classic pwn
-          # request pattern). If you add such a step, re-litigate whether
-          # allow-unsafe-pr-checkout is still safe here first.
-          allow-unsafe-pr-checkout: true
-
-      - name: Restore coverage report
-        run: cp "${{ runner.temp }}/sonar-pr-data/coverage.xml" coverage.xml
-
-      - name: Pin sonar-project.properties to the trusted base ref
-        # The fork's copy of this file is attacker-controlled and must never
-        # configure a job that holds SONAR_TOKEN (e.g. via sonar.host.url,
-        # proxy settings, exclusions). Overwrite it with the base branch's
-        # version before scanning; only the PR's source/test files (the
-        # intended scan target) come from the fork checkout. PR_BASE_REF is
-        # passed via env: (not spliced into the script) even though it was
-        # already regex-validated earlier - never template context values
-        # directly into run: text.
-        env:
-          PR_BASE_REF: ${{ env.PR_BASE_REF }}
-        run: git show "origin/$PR_BASE_REF:sonar-project.properties" > sonar-project.properties
-
       - name: Skip if the PR has moved on
         # Build runs can finish out of order, so an older run may reach this
-        # job after a newer one. Checked right before the scan, so only the
-        # PR's current head is analysed; together with the queueing group above
+        # job after a newer one. Checked before the checkout and the scan, so
+        # only the PR's current head is analysed; with the queueing group above
         # an older analysis cannot replace a newer one. Transient API errors
         # are retried; an unreadable head SHA then fails the job instead of
-        # skipping silently.
+        # skipping silently. The base and head refs are taken from the same API
+        # reply and replace the ones from the untrusted pr.env, so the fork
+        # cannot pick the branch the scan settings are read from, nor the
+        # branch names the analysis is filed under.
         id: head
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           RUN_HEAD_SHA: ${{ github.event.workflow_run.head_sha }}
+          RUN_HEAD_REPO: ${{ github.event.workflow_run.head_repository.full_name }}
+          RUN_HEAD_BRANCH: ${{ github.event.workflow_run.head_branch }}
         run: |
           set -euo pipefail
           current_sha=""
+          base_ref=""
+          head_ref=""
+          head_repo=""
           for attempt in 1 2 3; do
-            if current_sha=$(gh api "repos/$GITHUB_REPOSITORY/pulls/$PR_NUMBER" --jq .head.sha); then
+            if pr_info=$(gh api "repos/$GITHUB_REPOSITORY/pulls/$PR_NUMBER" --jq '.head.sha + " " + .base.ref + " " + .head.ref + " " + (.head.repo.full_name // "")'); then
+              read -r current_sha base_ref head_ref head_repo <<< "$pr_info"
               break
             fi
-            current_sha=""
-            echo "::warning::reading the head of PR #$PR_NUMBER failed (attempt $attempt of 3)"
+            echo "::warning::reading PR #$PR_NUMBER failed (attempt $attempt of 3)"
             if (( attempt < 3 )); then sleep $((attempt * 10)); fi
           done
           [[ "$current_sha" =~ ^[0-9a-f]{40}$ ]] || { echo "::error::could not read the head SHA of PR #$PR_NUMBER"; exit 1; }
+          [[ "$base_ref" =~ ^[A-Za-z0-9._/-]+$ ]] || { echo "::error::could not read the base ref of PR #$PR_NUMBER"; exit 1; }
+          [[ "$head_ref" =~ ^[A-Za-z0-9._/-]+$ ]] || { echo "::error::could not read the head ref of PR #$PR_NUMBER"; exit 1; }
+          # The PR number comes from the untrusted pr.env: make sure it names
+          # the PR this Build run was for, so no other PR's analysis is touched.
+          if [[ -z "$head_repo" || "$head_repo" != "$RUN_HEAD_REPO" || "$head_ref" != "$RUN_HEAD_BRANCH" ]]; then
+            echo "::error::PR #$PR_NUMBER comes from ${head_repo:-<deleted repo>}:$head_ref, but this Build run is for $RUN_HEAD_REPO:$RUN_HEAD_BRANCH"
+            exit 1
+          fi
+          if [[ "$base_ref" != "$PR_BASE_REF" || "$head_ref" != "$PR_HEAD_REF" ]]; then
+            echo "::warning::pr.env names $PR_HEAD_REF -> $PR_BASE_REF, the PR API $head_ref -> $base_ref; using the API values"
+          fi
+          # Step outputs, not $GITHUB_ENV: later steps read the refs explicitly.
+          echo "base_ref=$base_ref" >> "$GITHUB_OUTPUT"
+          echo "head_ref=$head_ref" >> "$GITHUB_OUTPUT"
           if [[ "$current_sha" == "$RUN_HEAD_SHA" ]]; then
             echo "current=true" >> "$GITHUB_OUTPUT"
           else
@@ -146,6 +127,67 @@ jobs:
             echo "current=false" >> "$GITHUB_OUTPUT"
           fi
 
+      - name: Prepare scan inputs outside the workspace
+        # The fork's copy of sonar-project.properties is attacker-controlled
+        # and must never configure a job that holds SONAR_TOKEN (e.g. via
+        # sonar.host.url, proxy settings, exclusions). The scan reads the base
+        # branch's version from outside the workspace instead (project.settings
+        # below), and the coverage report straight from the artifact.
+        # Runs before the checkout: no `run:` step may come after it.
+        if: steps.head.outputs.current == 'true'
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          BASE_REF: ${{ steps.head.outputs.base_ref }}
+        run: |
+          set -euo pipefail
+          coverage="$RUNNER_TEMP/sonar-pr-data/coverage.xml"
+          if ! { [[ -s "$coverage" ]] && grep -q '<coverage' "$coverage"; }; then
+            echo "::error::coverage.xml is missing, empty or not a coverage report in the PR analysis data"
+            exit 1
+          fi
+          settings="$RUNNER_TEMP/sonar-project.properties"
+          for attempt in 1 2 3; do
+            if gh api -H "Accept: application/vnd.github.raw" \
+              "repos/$GITHUB_REPOSITORY/contents/sonar-project.properties?ref=$BASE_REF" > "$settings"; then
+              break
+            fi
+            echo "::warning::fetching sonar-project.properties of $BASE_REF failed (attempt $attempt of 3)"
+            if (( attempt == 3 )); then
+              echo "::error::could not fetch sonar-project.properties of $BASE_REF"
+              exit 1
+            fi
+            sleep $((attempt * 10))
+          done
+          # Deliberately strict: our file uses plain `key=value` lines.
+          for key in sonar.projectKey sonar.sources; do
+            grep -q "^$key=[^[:space:]]" "$settings" || { echo "::error::sonar-project.properties of $BASE_REF has no $key value"; exit 1; }
+          done
+
+      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+        if: steps.head.outputs.current == 'true'
+        with:
+          fetch-depth: 0  # Shallow clones should be disabled for a better relevancy of analysis
+          # The exact commit build.yml measured coverage on (its PR head), not
+          # the moving refs/pull/N/head: after a further push that ref would
+          # pair newer sources with the older run's coverage.xml.
+          ref: ${{ github.event.workflow_run.head_sha }}
+          persist-credentials: false
+          # checkout refuses fork-PR refs in a workflow_run job by default (the
+          # "pwn request" guard - see https://gh.io/securely-using-pull_request_target).
+          # Here the PR's files are only scan input: the scanner takes its
+          # settings and coverage report from outside the workspace and has
+          # sonar.host.url forced via -D (which always outranks any properties
+          # file), so the PR cannot change the scan configuration or the target host
+          # of its SONAR_TOKEN-bearing traffic.
+          #
+          # WARNING for future editors: this safety argument holds only as
+          # long as no `run:` step comes after this checkout, and no later step
+          # installs dependencies from, builds, or otherwise executes the
+          # checked-out PR code (the classic pwn request pattern). Put new
+          # `run:` steps before the checkout. If you must add one after it, re-litigate
+          # whether allow-unsafe-pr-checkout is still safe here first.
+          allow-unsafe-pr-checkout: true
+
       - name: SonarQube Scan
         if: steps.head.outputs.current == 'true'
         uses: SonarSource/sonarqube-scan-action@713881670b6b3676cda39549040e2d88c70d582e # v8.2.0
@@ -153,7 +195,10 @@ jobs:
           SONAR_TOKEN: ${{ secrets.SONAR_TOKEN }}
         with:
           args: >
+            -Dproject.settings=${{ runner.temp }}/sonar-project.properties
+            -Dsonar.python.coverage.reportPaths=${{ runner.temp }}/sonar-pr-data/coverage.xml
             -Dsonar.host.url=https://sonarcloud.io
+            -Dsonar.projectBaseDir=${{ github.workspace }}
             -Dsonar.pullrequest.key=${{ env.PR_NUMBER }}
-            -Dsonar.pullrequest.branch=${{ env.PR_HEAD_REF }}
-            -Dsonar.pullrequest.base=${{ env.PR_BASE_REF }}
+            -Dsonar.pullrequest.branch=${{ steps.head.outputs.head_ref }}
+            -Dsonar.pullrequest.base=${{ steps.head.outputs.base_ref }}
