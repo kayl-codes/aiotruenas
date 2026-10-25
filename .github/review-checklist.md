@@ -66,8 +66,9 @@ and are the reference for these rules; the README's "Semantics" and stale-data p
   it), not for a sleep. The fake server must withhold the response (e.g. `drop_response_for`), so the call is
   still pending when the cancel or timeout hits. A test for cancellation during send must actually block in
   `send`. A response-timeout test asserts the same evidence (the request reached the server, the lock is free)
-  so that a timeout firing in `send()` would fail it. Flag sleep-based timing and tests that would also pass if
-  the cancel or timeout landed in a different phase.
+  and, after acquiring the lock, that the call is still pending (its task not done, its `_pending_calls` entry
+  present), so that a timeout firing in `send()` would fail it. Flag sleep-based timing and tests that would also
+  pass if the cancel or timeout landed in a different phase.
 - **Fake responses match the real server:** fake-server payloads for a new or changed RPC follow the shape TrueNAS
   actually sends (live run or middleware source), including the "no data" shapes (e.g. a netdata graph item with
   `legend: ["time"]` and empty aggregations), not just the happy path.
