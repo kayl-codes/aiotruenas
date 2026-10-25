@@ -29,10 +29,14 @@ and are the reference for these rules; the README's "Semantics" and stale-data p
   `ENOENT`), never a whole exception class. The evidence (live run or TrueNAS source, with version) belongs in the
   PR. Flag a broad `except`/`isinstance` tolerance without it.
 - **Cancellation:** `asyncio.CancelledError` (and any non-`TrueNASError` `BaseException` from
-  `gather(..., return_exceptions=True)`) is re-raised, never swallowed or converted. Cleanup of per-call state
-  (`_pending_calls`, subscriptions, locks) happens in `finally`, so a cancel in any phase releases it.
-- **Shared connection:** one `asyncio.Lock` serializes send/recv; a failure or cancel while holding it must not
-  leave the lock held or the connection unusable for the next call.
+  `gather(..., return_exceptions=True)`) is re-raised, never swallowed or converted. Cleanup of state a call
+  registers for itself (its `_pending_calls` entry) happens in `finally`, so a cancel in any phase releases it.
+  Caller-owned state is not per-call: a cancelled read from a subscription must not remove that subscription —
+  it stays until `unsubscribe()` or connection teardown.
+- **Shared connection:** one `asyncio.Lock` serializes sends and guards the shared state (`_pending_calls`,
+  `_subscriptions`, connection close); the background `_read_loop` receives without holding it. Flag a change
+  that holds the lock across `recv()` or across waiting for a response — that blocks every other call. A failure
+  or cancel while holding it must not leave the lock held or the connection unusable for the next call.
 - **Docs follow behaviour:** a change to what a public method raises, tolerates or returns updates its docstring,
   the README contract text and `CHANGELOG.md` (`[Unreleased]`) in the same PR.
 

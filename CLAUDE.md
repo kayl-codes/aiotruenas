@@ -38,11 +38,15 @@ pytest                  # unit tests against a fake websockets server (tests/fak
   `pip install -e ".[dev]"`.
 - `pre-commit` is configured ([.pre-commit-config.yaml](.pre-commit-config.yaml)) with the same ruff
   hooks as CI.
+- Code review (local review agents included) checks every diff against
+  [.github/review-checklist.md](.github/review-checklist.md).
 
 ## Architecture (see PROMPT.md for full detail)
 
 - **`TrueNASClient`**: the sole public entry point. Asyncio-native, no threads, no `RLock` — a
-  single `asyncio.Lock` serializes send/recv on the shared WebSocket connection. Public shape:
+  single `asyncio.Lock` serializes sends and guards the shared state on the shared WebSocket
+  connection; a background read loop receives without holding it and routes replies to the
+  waiting calls. Public shape:
   ```python
   async with TrueNASClient(host, api_key, verify_ssl=True) as client:
       result = await client.call("system.info")
