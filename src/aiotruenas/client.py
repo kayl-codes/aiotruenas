@@ -466,6 +466,10 @@ class TrueNASClient:
         If ``job=True``, the result is treated as a job id and polled via
         ``core.get_jobs`` until it reaches a terminal state; the job's own
         result (or error) is returned/raised instead.
+
+        ``params`` that cannot be serialized to JSON raise the error from
+        :func:`json.dumps` (e.g. ``TypeError``, ``ValueError``) before anything
+        is sent; the connection stays usable.
         """
         effective_timeout = self._query_timeout if timeout is None else timeout
 
@@ -474,24 +478,30 @@ class TrueNASClient:
                 raise TrueNASConnectionError("not connected; call connect() first")
 
             rpc_id = self._next_id()
+            # Serialized before the future is registered: params that are not
+            # JSON-serializable raise TypeError/ValueError to the caller with
+            # nothing left behind in _pending_calls and the connection intact.
+            message = json.dumps(
+                {
+                    "jsonrpc": _JSONRPC_VERSION,
+                    "id": rpc_id,
+                    "method": method,
+                    "params": _normalize_params(params),
+                }
+            )
             future: asyncio.Future[dict[str, Any]] = (
                 asyncio.get_running_loop().create_future()
             )
             self._pending_calls[rpc_id] = future
 
-            payload = {
-                "jsonrpc": _JSONRPC_VERSION,
-                "id": rpc_id,
-                "method": method,
-                "params": _normalize_params(params),
-            }
-
             send_error: Exception | None = None
             try:
-                await self._ws.send(json.dumps(payload))
+                await self._ws.send(message)
             except (ConnectionClosed, OSError, WebSocketException) as exc:
                 send_error = exc
-            except asyncio.CancelledError:
+            except BaseException:
+                # Cancellation or an unexpected error from send(): nobody
+                # will wait for this future, so unregister it before raising.
                 self._pending_calls.pop(rpc_id, None)
                 raise
 

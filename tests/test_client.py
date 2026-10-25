@@ -785,6 +785,56 @@ async def test_cancel_while_awaiting_response_does_not_leak_pending_future() -> 
             assert client.connected
 
 
+def _circular_params() -> dict:
+    params: dict = {}
+    params["self"] = params
+    return params
+
+
+@pytest.mark.parametrize(
+    ("params", "error"),
+    [
+        pytest.param({"value": object()}, TypeError, id="not-serializable"),
+        pytest.param(_circular_params(), ValueError, id="circular"),
+    ],
+)
+async def test_unserializable_params_do_not_leak_pending_future(
+    params: dict, error: type[Exception]
+) -> None:
+    async with FakeTrueNASServer(
+        valid_api_key=API_KEY, responses={"system.version": "25.04"}
+    ) as server:
+        async with make_client(server) as client:
+            await client.connect()
+            with pytest.raises(error):
+                await client.call("system.info", params)
+            assert client._pending_calls == {}
+            assert not client._lock.locked()
+            assert client.connected
+            assert await client.call("system.version") == "25.04"
+            # Frames arrive in order, so the failed call never reached the wire.
+            assert not server.request_seen["system.info"].is_set()
+
+
+async def test_unexpected_send_error_does_not_leak_pending_future(monkeypatch) -> None:
+    async with FakeTrueNASServer(
+        valid_api_key=API_KEY, responses={"system.version": "25.04"}
+    ) as server:
+        async with make_client(server) as client:
+            await client.connect()
+            real_send = client._ws.send
+
+            async def failing_send(message: str) -> None:
+                raise RuntimeError("unexpected send failure")
+
+            monkeypatch.setattr(client._ws, "send", failing_send)
+            with pytest.raises(RuntimeError, match="unexpected send failure"):
+                await client.call("system.info")
+            assert client._pending_calls == {}
+            monkeypatch.setattr(client._ws, "send", real_send)
+            assert await client.call("system.version") == "25.04"
+
+
 async def test_cancel_during_send_does_not_leak_pending_future(monkeypatch) -> None:
     async with FakeTrueNASServer(
         valid_api_key=API_KEY, responses={"system.version": "25.04"}
