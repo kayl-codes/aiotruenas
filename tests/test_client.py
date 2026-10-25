@@ -994,6 +994,91 @@ async def test_subscribe_raises_if_the_connection_is_replaced_meanwhile(
             assert client._subscription_events == {}
 
 
+def _is_subscribe_reply(candidate: dict) -> bool:
+    return str(candidate.get("result", "")).startswith("sub-")
+
+
+async def test_subscribe_queues_a_notification_sent_right_after_the_reply(
+    monkeypatch,
+) -> None:
+    async with FakeTrueNASServer(
+        valid_api_key=API_KEY, notify_after_subscribe={"app.stats"}
+    ) as server:
+        async with make_client(server) as client:
+            await client.connect()
+            real_route = client._route_message
+
+            async def route_reply_and_notification_together(ws, candidate):
+                if not _is_subscribe_reply(candidate):
+                    await real_route(ws, candidate)
+                    return
+                # Both frames already received: the reader routes them back to
+                # back, before subscribe() can resume with the reply.
+                notification = client._parse_message(await ws.recv())
+                await real_route(ws, candidate)
+                await real_route(ws, notification)
+
+            monkeypatch.setattr(
+                client, "_route_message", route_reply_and_notification_together
+            )
+            async with asyncio.timeout(5):
+                sub_id, queue = await client.subscribe("app.stats")
+            assert await client.is_subscribed(sub_id)
+            assert queue.qsize() == 1
+            assert queue.get_nowait().get("fields") == [{"initial": True}]
+
+
+async def test_subscribe_cancelled_after_the_reply_untracks_the_subscription(
+    monkeypatch,
+) -> None:
+    async with FakeTrueNASServer(valid_api_key=API_KEY) as server:
+        async with make_client(server) as client:
+            await client.connect()
+            real_route = client._route_message
+            subscribe_task: asyncio.Future | None = None
+
+            async def route_then_cancel_subscribe(ws, candidate):
+                await real_route(ws, candidate)
+                if _is_subscribe_reply(candidate):
+                    # Before subscribe() resumes with the routed reply.
+                    subscribe_task.cancel()
+
+            monkeypatch.setattr(client, "_route_message", route_then_cancel_subscribe)
+            subscribe_task = asyncio.ensure_future(client.subscribe("app.stats"))
+            with pytest.raises(asyncio.CancelledError):
+                async with asyncio.timeout(5):
+                    await subscribe_task
+            assert client._subscriptions == {}
+            assert client._subscription_events == {}
+            assert client._reply_hooks == {}
+            assert client.connected
+
+
+async def test_cancelled_call_drops_its_reply_hook() -> None:
+    async with FakeTrueNASServer(
+        valid_api_key=API_KEY,
+        drop_response_for={"system.info"},
+        responses={"system.version": "25.04"},
+    ) as server:
+        async with make_client(server, query_timeout=30.0) as client:
+            await client.connect()
+            replies: list[dict] = []
+            call_task = asyncio.ensure_future(
+                client._call_on_connection("system.info", None, on_reply=replies.append)
+            )
+            await asyncio.wait_for(server.request_seen["system.info"].wait(), 2)
+            # Taking the lock proves send() returned: the call awaits its reply.
+            async with asyncio.timeout(2), client._lock:
+                pass
+            assert len(client._reply_hooks) == 1
+            call_task.cancel()
+            with pytest.raises(asyncio.CancelledError):
+                await call_task
+            assert client._reply_hooks == {}
+            assert await client.call("system.version") == "25.04"
+            assert not replies
+
+
 async def test_old_connection_cannot_complete_new_calls() -> None:
     async with FakeTrueNASServer(valid_api_key=API_KEY) as server:
         async with make_client(server) as client:
