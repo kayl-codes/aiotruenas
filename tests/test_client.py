@@ -506,13 +506,16 @@ async def test_close_while_call_in_flight_does_not_raise_attribute_error() -> No
             call_task = asyncio.ensure_future(client.call("system.info"))
             close_task = asyncio.ensure_future(client.close())
 
-            with pytest.raises(TrueNASConnectionClosedError):
+            with pytest.raises(
+                TrueNASConnectionClosedError, match="closed by the client"
+            ) as exc_info:
                 await call_task
+            assert exc_info.value.phase == "disconnect"
             await close_task
             assert not client.connected
 
 
-async def _inert_read_loop() -> None:
+async def _inert_read_loop(_ws: ClientConnection) -> None:
     """Stand-in reader that never ends and never tears anything down."""
     await asyncio.Event().wait()
 
@@ -618,9 +621,14 @@ async def test_close_cancelled_during_the_handshake_aborts_the_socket(
             assert not client.connected
 
 
-async def test_close_teardown_survives_a_second_cancel(monkeypatch) -> None:
-    async with FakeTrueNASServer(valid_api_key=API_KEY) as server:
+async def test_close_cancelled_during_the_handshake_fails_pending_calls(
+    monkeypatch,
+) -> None:
+    async with FakeTrueNASServer(
+        valid_api_key=API_KEY, drop_response_for={"system.info"}
+    ) as server:
         client = make_client(server)
+        # Only close() itself can resolve the call: this reader never tears down.
         monkeypatch.setattr(client, "_read_loop", _inert_read_loop)
         async with client:
             await client.connect()
@@ -628,42 +636,600 @@ async def test_close_teardown_survives_a_second_cancel(monkeypatch) -> None:
             call_task = asyncio.ensure_future(client.call("system.info"))
             await server.request_seen["system.info"].wait()
             close_entered = asyncio.Event()
-            teardown_entered = asyncio.Event()
-            gate = asyncio.Event()
-            real_teardown = client._teardown_connection
+            release = asyncio.Event()
 
             async def hanging_close() -> None:
                 close_entered.set()
-                # Released with the teardown, so a failing run cannot hang the
+                # Released at the end, so a failing run cannot hang the
                 # context manager's own close().
-                await gate.wait()
-
-            async def gated_teardown(cause: BaseException | None = None) -> None:
-                teardown_entered.set()
-                await gate.wait()
-                await real_teardown(cause)
+                await release.wait()
 
             monkeypatch.setattr(client._ws, "close", hanging_close)
-            monkeypatch.setattr(client, "_teardown_connection", gated_teardown)
             close_task = asyncio.ensure_future(client.close())
             await close_entered.wait()
-            close_task.cancel()
-            await teardown_entered.wait()
-            close_task.cancel()
             try:
+                # Detached before the handshake: the call has already failed
+                # and the client is disconnected while ws.close() still hangs.
+                with pytest.raises(TrueNASConnectionClosedError, match="by the client"):
+                    async with asyncio.timeout(5):
+                        await call_task
+                assert client._pending_calls == {}
+                assert not client.connected
+
+                close_task.cancel()
                 with pytest.raises(asyncio.CancelledError):
                     async with asyncio.timeout(5):
                         await close_task
             finally:
-                gate.set()
-
-            # The shielded teardown still resolves the pending call.
-            with pytest.raises(TrueNASConnectionClosedError):
-                async with asyncio.timeout(5):
-                    await call_task
-            assert client._pending_calls == {}
+                release.set()
             assert reader.cancelled()
             assert not client.connected
+
+
+def _gate_ws_close(monkeypatch, ws: ClientConnection) -> tuple[asyncio.Event, ...]:
+    """Hold ``ws.close()`` until the returned gate is set."""
+    entered = asyncio.Event()
+    gate = asyncio.Event()
+    real_close = ws.close
+
+    async def gated_close() -> None:
+        entered.set()
+        await gate.wait()
+        await real_close()
+
+    monkeypatch.setattr(ws, "close", gated_close)
+    return entered, gate
+
+
+async def test_connect_during_close_opens_a_fresh_connection(monkeypatch) -> None:
+    async with FakeTrueNASServer(
+        valid_api_key=API_KEY, responses={"system.info": {"hostname": "nas"}}
+    ) as server:
+        async with make_client(server) as client:
+            await client.connect()
+            _, sub_queue = await client.subscribe("app.stats")
+            old_ws = client._ws
+            old_reader = client._reader_task
+            entered, gate = _gate_ws_close(monkeypatch, old_ws)
+            close_task = asyncio.ensure_future(client.close())
+            try:
+                async with asyncio.timeout(5):
+                    await entered.wait()
+                # close() holds the lock in its handshake and has already
+                # detached the connection; connect() queues behind it.
+                assert not client.connected
+                assert sub_queue.get_nowait() is client._QUEUE_TERMINATOR
+                connect_task = asyncio.ensure_future(client.connect())
+                await asyncio.sleep(0)
+                assert not connect_task.done()
+                assert len(client._lock._waiters or ()) == 1
+            finally:
+                gate.set()
+
+            async with asyncio.timeout(5):
+                await connect_task
+                await close_task
+            # The old reader has torn down (close() awaited it) without
+            # touching the new connection.
+            assert old_reader.done()
+            assert client.connected
+            assert client._ws is not old_ws
+            assert client._ws.state is State.OPEN
+            assert await client.call("system.info") == {"hostname": "nas"}
+
+
+async def test_connect_after_a_call_timeout_opens_a_fresh_connection(
+    monkeypatch,
+) -> None:
+    async with FakeTrueNASServer(
+        valid_api_key=API_KEY,
+        drop_response_for={"system.info"},
+        responses={"system.version": "25.04"},
+    ) as server:
+        async with make_client(server) as client:
+            await client.connect()
+            _, sub_queue = await client.subscribe("app.stats")
+            old_ws = client._ws
+            old_reader = client._reader_task
+            other_call = asyncio.ensure_future(client.call("system.info"))
+            entered, gate = _gate_ws_close(monkeypatch, old_ws)
+            call_task = asyncio.ensure_future(client.call("system.info", timeout=0.2))
+            try:
+                # The timed-out call closes its connection under the lock and
+                # takes the other call and the subscription down with it.
+                async with asyncio.timeout(5):
+                    await entered.wait()
+                # Both requests reached the server; only the response wait
+                # has a timeout.
+                assert server.request_seen["system.info"].is_set()
+                assert not client.connected
+                with pytest.raises(
+                    TrueNASConnectionClosedError, match="timed out"
+                ) as exc_info:
+                    async with asyncio.timeout(5):
+                        await other_call
+                assert exc_info.value.phase == "disconnect"
+                assert sub_queue.get_nowait() is client._QUEUE_TERMINATOR
+                connect_task = asyncio.ensure_future(client.connect())
+                await asyncio.sleep(0)
+                assert not connect_task.done()
+                assert len(client._lock._waiters or ()) == 1
+            finally:
+                gate.set()
+
+            with pytest.raises(TrueNASCallTimeoutError):
+                async with asyncio.timeout(5):
+                    await call_task
+            async with asyncio.timeout(5):
+                await connect_task
+                await asyncio.wait([old_reader])
+            # The old reader has ended without touching the new connection.
+            assert client.connected
+            assert client._ws is not old_ws
+            assert client._ws.state is State.OPEN
+            assert await client.call("system.version") == "25.04"
+
+
+async def test_call_cancelled_while_closing_after_timeout_releases_the_socket(
+    monkeypatch,
+) -> None:
+    async with FakeTrueNASServer(
+        valid_api_key=API_KEY, drop_response_for={"system.info"}
+    ) as server:
+        async with make_client(server) as client:
+            await client.connect()
+            ws = client._ws
+            reader = client._reader_task
+            close_entered = asyncio.Event()
+            release = asyncio.Event()
+
+            async def hanging_close() -> None:
+                close_entered.set()
+                await release.wait()
+
+            monkeypatch.setattr(ws, "close", hanging_close)
+            call_task = asyncio.ensure_future(client.call("system.info", timeout=0.2))
+            try:
+                async with asyncio.timeout(5):
+                    await close_entered.wait()
+                # The request reached the server; only the response wait has
+                # a timeout.
+                assert server.request_seen["system.info"].is_set()
+                call_task.cancel()
+                with pytest.raises(asyncio.CancelledError):
+                    async with asyncio.timeout(5):
+                        await call_task
+                # Nobody tracks the detached socket: the cancelled close must
+                # still drop it and stop its reader.
+                assert ws.transport.is_closing()
+                async with asyncio.timeout(5):
+                    await asyncio.wait([reader])
+            finally:
+                release.set()
+            assert not client.connected
+
+
+async def test_call_cancelled_while_waiting_to_close_after_timeout_detaches(
+    monkeypatch,
+) -> None:
+    async with FakeTrueNASServer(
+        valid_api_key=API_KEY,
+        drop_response_for={"system.info", "system.version"},
+        responses={"system.hostname": "nas"},
+    ) as server:
+        async with make_client(server) as client:
+            await client.connect()
+            _, sub_queue = await client.subscribe("app.stats")
+            ws = client._ws
+            reader = client._reader_task
+            close_reached = asyncio.Event()
+            real_close = client._close_failed_call_connection
+
+            async def signalling_close(*args) -> None:
+                close_reached.set()
+                await real_close(*args)
+
+            monkeypatch.setattr(
+                client, "_close_failed_call_connection", signalling_close
+            )
+            other_call = asyncio.ensure_future(client.call("system.version"))
+            # Long enough for the lock to be taken first, even on a slow runner.
+            call_task = asyncio.ensure_future(client.call("system.info", timeout=1.0))
+            async with asyncio.timeout(5):
+                await server.request_seen["system.version"].wait()
+                await server.request_seen["system.info"].wait()
+                # Another operation holds the lock when the call times out.
+                await client._lock.acquire()
+            try:
+                async with asyncio.timeout(5):
+                    await close_reached.wait()
+                assert len(client._lock._waiters or ()) == 1
+                call_task.cancel()
+                with pytest.raises(asyncio.CancelledError):
+                    async with asyncio.timeout(5):
+                        await call_task
+                # The cancel must not leave the timed-out connection current.
+                assert not client.connected
+                with pytest.raises(
+                    TrueNASConnectionClosedError, match="timed out"
+                ) as exc_info:
+                    async with asyncio.timeout(5):
+                        await other_call
+                assert exc_info.value.phase == "disconnect"
+                assert sub_queue.get_nowait() is client._QUEUE_TERMINATOR
+                assert ws.transport.is_closing()
+                assert reader.cancelling()
+            finally:
+                client._lock.release()
+
+            # The stopped reader's teardown needed the lock; it leaves the
+            # detached state alone, and a fresh connection works.
+            async with asyncio.timeout(5):
+                await asyncio.wait([reader])
+                await client.connect()
+            assert client._ws is not ws
+            assert await client.call("system.hostname") == "nas"
+
+
+async def test_send_failure_detaches_the_connection(monkeypatch) -> None:
+    async with FakeTrueNASServer(
+        valid_api_key=API_KEY, drop_response_for={"system.info"}
+    ) as server:
+        async with make_client(server) as client:
+            await client.connect()
+            _, sub_queue = await client.subscribe("app.stats")
+            pending_call = asyncio.ensure_future(client.call("system.info"))
+            await server.request_seen["system.info"].wait()
+            old_ws = client._ws
+
+            async def failing_send(_message: str) -> None:
+                raise OSError("send broke")
+
+            monkeypatch.setattr(old_ws, "send", failing_send)
+            with pytest.raises(TrueNASConnectionClosedError, match="send broke") as exc:
+                await client.call("system.version")
+            assert exc.value.phase == "call"
+
+            assert not client.connected
+            with pytest.raises(
+                TrueNASConnectionClosedError, match="send broke"
+            ) as exc_info:
+                async with asyncio.timeout(5):
+                    await pending_call
+            assert exc_info.value.phase == "disconnect"
+            assert sub_queue.get_nowait() is client._QUEUE_TERMINATOR
+            assert client._pending_calls == {}
+            await client.connect()
+            assert client._ws is not old_ws
+
+
+async def test_failed_call_closes_only_its_own_connection() -> None:
+    # call()'s timeout and error paths re-take the lock before closing; by
+    # then a reconnect may have replaced the connection the call ran on.
+    async with FakeTrueNASServer(
+        valid_api_key=API_KEY, responses={"system.version": "25.04"}
+    ) as server:
+        async with make_client(server) as client:
+            await client.connect()
+            old_ws = client._ws
+            await client.close()
+            await client.connect()
+            new_ws = client._ws
+
+            async with client._lock:
+                await client._close_websocket_locked(old_ws, "old call failed")
+            assert new_ws.state is State.OPEN
+            assert await client.call("system.version") == "25.04"
+
+            # Cancelled while waiting for the lock, the close detaches without
+            # it, which must equally leave the newer connection alone.
+            async with client._lock:
+                close_task = asyncio.ensure_future(
+                    client._close_failed_call_connection(old_ws, "old call failed")
+                )
+                await asyncio.sleep(0)
+                assert len(client._lock._waiters or ()) == 1
+                close_task.cancel()
+                with pytest.raises(asyncio.CancelledError):
+                    async with asyncio.timeout(5):
+                        await close_task
+                assert client._ws is new_ws
+            assert new_ws.state is State.OPEN
+            assert await client.call("system.version") == "25.04"
+
+
+async def test_old_connection_cannot_feed_new_subscriptions() -> None:
+    async with FakeTrueNASServer(valid_api_key=API_KEY) as server:
+        async with make_client(server) as client:
+            await client.connect()
+            old_ws = client._ws
+            await client.close()
+            await client.connect()
+            sub_id, queue = await client.subscribe("app.stats")
+            messages = [
+                {"jsonrpc": "2.0", "id": sub_id, "params": {}},
+                {
+                    "jsonrpc": "2.0",
+                    "method": "collection_update",
+                    "collection": "app.stats",
+                    "params": {"collection": "app.stats"},
+                },
+            ]
+
+            # Control: from the current connection, both messages arrive.
+            for message in messages:
+                await client._route_message(client._ws, message)
+            assert queue.qsize() == 2
+
+            # Late messages the old connection's reader still routes.
+            for message in messages:
+                await client._route_message(old_ws, message)
+            assert queue.qsize() == 2
+
+
+async def test_subscribe_raises_if_the_connection_is_replaced_meanwhile(
+    monkeypatch,
+) -> None:
+    async with FakeTrueNASServer(valid_api_key=API_KEY) as server:
+        async with make_client(server) as client:
+            await client.connect()
+            real_call = client._call_on_connection
+
+            async def call_then_reconnect(method, params, **kwargs):
+                result = await real_call(method, params, **kwargs)
+                # A reconnect, not just a close: the client is connected
+                # again, but not on the connection the subscription ran on.
+                await client.close()
+                await client.connect()
+                return result
+
+            monkeypatch.setattr(client, "_call_on_connection", call_then_reconnect)
+            with pytest.raises(
+                TrueNASConnectionClosedError, match="subscribing"
+            ) as exc_info:
+                await client.subscribe("app.stats")
+            assert exc_info.value.phase == "call"
+            assert client.connected
+            assert client._subscriptions == {}
+            assert client._subscription_events == {}
+
+
+async def test_old_connection_cannot_complete_new_calls() -> None:
+    async with FakeTrueNASServer(valid_api_key=API_KEY) as server:
+        async with make_client(server) as client:
+            await client.connect()
+            old_ws = client._ws
+            await client.close()
+            await client.connect()
+            future = asyncio.get_running_loop().create_future()
+            client._pending_calls[999] = future
+
+            # A late reply the old connection's reader still routes.
+            await client._route_message(
+                old_ws, {"jsonrpc": "2.0", "id": 999, "result": "stale"}
+            )
+            assert not future.done()
+            assert client._pending_calls[999] is future
+
+            # Control: the current connection completes the call.
+            await client._route_message(
+                client._ws, {"jsonrpc": "2.0", "id": 999, "result": "fresh"}
+            )
+            assert future.result()["result"] == "fresh"
+
+
+async def test_subscribe_behind_a_reconnect_registers_on_the_new_connection(
+    monkeypatch,
+) -> None:
+    async with FakeTrueNASServer(valid_api_key=API_KEY) as server:
+        async with make_client(server) as client:
+            await client.connect()
+            old_ws = client._ws
+            entered, gate = _gate_ws_close(monkeypatch, old_ws)
+            close_task = asyncio.ensure_future(client.close())
+            try:
+                async with asyncio.timeout(5):
+                    await entered.wait()
+                # close() holds the lock. connect() queues first, then
+                # subscribe(): its core.subscribe runs on the new connection.
+                connect_task = asyncio.ensure_future(client.connect())
+                await asyncio.sleep(0)
+                subscribe_task = asyncio.ensure_future(client.subscribe("app.stats"))
+                await asyncio.sleep(0)
+                assert len(client._lock._waiters or ()) == 2
+            finally:
+                gate.set()
+
+            async with asyncio.timeout(5):
+                await close_task
+                await connect_task
+                sub_id, queue = await subscribe_task
+            assert client._ws is not old_ws
+            assert await client.is_subscribed(sub_id)
+            await server.send_subscription_event(
+                sub_id, {"fields": [{"app_name": "app-1"}]}
+            )
+            async with asyncio.timeout(5):
+                event = await queue.get()
+            assert event is not client._QUEUE_TERMINATOR
+
+
+async def test_unsubscribe_of_an_ended_subscription_sends_nothing() -> None:
+    async with FakeTrueNASServer(valid_api_key=API_KEY) as server:
+        async with make_client(server) as client:
+            await client.connect()
+            old_id, _ = await client.subscribe("app.stats")
+            await client.close()
+            await client.connect()
+            new_id, new_queue = await client.subscribe("app.stats")
+
+            await client.unsubscribe(old_id)
+
+            assert not server.request_seen["core.unsubscribe"].is_set()
+            assert await client.is_subscribed(new_id)
+            assert new_queue.empty()
+
+            # Without a connection, nothing is tracked and nothing is sent.
+            await client.close()
+            await client.unsubscribe(new_id)
+            assert not server.request_seen["core.unsubscribe"].is_set()
+
+
+async def test_unsubscribe_does_not_touch_a_newer_connection(monkeypatch) -> None:
+    async with FakeTrueNASServer(valid_api_key=API_KEY) as server:
+        async with make_client(server) as client:
+            await client.connect()
+            sub_id, old_queue = await client.subscribe("app.stats")
+            real_call = client._call_on_connection
+            new_queue: asyncio.Queue = asyncio.Queue()
+
+            async def reconnect_then_call(method, params, **kwargs):
+                await client.close()
+                await client.connect()
+                # The server hands out the same id on the new connection.
+                async with client._lock:
+                    client._subscriptions[sub_id] = new_queue
+                    client._subscription_events[sub_id] = "app.stats"
+                return await real_call(method, params, **kwargs)
+
+            monkeypatch.setattr(client, "_call_on_connection", reconnect_then_call)
+            with pytest.raises(
+                TrueNASConnectionClosedError, match="core.unsubscribe"
+            ) as exc_info:
+                await client.unsubscribe(sub_id)
+            assert exc_info.value.phase == "call"
+            assert not server.request_seen["core.unsubscribe"].is_set()
+            # The old subscription ended with its connection; the new one
+            # with the same id stays.
+            assert old_queue.get_nowait() is client._QUEUE_TERMINATOR
+            assert client._subscriptions == {sub_id: new_queue}
+            assert new_queue.empty()
+
+
+async def test_unsubscribe_answered_before_a_reconnect_keeps_the_new_subscription(
+    monkeypatch,
+) -> None:
+    async with FakeTrueNASServer(valid_api_key=API_KEY) as server:
+        async with make_client(server) as client:
+            await client.connect()
+            sub_id, old_queue = await client.subscribe("app.stats")
+            real_call = client._call_on_connection
+            new_queue: asyncio.Queue = asyncio.Queue()
+
+            async def call_then_reconnect(method, params, **kwargs):
+                result = await real_call(method, params, **kwargs)
+                await client.close()
+                await client.connect()
+                # The server hands out the same id on the new connection.
+                async with client._lock:
+                    client._subscriptions[sub_id] = new_queue
+                    client._subscription_events[sub_id] = "app.stats"
+                return result
+
+            monkeypatch.setattr(client, "_call_on_connection", call_then_reconnect)
+            await client.unsubscribe(sub_id)
+            assert server.request_seen["core.unsubscribe"].is_set()
+            assert old_queue.get_nowait() is client._QUEUE_TERMINATOR
+            assert client._subscriptions == {sub_id: new_queue}
+            assert new_queue.empty()
+
+
+async def test_unsubscribe_rejected_by_the_server_can_be_retried(monkeypatch) -> None:
+    async with FakeTrueNASServer(valid_api_key=API_KEY) as server:
+        async with make_client(server) as client:
+            await client.connect()
+            sub_id, queue = await client.subscribe("app.stats")
+            real_handler = server._handle_unsubscribe
+
+            async def reject(ws, rpc_id, params):
+                await ws.send(
+                    json.dumps(
+                        {
+                            "jsonrpc": "2.0",
+                            "id": rpc_id,
+                            "error": {"code": -32000, "message": "busy"},
+                        }
+                    )
+                )
+
+            monkeypatch.setattr(server, "_handle_unsubscribe", reject)
+            with pytest.raises(TrueNASCallError, match="busy"):
+                await client.unsubscribe(sub_id)
+            # Still tracked and not ended: the server kept the subscription.
+            assert await client.is_subscribed(sub_id)
+            assert queue.empty()
+
+            monkeypatch.setattr(server, "_handle_unsubscribe", real_handler)
+            await client.unsubscribe(sub_id)
+            assert not await client.is_subscribed(sub_id)
+            assert queue.get_nowait() is client._QUEUE_TERMINATOR
+
+
+async def test_unsubscribe_timeout_ends_the_subscription(monkeypatch) -> None:
+    async with FakeTrueNASServer(valid_api_key=API_KEY) as server:
+        async with make_client(server, query_timeout=0.2) as client:
+            await client.connect()
+            sub_id, queue = await client.subscribe("app.stats")
+
+            async def never_answer(ws, rpc_id, params):
+                return None
+
+            monkeypatch.setattr(server, "_handle_unsubscribe", never_answer)
+            with pytest.raises(TrueNASCallTimeoutError):
+                await client.unsubscribe(sub_id)
+            assert server.request_seen["core.unsubscribe"].is_set()
+            # The timeout closed the connection, which ended the subscription.
+            assert not client.connected
+            assert not await client.is_subscribed(sub_id)
+            assert queue.get_nowait() is client._QUEUE_TERMINATOR
+
+
+async def test_unsubscribe_cancelled_after_sending_ends_the_subscription(
+    monkeypatch,
+) -> None:
+    async with FakeTrueNASServer(valid_api_key=API_KEY) as server:
+        async with make_client(server, query_timeout=30) as client:
+            await client.connect()
+            sub_id, queue = await client.subscribe("app.stats")
+
+            async def drop_then_never_answer(ws, rpc_id, params):
+                server._subscriptions.pop(params[0], None)
+
+            monkeypatch.setattr(server, "_handle_unsubscribe", drop_then_never_answer)
+            task = asyncio.ensure_future(client.unsubscribe(sub_id))
+            async with asyncio.timeout(5):
+                await server.request_seen["core.unsubscribe"].wait()
+            task.cancel()
+            with pytest.raises(asyncio.CancelledError):
+                async with asyncio.timeout(5):
+                    await task
+            # The server may have dropped it: the subscription ends locally,
+            # and the connection stays up.
+            assert client.connected
+            assert not await client.is_subscribed(sub_id)
+            assert queue.get_nowait() is client._QUEUE_TERMINATOR
+
+
+async def test_call_bound_to_a_closed_connection_raises_closed_error() -> None:
+    async with FakeTrueNASServer(valid_api_key=API_KEY) as server:
+        async with make_client(server) as client:
+            await client.connect()
+            old_ws = client._ws
+            await client.close()
+
+            # Bound to the closed connection: closed, not "not connected".
+            with pytest.raises(
+                TrueNASConnectionClosedError,
+                match="connection closed before 'system.info' was sent",
+            ) as exc_info:
+                await client._call_on_connection(
+                    "system.info", None, expected_ws=old_ws
+                )
+            assert exc_info.value.phase == "call"
+
+            # Control: an unbound call reports the missing connection.
+            with pytest.raises(TrueNASConnectionError, match="not connected"):
+                await client._call_on_connection("system.info", None)
 
 
 async def test_close_in_cancel_cleanup_tolerates_a_cancelled_reader(
@@ -739,10 +1305,10 @@ async def test_subscribe_raises_on_non_string_subscription_id(monkeypatch) -> No
         async with make_client(server) as client:
             await client.connect()
 
-            async def fake_call(method, params=None, *, job: bool = False):
-                return {"result": 123}
+            async def fake_call(method, params, **kwargs):
+                return {"result": 123}, client._ws
 
-            monkeypatch.setattr(client, "call", fake_call)
+            monkeypatch.setattr(client, "_call_on_connection", fake_call)
             with pytest.raises(TrueNASMalformedResponseError) as excinfo:
                 await client.subscribe("app.stats")
             assert "core.subscribe" in str(excinfo.value)
