@@ -92,6 +92,9 @@ guess the wire format from the legacy client alone.
 - No threads, no `RLock` — use a single `asyncio.Lock` to serialize send/recv on the shared
   connection (asyncio is single-threaded, so the dual-lock scheme in the old sync client, needed
   there to order I/O-lock vs. fast-state-lock across OS threads, can collapse to one lock here).
+  *As implemented:* the lock serializes sends and guards the shared state; receiving happens in a
+  background read loop that does **not** hold it (holding it across `recv()` would block every
+  other call), see `CLAUDE.md` and `.github/review-checklist.md`.
 - Public API shape (adjust names as you see fit, but keep this shape):
   ```python
   async with TrueNASClient(host, api_key, verify_ssl=True) as client:

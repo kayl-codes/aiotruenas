@@ -27,12 +27,17 @@ and are the reference for these rules; the README's "Semantics" and stale-data p
 - **Tolerances match verified error shapes:** an error that is deliberately tolerated must be matched as narrowly as
   the evidence allows (e.g. `TrueNASCallError` with a specific `errname`, as for an unknown `cputemp` graph:
   `ENOENT`), never a whole exception class. The evidence (live run or TrueNAS source, with version) belongs in the
-  PR. Flag a broad `except`/`isinstance` tolerance without it.
+  PR. Flag a broad `except`/`isinstance` tolerance without it. This rule is about suppressing an error while
+  presenting a fresh result; a `TrueNASState` cache fallback that catches `TrueNASError` and reports the endpoint
+  as stale follows the state-layer contract above and is not a violation.
 - **Cancellation:** `asyncio.CancelledError` (and any non-`TrueNASError` `BaseException` from
-  `gather(..., return_exceptions=True)`) is re-raised, never swallowed or converted. Cleanup of state a call
-  registers for itself (its `_pending_calls` entry) happens in `finally`, so a cancel in any phase releases it.
-  Caller-owned state is not per-call: a cancelled read from a subscription must not remove that subscription —
-  it stays until `unsubscribe()` or connection teardown.
+  `gather(..., return_exceptions=True)`) is re-raised, never swallowed or converted. The one exception is a task
+  the client itself cancels and awaits (the read loop during `close()`), whose expected `CancelledError` is
+  suppressed. State a call registers for itself (its `_pending_calls` entry) is removed on **every** exit path —
+  success, error, cancellation, and an error raised before the wait starts (e.g. while building or sending the
+  request) — whether by `finally` or by a phase-specific handler. Caller-owned state is not per-call: a cancelled
+  read from a subscription must not remove that subscription — it stays until `unsubscribe()` or connection
+  teardown.
 - **Shared connection:** one `asyncio.Lock` serializes sends and guards the shared state (`_pending_calls`,
   `_subscriptions`, connection close); the background `_read_loop` receives without holding it. Flag a change
   that holds the lock across `recv()` or across waiting for a response — that blocks every other call. A failure
@@ -45,10 +50,11 @@ and are the reference for these rules; the README's "Semantics" and stale-data p
 - **A test must fail without the fix (mutation probe):** for every bug fix, state in the PR which line was reverted
   or replaced and which test failed. A tolerance is pinned from both sides: the tolerated case passes and a
   near-miss (other `errname`, missing `data`, a non-optional graph) still raises.
-- **Cancel and timeout tests prove the phase:** a test for cancellation after the request was sent must wait for
-  evidence that the request reached the fake server (e.g. `FakeTrueNASServer.request_seen`), not for a sleep; a
-  test for cancellation during send must actually block in `send`. Flag sleep-based timing and tests that would
-  also pass if the cancel landed in a different phase.
+- **Cancel and timeout tests prove the phase:** a test for cancellation while awaiting the response must wait for
+  evidence that the request reached the fake server (e.g. `FakeTrueNASServer.request_seen`) **and** that `send()`
+  returned (the server can see the request while `send()` still drains; acquiring `client._lock` proves the call
+  released it), not for a sleep; a test for cancellation during send must actually block in `send`. Flag
+  sleep-based timing and tests that would also pass if the cancel landed in a different phase.
 - **Fake responses match the real server:** fake-server payloads for a new or changed RPC follow the shape TrueNAS
   actually sends (live run or middleware source), including the "no data" shapes (e.g. a netdata graph item with
   `legend: ["time"]` and empty aggregations), not just the happy path.
