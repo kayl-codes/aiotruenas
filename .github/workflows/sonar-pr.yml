@@ -25,11 +25,14 @@ jobs:
       github.event.workflow_run.event == 'pull_request' &&
       github.event.workflow_run.conclusion == 'success'
     runs-on: ubuntu-latest
-    # One scan per PR branch at a time; a newer one cancels an older one still
-    # running, so an outdated analysis cannot finish last and replace it.
+    # Scans of one PR branch run one at a time and are never cancelled: a late
+    # older run then waits, and the head check below makes it skip, while a
+    # newer one waiting behind an older scan runs last. Only a third run
+    # arriving out of order can still replace a waiting one (GitHub keeps one
+    # pending run per group).
     concurrency:
       group: sonar-pr-${{ github.event.workflow_run.head_repository.full_name }}-${{ github.event.workflow_run.head_branch }}
-      cancel-in-progress: true
+      cancel-in-progress: false
     permissions:
       contents: read
       actions: read
@@ -69,30 +72,7 @@ jobs:
           echo "PR_HEAD_REF=$pr_head_ref" >> "$GITHUB_ENV"
           echo "PR_BASE_REF=$pr_base_ref" >> "$GITHUB_ENV"
 
-      - name: Skip if the PR has moved on
-        # Build runs can finish out of order, and the concurrency group above
-        # only cancels by arrival. Scan only while this run's commit is still
-        # the PR head, so an older analysis never replaces a newer one. A
-        # failing API call fails the job instead of skipping silently.
-        id: head
-        env:
-          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-          RUN_HEAD_SHA: ${{ github.event.workflow_run.head_sha }}
-        run: |
-          set -euo pipefail
-          current_sha=$(gh api "repos/$GITHUB_REPOSITORY/pulls/$PR_NUMBER" --jq .head.sha)
-          [[ "$current_sha" =~ ^[0-9a-f]{40}$ ]] || { echo "::error::could not read the head SHA of PR #$PR_NUMBER"; exit 1; }
-          if [[ "$current_sha" == "$RUN_HEAD_SHA" ]]; then
-            echo "current=true" >> "$GITHUB_OUTPUT"
-          else
-            reason="Skipping scan: $RUN_HEAD_SHA is no longer the head of PR #$PR_NUMBER ($current_sha)"
-            echo "::notice::$reason"
-            echo "$reason" >> "$GITHUB_STEP_SUMMARY"
-            echo "current=false" >> "$GITHUB_OUTPUT"
-          fi
-
       - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
-        if: steps.head.outputs.current == 'true'
         with:
           fetch-depth: 0  # Shallow clones should be disabled for a better relevancy of analysis
           # The exact commit build.yml measured coverage on (its PR head), not
@@ -119,7 +99,6 @@ jobs:
           allow-unsafe-pr-checkout: true
 
       - name: Restore coverage report
-        if: steps.head.outputs.current == 'true'
         run: cp "${{ runner.temp }}/sonar-pr-data/coverage.xml" coverage.xml
 
       - name: Pin sonar-project.properties to the trusted base ref
@@ -131,10 +110,41 @@ jobs:
         # passed via env: (not spliced into the script) even though it was
         # already regex-validated earlier - never template context values
         # directly into run: text.
-        if: steps.head.outputs.current == 'true'
         env:
           PR_BASE_REF: ${{ env.PR_BASE_REF }}
         run: git show "origin/$PR_BASE_REF:sonar-project.properties" > sonar-project.properties
+
+      - name: Skip if the PR has moved on
+        # Build runs can finish out of order, so an older run may reach this
+        # job after a newer one. Checked right before the scan, so only the
+        # PR's current head is analysed; together with the queueing group above
+        # an older analysis cannot replace a newer one. Transient API errors
+        # are retried; an unreadable head SHA then fails the job instead of
+        # skipping silently.
+        id: head
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          RUN_HEAD_SHA: ${{ github.event.workflow_run.head_sha }}
+        run: |
+          set -euo pipefail
+          current_sha=""
+          for attempt in 1 2 3; do
+            if current_sha=$(gh api "repos/$GITHUB_REPOSITORY/pulls/$PR_NUMBER" --jq .head.sha); then
+              break
+            fi
+            current_sha=""
+            echo "::warning::reading the head of PR #$PR_NUMBER failed (attempt $attempt of 3)"
+            if (( attempt < 3 )); then sleep $((attempt * 10)); fi
+          done
+          [[ "$current_sha" =~ ^[0-9a-f]{40}$ ]] || { echo "::error::could not read the head SHA of PR #$PR_NUMBER"; exit 1; }
+          if [[ "$current_sha" == "$RUN_HEAD_SHA" ]]; then
+            echo "current=true" >> "$GITHUB_OUTPUT"
+          else
+            reason="Skipping scan: $RUN_HEAD_SHA is no longer the head of PR #$PR_NUMBER ($current_sha)"
+            echo "::notice::$reason"
+            echo "$reason" >> "$GITHUB_STEP_SUMMARY"
+            echo "current=false" >> "$GITHUB_OUTPUT"
+          fi
 
       - name: SonarQube Scan
         if: steps.head.outputs.current == 'true'
