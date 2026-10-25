@@ -521,6 +521,29 @@ class TrueNASClient:
                 # Nothing tracks the detached socket and reader any more.
                 self._release_socket(ws, reader_task)
 
+    async def _close_failed_call_connection(
+        self, ws: ClientConnection, message: str
+    ) -> None:
+        """Close ``ws`` after a failed call, even if cancelled on the way.
+
+        A cancel while another operation holds the lock still detaches and
+        releases ``ws``, then re-raises. That detach runs without the lock: it
+        is synchronous and only acts while ``ws`` is current. A lock holder
+        suspended meanwhile is a ``connect()`` (only runs with no current
+        connection), a close that already detached, or another call sending on
+        ``ws``, whose pending future the detach fails.
+        """
+        try:
+            await self._lock.acquire()
+        except asyncio.CancelledError:
+            if self._ws is ws:
+                self._release_socket(ws, self._detach_connection_locked(message))
+            raise
+        try:
+            await self._close_websocket_locked(ws, message)
+        finally:
+            self._lock.release()
+
     async def call(
         self,
         method: str,
@@ -613,10 +636,9 @@ class TrueNASClient:
             async with asyncio.timeout(effective_timeout):
                 response = await future
         except TimeoutError as e:
-            async with self._lock:
-                await self._close_websocket_locked(
-                    ws, f"connection closed after {method!r} timed out"
-                )
+            await self._close_failed_call_connection(
+                ws, f"connection closed after {method!r} timed out"
+            )
             raise TrueNASCallTimeoutError(
                 f"timed out while waiting for response to {method!r}"
             ) from e
@@ -625,8 +647,7 @@ class TrueNASClient:
             OSError,
             WebSocketException,
         ) as exc:
-            async with self._lock:
-                await self._close_websocket_locked(ws, str(exc))
+            await self._close_failed_call_connection(ws, str(exc))
             raise TrueNASConnectionClosedError(str(exc), phase="call") from exc
         finally:
             # Every exit unregisters the future -- including cancellation

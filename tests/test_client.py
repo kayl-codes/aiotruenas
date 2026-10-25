@@ -809,6 +809,68 @@ async def test_call_cancelled_while_closing_after_timeout_releases_the_socket(
             assert not client.connected
 
 
+async def test_call_cancelled_while_waiting_to_close_after_timeout_detaches(
+    monkeypatch,
+) -> None:
+    async with FakeTrueNASServer(
+        valid_api_key=API_KEY,
+        drop_response_for={"system.info", "system.version"},
+        responses={"system.hostname": "nas"},
+    ) as server:
+        async with make_client(server) as client:
+            await client.connect()
+            _, sub_queue = await client.subscribe("app.stats")
+            ws = client._ws
+            reader = client._reader_task
+            close_reached = asyncio.Event()
+            real_close = client._close_failed_call_connection
+
+            async def signalling_close(*args) -> None:
+                close_reached.set()
+                await real_close(*args)
+
+            monkeypatch.setattr(
+                client, "_close_failed_call_connection", signalling_close
+            )
+            other_call = asyncio.ensure_future(client.call("system.version"))
+            # Long enough for the lock to be taken first, even on a slow runner.
+            call_task = asyncio.ensure_future(client.call("system.info", timeout=1.0))
+            async with asyncio.timeout(5):
+                await server.request_seen["system.version"].wait()
+                await server.request_seen["system.info"].wait()
+                # Another operation holds the lock when the call times out.
+                await client._lock.acquire()
+            try:
+                async with asyncio.timeout(5):
+                    await close_reached.wait()
+                assert len(client._lock._waiters or ()) == 1
+                call_task.cancel()
+                with pytest.raises(asyncio.CancelledError):
+                    async with asyncio.timeout(5):
+                        await call_task
+                # The cancel must not leave the timed-out connection current.
+                assert not client.connected
+                with pytest.raises(
+                    TrueNASConnectionClosedError, match="timed out"
+                ) as exc_info:
+                    async with asyncio.timeout(5):
+                        await other_call
+                assert exc_info.value.phase == "disconnect"
+                assert sub_queue.get_nowait() is client._QUEUE_TERMINATOR
+                assert ws.transport.is_closing()
+                assert reader.cancelling()
+            finally:
+                client._lock.release()
+
+            # The stopped reader's teardown needed the lock; it leaves the
+            # detached state alone, and a fresh connection works.
+            async with asyncio.timeout(5):
+                await asyncio.wait([reader])
+                await client.connect()
+            assert client._ws is not ws
+            assert await client.call("system.hostname") == "nas"
+
+
 async def test_send_failure_detaches_the_connection(monkeypatch) -> None:
     async with FakeTrueNASServer(
         valid_api_key=API_KEY, drop_response_for={"system.info"}
@@ -856,6 +918,22 @@ async def test_failed_call_closes_only_its_own_connection() -> None:
 
             async with client._lock:
                 await client._close_websocket_locked(old_ws, "old call failed")
+            assert new_ws.state is State.OPEN
+            assert await client.call("system.version") == "25.04"
+
+            # Cancelled while waiting for the lock, the close detaches without
+            # it, which must equally leave the newer connection alone.
+            async with client._lock:
+                close_task = asyncio.ensure_future(
+                    client._close_failed_call_connection(old_ws, "old call failed")
+                )
+                await asyncio.sleep(0)
+                assert len(client._lock._waiters or ()) == 1
+                close_task.cancel()
+                with pytest.raises(asyncio.CancelledError):
+                    async with asyncio.timeout(5):
+                        await close_task
+                assert client._ws is new_ws
             assert new_ws.state is State.OPEN
             assert await client.call("system.version") == "25.04"
 
