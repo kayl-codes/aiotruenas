@@ -511,7 +511,8 @@ async def test_close_cancelled_before_the_lock_leaves_the_connection_intact() ->
                 close_task = asyncio.ensure_future(client.close())
                 await asyncio.sleep(0)
                 # close() is queued on the lock, not finished or unstarted.
-                assert len(client._lock._waiters) == 1
+                assert not close_task.done()
+                assert len(client._lock._waiters or ()) == 1
                 close_task.cancel()
                 # Bounded: a close() that tears down here would wait for the
                 # lock this test holds.
@@ -531,6 +532,7 @@ async def test_close_cancelled_during_the_handshake_aborts_the_socket(
         async with make_client(server) as client:
             await client.connect()
             ws = client._ws
+            reader = client._reader_task
             close_entered = asyncio.Event()
 
             async def hanging_close() -> None:
@@ -546,6 +548,56 @@ async def test_close_cancelled_during_the_handshake_aborts_the_socket(
                 async with asyncio.timeout(5):
                     await close_task
             assert ws.transport.is_closing()
+            async with asyncio.timeout(5):
+                await asyncio.wait([reader])
+            assert not client.connected
+
+
+async def test_close_teardown_survives_a_second_cancel(monkeypatch) -> None:
+    async with FakeTrueNASServer(valid_api_key=API_KEY) as server:
+        client = make_client(server)
+        monkeypatch.setattr(client, "_read_loop", _inert_read_loop)
+        async with client:
+            await client.connect()
+            reader = client._reader_task
+            call_task = asyncio.ensure_future(client.call("system.info"))
+            await server.request_seen["system.info"].wait()
+            close_entered = asyncio.Event()
+            teardown_entered = asyncio.Event()
+            gate = asyncio.Event()
+            real_teardown = client._teardown_connection
+
+            async def hanging_close() -> None:
+                close_entered.set()
+                # Released with the teardown, so a failing run cannot hang the
+                # context manager's own close().
+                await gate.wait()
+
+            async def gated_teardown(cause: BaseException | None = None) -> None:
+                teardown_entered.set()
+                await gate.wait()
+                await real_teardown(cause)
+
+            monkeypatch.setattr(client._ws, "close", hanging_close)
+            monkeypatch.setattr(client, "_teardown_connection", gated_teardown)
+            close_task = asyncio.ensure_future(client.close())
+            await close_entered.wait()
+            close_task.cancel()
+            await teardown_entered.wait()
+            close_task.cancel()
+            try:
+                with pytest.raises(asyncio.CancelledError):
+                    async with asyncio.timeout(5):
+                        await close_task
+            finally:
+                gate.set()
+
+            # The shielded teardown still resolves the pending call.
+            with pytest.raises(TrueNASConnectionClosedError):
+                async with asyncio.timeout(5):
+                    await call_task
+            assert client._pending_calls == {}
+            assert reader.cancelled()
             assert not client.connected
 
 
@@ -566,6 +618,8 @@ async def test_close_in_cancel_cleanup_tolerates_a_cancelled_reader(
                     await asyncio.Event().wait()
                 # Caught but not uncancelled: the count stays at 1. The reader
                 # is cancelled on its own, so close() sees its CancelledError.
+                # The re-raise side is pinned by
+                # test_close_cancelled_by_caller_propagates_and_tears_down.
                 reader.cancel()
                 await client.close()
                 return asyncio.current_task().cancelling()

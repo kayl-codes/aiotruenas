@@ -424,8 +424,8 @@ class TrueNASClient:
     async def close(self) -> None:
         """Close the WebSocket connection, if any. Safe to call repeatedly.
 
-        The lifecycle is intentionally split into two lock acquisitions:
-        1. close the websocket, which ends the reader task
+        The lifecycle is intentionally split around the lock:
+        1. close the websocket under the lock, which ends the reader task
         2. await the reader task outside the lock
         3. run shared teardown under the lock again
 
@@ -471,12 +471,14 @@ class TrueNASClient:
         """Release the socket and reader of a close() that got past the lock."""
         if reader_task is not None and not reader_task.done():
             reader_task.cancel()
-        if ws.state is not State.CLOSED:
-            # The closing handshake was cut short (cancelled or failed): drop
-            # the transport instead of leaving the socket open.
-            ws.transport.abort()
-        # Shielded so a second cancel cannot leave pending calls unresolved.
-        await asyncio.shield(self._teardown_connection())
+        try:
+            if ws.state is not State.CLOSED:
+                # The closing handshake was cut short (cancelled or failed):
+                # drop the transport instead of leaving the socket open.
+                ws.transport.abort()
+        finally:
+            # Shielded so a second cancel cannot leave pending calls unresolved.
+            await asyncio.shield(self._teardown_connection())
 
     async def _close_websocket_locked(self) -> None:
         """Close ``self._ws``. Caller must already hold ``self._lock``."""
