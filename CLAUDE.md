@@ -49,7 +49,9 @@ pytest                  # unit tests against a fake websockets server (tests/fak
   ```
   `connect()` raises typed exceptions on failure (no `return None, check .error` pattern like the
   synchronous HA-side client). `call(method, params, *, timeout=None, job=False)` is the generic RPC
-  surface — no typed per-domain convenience methods in v1 (e.g. no `get_pools()`).
+  surface. `TrueNASState` (dict-based, cached, best-effort fallbacks) and `TrueNASSystem`
+  (typed frozen dataclasses from `models.py`, stateless, raises instead of falling back; system
+  info, interfaces, stats) sit on top of it.
 - **Exception hierarchy**: `TrueNASError` base with subclasses for the error taxonomy carried over
   from the sync client's `ERR_*` constants (cert verification, wrong scheme/port, TLS/WS negotiation
   failures, DNS failure, connection refused, handshake timeout, invalid API key, proxy/SSO
@@ -65,7 +67,9 @@ pytest                  # unit tests against a fake websockets server (tests/fak
 ## Non-goals (see PROMPT.md for full rationale)
 
 - No `homeassistant.*` imports.
-- No typed per-domain convenience methods in v1 (generic `call(method, params)` only).
+- Typed models are added per domain only when a consumer needs them (currently system info,
+  network interfaces, system stats); `TrueNASState`'s dict API stays unchanged for existing
+  consumers.
 - No verbatim code from `truenas/api_client` (LGPL-3.0) — protocol understanding only, reimplemented
   independently to keep this repo Apache-2.0.
 - No SCRAM-SHA-512 implementation in this step (see Architecture above).

@@ -22,6 +22,8 @@ from .exceptions import (
     TrueNASUnsupportedTlsVersionError,
     TrueNASWebSocketUnsupportedError,
 )
+from .models import InterfaceTraffic, NetworkInterface, SystemInfo, SystemStats
+from .system import TrueNASSystem
 
 __version__ = "1.6.1"
 
@@ -29,6 +31,11 @@ __all__ = [
     "DEFAULT_QUERY_TIMEOUT",
     "TrueNASClient",
     "TrueNASState",
+    "TrueNASSystem",
+    "SystemInfo",
+    "SystemStats",
+    "NetworkInterface",
+    "InterfaceTraffic",
     "TrueNASError",
     "TrueNASConnectionError",
     "TrueNASCertificateVerificationError",

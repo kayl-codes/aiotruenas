@@ -28,6 +28,7 @@ Issues = "https://github.com/kayl-codes/aiotruenas/issues"
 
 [project.optional-dependencies]
 dev = [
+    "mypy>=1.11",
     "pytest>=8",
     "pytest-asyncio>=0.24",
     "pytest-cov>=6",
@@ -40,6 +41,7 @@ include = [
     "/src",
     "/tests",
     "/README.md",
+    "/CHANGELOG.md",
     "/LICENSE",
     "/PROMPT.md",
 ]
@@ -54,6 +56,27 @@ target-version = "py313"
 [tool.ruff.lint]
 # FURB/PERF/PIE/PLE/PLW/RET/RSE: a local pre-check for Sourcery-style refactorings (PLR/TRY left out as noise).
 select = ["E", "F", "W", "I", "UP", "ASYNC", "FURB", "PERF", "PIE", "PLE", "PLW", "RET", "RSE"]
+
+[tool.mypy]
+python_version = "3.13"
+
+# The typed models API is held to the flags ``--strict`` enables; the rest of
+# the package is not (yet) strict-clean. ``strict`` itself is a global-only
+# option, so the per-module equivalents are listed explicitly.
+[[tool.mypy.overrides]]
+module = ["aiotruenas.models", "aiotruenas.system"]
+check_untyped_defs = true
+disallow_any_generics = true
+disallow_incomplete_defs = true
+disallow_subclassing_any = true
+disallow_untyped_calls = true
+disallow_untyped_decorators = true
+disallow_untyped_defs = true
+extra_checks = true
+no_implicit_reexport = true
+strict_equality = true
+warn_return_any = true
+warn_unused_ignores = true
 
 [tool.pytest.ini_options]
 asyncio_mode = "auto"
