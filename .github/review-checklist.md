@@ -25,7 +25,9 @@ and are the reference for these rules; the README's "Semantics" and stale-data p
   previous values. Documented caller-input errors stay standard exceptions (e.g. `ValueError` for an invalid host,
   `KeyError` for an unknown subscription, the `json.dumps` error for unserializable `params`), and a caller-requested
   wait that simply expires (`get_subscription_events(event_timeout=...)` returning `[]`) is not a failure; neither
-  is a violation. `TrueNASState` may fall back to its cached snapshot, but every new fallback must be
+  is a violation. "Malformed" means the response as a whole or a required field has the wrong shape; a documented,
+  logged skip of single unusable list entries (e.g. interfaces without a usable `id` in `get_network_interfaces()`)
+  is not. `TrueNASState` may fall back to its cached snapshot, but every new fallback must be
   reflected in its stale signal (`stale_endpoints`, `systemstats_stale_graphs`, `ups_stale_graphs`) or the README
   must say why not. Flag a fallback that changes neither.
 - **Tolerances match verified error shapes:** an error that is deliberately tolerated must be matched as narrowly as
@@ -61,10 +63,11 @@ and are the reference for these rules; the README's "Semantics" and stale-data p
   fresh evidence that **this** request reached the fake server (e.g. `FakeTrueNASServer.request_seen` for a method
   no earlier step of the test called, or cleared before the call) **and** that its `send()` returned (the server
   can see the request while `send()` still drains; acquiring `client._lock` after that proves the call released
-  it), not for a sleep; a test for cancellation during send must actually block in `send`. A response-timeout
-  test asserts the same evidence (the request reached the server, the lock is free) so that a timeout firing in
-  `send()` would fail it. Flag sleep-based timing and tests that would also pass if the cancel or timeout landed
-  in a different phase.
+  it), not for a sleep. The fake server must withhold the response (e.g. `drop_response_for`), so the call is
+  still pending when the cancel or timeout hits. A test for cancellation during send must actually block in
+  `send`. A response-timeout test asserts the same evidence (the request reached the server, the lock is free)
+  so that a timeout firing in `send()` would fail it. Flag sleep-based timing and tests that would also pass if
+  the cancel or timeout landed in a different phase.
 - **Fake responses match the real server:** fake-server payloads for a new or changed RPC follow the shape TrueNAS
   actually sends (live run or middleware source), including the "no data" shapes (e.g. a netdata graph item with
   `legend: ["time"]` and empty aggregations), not just the happy path.
