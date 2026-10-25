@@ -11,6 +11,7 @@ from typing import Any, Self
 
 from websockets.asyncio.client import ClientConnection, connect
 from websockets.exceptions import ConnectionClosed, WebSocketException
+from websockets.protocol import State
 
 from ._errors import build_call_error, classify_connect_exception
 from .exceptions import (
@@ -423,25 +424,61 @@ class TrueNASClient:
     async def close(self) -> None:
         """Close the WebSocket connection, if any. Safe to call repeatedly.
 
-        The lifecycle is intentionally split into two lock acquisitions:
-        1. close the websocket and cancel the reader task
+        The lifecycle is intentionally split around the lock:
+        1. close the websocket under the lock, which ends the reader task
         2. await the reader task outside the lock
         3. run shared teardown under the lock again
 
         This avoids deadlock while keeping connection state mutations serialized.
+        A cancelled ``close()`` re-raises. Cancelled before it holds the lock,
+        it leaves the connection untouched; cancelled later, it still aborts
+        the socket, stops the reader and tears the connection down.
         """
+        ws = None
         reader_task = None
-        async with self._lock:
-            if self._ws is None:
-                return
-            reader_task = self._reader_task
-            self._reader_task = None
-            with contextlib.suppress(WebSocketException, OSError):
-                await self._ws.close()
-        if reader_task is not None:
-            with contextlib.suppress(asyncio.CancelledError):
-                await reader_task
-        await self._teardown_connection()
+        try:
+            async with self._lock:
+                ws = self._ws
+                if ws is None:
+                    return
+                reader_task = self._reader_task
+                self._reader_task = None
+                with contextlib.suppress(WebSocketException, OSError):
+                    await ws.close()
+            if reader_task is not None:
+                await self._await_reader(reader_task)
+        finally:
+            if ws is not None:
+                await self._finish_close(ws, reader_task)
+
+    @staticmethod
+    async def _await_reader(reader_task: asyncio.Task[None]) -> None:
+        """Wait for the reader to end, tolerating only its own cancellation."""
+        current = asyncio.current_task()
+        # Compare against the count on entry: a caller that caught an earlier
+        # cancel (e.g. ``close()`` in an ``except CancelledError`` cleanup)
+        # keeps a positive count without being cancelled again here.
+        cancels_before = current.cancelling() if current is not None else 0
+        try:
+            await reader_task
+        except asyncio.CancelledError:
+            if current is not None and current.cancelling() > cancels_before:
+                raise
+
+    async def _finish_close(
+        self, ws: ClientConnection, reader_task: asyncio.Task[None] | None
+    ) -> None:
+        """Release the socket and reader of a close() that got past the lock."""
+        if reader_task is not None and not reader_task.done():
+            reader_task.cancel()
+        try:
+            if ws.state is not State.CLOSED:
+                # The closing handshake was cut short (cancelled or failed):
+                # drop the transport instead of leaving the socket open.
+                ws.transport.abort()
+        finally:
+            # Shielded so a second cancel cannot leave pending calls unresolved.
+            await asyncio.shield(self._teardown_connection())
 
     async def _close_websocket_locked(self) -> None:
         """Close ``self._ws``. Caller must already hold ``self._lock``."""
