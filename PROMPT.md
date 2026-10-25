@@ -93,8 +93,10 @@ guess the wire format from the legacy client alone.
   single-threaded, so the dual-lock scheme in the old sync client, needed there to order I/O-lock
   vs. fast-state-lock across OS threads, can collapse to one lock here). The lock serializes sends
   and guards the shared state; a background read loop receives and routes replies to the waiting
-  calls. The lock must **not** be held across `recv()` or while waiting for a response — that
-  would block every other call (see `CLAUDE.md` and `.github/review-checklist.md`).
+  calls. On an established connection the lock must **not** be held across `recv()` or while
+  waiting for a response — that would block every other call. Connection setup is the exception:
+  `connect()` holds the lock through the login handshake, so concurrent `connect()` calls cannot
+  open competing sockets (see `CLAUDE.md` and `.github/review-checklist.md`).
 - Public API shape (adjust names as you see fit, but keep this shape):
   ```python
   async with TrueNASClient(host, api_key, verify_ssl=True) as client:
