@@ -25,9 +25,18 @@ jobs:
       github.event.workflow_run.event == 'pull_request' &&
       github.event.workflow_run.conclusion == 'success'
     runs-on: ubuntu-latest
+    # Scans of one PR branch run one at a time and are never cancelled: a late
+    # older run then waits, and the head check below makes it skip, while a
+    # newer one waiting behind an older scan runs last. Only a third run
+    # arriving out of order can still replace a waiting one (GitHub keeps one
+    # pending run per group).
+    concurrency:
+      group: sonar-pr-${{ github.event.workflow_run.head_repository.full_name }}-${{ github.event.workflow_run.head_branch }}
+      cancel-in-progress: false
     permissions:
       contents: read
       actions: read
+      pull-requests: read
     steps:
       - name: Download PR analysis data
         uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
@@ -66,7 +75,10 @@ jobs:
       - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
         with:
           fetch-depth: 0  # Shallow clones should be disabled for a better relevancy of analysis
-          ref: refs/pull/${{ env.PR_NUMBER }}/head
+          # The exact commit build.yml measured coverage on (its PR head), not
+          # the moving refs/pull/N/head: after a further push that ref would
+          # pair newer sources with the older run's coverage.xml.
+          ref: ${{ github.event.workflow_run.head_sha }}
           persist-credentials: false
           # checkout refuses fork-PR refs in a workflow_run job by default (the
           # "pwn request" guard - see https://gh.io/securely-using-pull_request_target),
@@ -102,7 +114,40 @@ jobs:
           PR_BASE_REF: ${{ env.PR_BASE_REF }}
         run: git show "origin/$PR_BASE_REF:sonar-project.properties" > sonar-project.properties
 
+      - name: Skip if the PR has moved on
+        # Build runs can finish out of order, so an older run may reach this
+        # job after a newer one. Checked right before the scan, so only the
+        # PR's current head is analysed; together with the queueing group above
+        # an older analysis cannot replace a newer one. Transient API errors
+        # are retried; an unreadable head SHA then fails the job instead of
+        # skipping silently.
+        id: head
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          RUN_HEAD_SHA: ${{ github.event.workflow_run.head_sha }}
+        run: |
+          set -euo pipefail
+          current_sha=""
+          for attempt in 1 2 3; do
+            if current_sha=$(gh api "repos/$GITHUB_REPOSITORY/pulls/$PR_NUMBER" --jq .head.sha); then
+              break
+            fi
+            current_sha=""
+            echo "::warning::reading the head of PR #$PR_NUMBER failed (attempt $attempt of 3)"
+            if (( attempt < 3 )); then sleep $((attempt * 10)); fi
+          done
+          [[ "$current_sha" =~ ^[0-9a-f]{40}$ ]] || { echo "::error::could not read the head SHA of PR #$PR_NUMBER"; exit 1; }
+          if [[ "$current_sha" == "$RUN_HEAD_SHA" ]]; then
+            echo "current=true" >> "$GITHUB_OUTPUT"
+          else
+            reason="Skipping scan: $RUN_HEAD_SHA is no longer the head of PR #$PR_NUMBER ($current_sha)"
+            echo "::notice::$reason"
+            echo "$reason" >> "$GITHUB_STEP_SUMMARY"
+            echo "current=false" >> "$GITHUB_OUTPUT"
+          fi
+
       - name: SonarQube Scan
+        if: steps.head.outputs.current == 'true'
         uses: SonarSource/sonarqube-scan-action@713881670b6b3676cda39549040e2d88c70d582e # v8.2.0
         env:
           SONAR_TOKEN: ${{ secrets.SONAR_TOKEN }}
