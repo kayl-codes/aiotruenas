@@ -87,14 +87,17 @@ jobs:
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           RUN_HEAD_SHA: ${{ github.event.workflow_run.head_sha }}
+          RUN_HEAD_REPO: ${{ github.event.workflow_run.head_repository.full_name }}
+          RUN_HEAD_BRANCH: ${{ github.event.workflow_run.head_branch }}
         run: |
           set -euo pipefail
           current_sha=""
           base_ref=""
           head_ref=""
+          head_repo=""
           for attempt in 1 2 3; do
-            if pr_info=$(gh api "repos/$GITHUB_REPOSITORY/pulls/$PR_NUMBER" --jq '.head.sha + " " + .base.ref + " " + .head.ref'); then
-              read -r current_sha base_ref head_ref <<< "$pr_info"
+            if pr_info=$(gh api "repos/$GITHUB_REPOSITORY/pulls/$PR_NUMBER" --jq '.head.sha + " " + .base.ref + " " + .head.ref + " " + (.head.repo.full_name // "")'); then
+              read -r current_sha base_ref head_ref head_repo <<< "$pr_info"
               break
             fi
             echo "::warning::reading PR #$PR_NUMBER failed (attempt $attempt of 3)"
@@ -103,6 +106,12 @@ jobs:
           [[ "$current_sha" =~ ^[0-9a-f]{40}$ ]] || { echo "::error::could not read the head SHA of PR #$PR_NUMBER"; exit 1; }
           [[ "$base_ref" =~ ^[A-Za-z0-9._/-]+$ ]] || { echo "::error::could not read the base ref of PR #$PR_NUMBER"; exit 1; }
           [[ "$head_ref" =~ ^[A-Za-z0-9._/-]+$ ]] || { echo "::error::could not read the head ref of PR #$PR_NUMBER"; exit 1; }
+          # The PR number comes from the untrusted pr.env: make sure it names
+          # the PR this Build run was for, so no other PR's analysis is touched.
+          if [[ -z "$head_repo" || "$head_repo" != "$RUN_HEAD_REPO" || "$head_ref" != "$RUN_HEAD_BRANCH" ]]; then
+            echo "::error::PR #$PR_NUMBER comes from ${head_repo:-<deleted repo>}:$head_ref, but this Build run is for $RUN_HEAD_REPO:$RUN_HEAD_BRANCH"
+            exit 1
+          fi
           if [[ "$base_ref" != "$PR_BASE_REF" || "$head_ref" != "$PR_HEAD_REF" ]]; then
             echo "::warning::pr.env names $PR_HEAD_REF -> $PR_BASE_REF, the PR API $head_ref -> $base_ref; using the API values"
           fi
