@@ -53,4 +53,5 @@ published on the [GitHub releases page](https://github.com/kayl-codes/aiotruenas
 
 ### Unchanged
 
-- `TrueNASState` and its dict-based API are untouched; existing consumers need no changes.
+- `TrueNASState` keeps its dict-based API. Its only change is the two new `get_pool()` keys
+  above, so existing consumers need no changes.
