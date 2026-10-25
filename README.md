@@ -54,8 +54,8 @@ rather than returned as an error code/string, so callers can `except TrueNASAuth
   closes the connection the same way.
 - `connect()` then opens a new connection, also when it waited for a `close()` still in progress.
   Subscriptions do not carry over to the new connection: subscribe again.
-- `subscribe()` raises `TrueNASConnectionClosedError` if its connection closes before the
-  subscription is registered.
+- `subscribe()` raises `TrueNASConnectionClosedError` if its connection closes before it returns.
+  Notifications the server sends right after its `core.subscribe` reply are already in the queue.
 - `unsubscribe()` sends `core.unsubscribe` only for a subscription of the current connection. For a
   subscription that already ended with its connection, it returns without a request.
 

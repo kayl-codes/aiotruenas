@@ -53,6 +53,9 @@ class FakeTrueNASServer:
     request_seen: defaultdict[str, asyncio.Event] = field(
         default_factory=lambda: defaultdict(asyncio.Event), init=False
     )
+    #: Events whose ``core.subscribe`` reply is followed at once by one
+    #: notification, as from an event source that sends its current state.
+    notify_after_subscribe: set[str] = field(default_factory=set)
     close_on_method: set[str] = field(default_factory=set)
     close_before_login_response: bool = False
     #: Never answer the login, so a test can cancel connect() mid-login.
@@ -198,6 +201,10 @@ class FakeTrueNASServer:
         self._subscriptions[subscription_id] = {"event": event}
         self._connection_for_subscription[subscription_id] = ws
         await ws.send(_envelope(rpc_id, **{_KEY_RESULT: subscription_id}))
+        if event in self.notify_after_subscribe:
+            await self.send_subscription_event(
+                subscription_id, {"fields": [{"initial": True}]}
+            )
 
     async def _handle_unsubscribe(
         self, ws: ServerConnection, rpc_id: Any, params: list
