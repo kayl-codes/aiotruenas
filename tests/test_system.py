@@ -50,6 +50,19 @@ _CALL_ERROR = {
     }
 }
 
+# What TrueNAS 25.10 answers for a graph name it has no plugin for.
+_NO_SUCH_GRAPH_ERROR = {
+    "error": {
+        "code": -32001,
+        "message": "[ENOENT] 'cputemp' is not a valid graph plugin.",
+        "data": {
+            "error": 2,
+            "errname": "ENOENT",
+            "reason": "[ENOENT] 'cputemp' is not a valid graph plugin.",
+        },
+    }
+}
+
 
 def _graph(legend: list[str], mean: dict[str, Any], **extra: Any) -> dict[str, Any]:
     return {"legend": ["time", *legend], "aggregations": {"mean": mean}, **extra}
@@ -535,7 +548,7 @@ async def test_get_system_stats_raises_on_malformed_graph(graph: str) -> None:
         await _run(responses, lambda s: s.get_system_stats())
 
 
-@pytest.mark.parametrize("graph", ["cpu", "memory", "arcsize", "interface"])
+@pytest.mark.parametrize("graph", ["cpu", "cputemp", "memory", "arcsize", "interface"])
 async def test_get_system_stats_propagates_graph_call_error(graph: str) -> None:
     graphs = dict(_GRAPHS)
     graphs[graph] = _CALL_ERROR
@@ -545,9 +558,9 @@ async def test_get_system_stats_propagates_graph_call_error(graph: str) -> None:
     assert f"while fetching netdata graph '{graph}'" in excinfo.value.__notes__
 
 
-async def test_get_system_stats_tolerates_cputemp_call_error() -> None:
+async def test_get_system_stats_tolerates_unknown_cputemp_graph() -> None:
     graphs = dict(_GRAPHS)
-    graphs["cputemp"] = _CALL_ERROR
+    graphs["cputemp"] = _NO_SUCH_GRAPH_ERROR
     result = await _run(
         {NETDATA: _netdata(graphs)},
         lambda s: s.get_system_stats(_info(physical_memory=34359738368)),
@@ -557,6 +570,55 @@ async def test_get_system_stats_tolerates_cputemp_call_error() -> None:
     assert result.memory_usage_percent == 75.0
     assert result.arc_size == 4294967296
     assert set(result.interfaces) == {"eno1", "eno2"}
+
+
+@pytest.mark.parametrize(
+    ("graph", "error"),
+    [
+        *((g, _NO_SUCH_GRAPH_ERROR) for g in ("cpu", "memory", "arcsize", "interface")),
+        ("cputemp", {"error": {"code": -32001, "message": "[ENOENT] no data"}}),
+    ],
+)
+async def test_get_system_stats_only_tolerates_enoent_for_cputemp(
+    graph: str, error: dict[str, Any]
+) -> None:
+    graphs = dict(_GRAPHS)
+    graphs[graph] = error
+    responses = {NETDATA: _netdata(graphs)}
+    with pytest.raises(TrueNASCallError) as excinfo:
+        await _run(responses, lambda s: s.get_system_stats())
+    assert f"while fetching netdata graph '{graph}'" in excinfo.value.__notes__
+
+
+async def test_get_system_stats_unknown_cputemp_does_not_hide_other_error() -> None:
+    graphs = dict(_GRAPHS)
+    graphs["cputemp"] = _NO_SUCH_GRAPH_ERROR
+    graphs["cpu"] = _CALL_ERROR
+    responses = {NETDATA: _netdata(graphs)}
+    with pytest.raises(TrueNASCallError) as excinfo:
+        await _run(responses, lambda s: s.get_system_stats())
+    assert excinfo.value.errname == "EFAULT"
+    assert excinfo.value.__notes__ == ["while fetching netdata graph 'cpu'"]
+
+
+async def test_get_system_stats_cputemp_without_sensor_is_none() -> None:
+    # Without a temperature sensor netdata has no cputemp chart; TrueNAS
+    # answers with a series-less item instead of an error.
+    graphs = dict(_GRAPHS)
+    graphs["cputemp"] = [
+        {
+            "name": "cputemp",
+            "identifier": "cputemp",
+            "legend": ["time"],
+            "data": [],
+            "start": 1700000000,
+            "end": 1700000060,
+            "aggregations": {"min": {}, "mean": {}, "max": {}},
+        }
+    ]
+    result = await _run({NETDATA: _netdata(graphs)}, lambda s: s.get_system_stats())
+    assert result.cpu_temperature is None
+    assert result.cpu_usage_percent == 12.5
 
 
 def _raw_graph(legend: list[str], data: list[Any], **extra: Any) -> dict[str, Any]:
