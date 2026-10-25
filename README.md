@@ -181,8 +181,12 @@ Semantics:
   shape (e.g. a netdata graph item with neither a `legend` list nor `aggregations.mean`, or an
   `interface` item without
   `identifier`) raises `TrueNASMalformedResponseError`. Nothing is swallowed. The one
-  exception: a JSON-RPC error for the optional `cputemp` graph (e.g. no temperature chart on that
-  hardware) only leaves `cpu_temperature` as `None`.
+  exception: if TrueNAS does not know the optional `cputemp` graph at all (JSON-RPC error with
+  errname `ENOENT`), only `cpu_temperature` is `None`; any other error for it is raised.
+- A missing netdata chart is not an error on the TrueNAS side: on hardware without a temperature
+  sensor, or when netdata cannot deliver a chart, TrueNAS returns the graph without series, so the
+  field is `None`. A `None` reading therefore does not distinguish "not supported" from "netdata
+  had no data".
 - When several graph calls fail at once, the root cause (e.g. the call timeout) is raised rather
   than the connection-closed / "not connected" errors it triggers in the other graph calls.
 

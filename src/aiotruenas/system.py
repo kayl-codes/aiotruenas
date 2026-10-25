@@ -50,11 +50,13 @@ _GRAPH_MEMORY = "memory"
 _GRAPH_ARCSIZE = "arcsize"
 _GRAPH_INTERFACE = "interface"
 
-# Graphs whose server-side failure (a JSON-RPC error, e.g. no such chart on
-# hardware without a temperature sensor) only blanks their own field instead
-# of failing the whole get_system_stats() call. Connection, timeout and auth
-# errors still propagate.
+# Graphs whose absence on the server ("... is not a valid graph plugin.",
+# errname ENOENT) only blanks their own field instead of failing the whole
+# get_system_stats() call. Every other error still propagates. Hardware
+# without a temperature sensor is not an error at all: TrueNAS then returns
+# the graph with no series.
 _OPTIONAL_GRAPHS = frozenset({_GRAPH_CPUTEMP})
+_ERRNAME_NO_SUCH_GRAPH = "ENOENT"
 
 # Netdata aggregation window, relative to now: the most recent samples are
 # skipped since netdata may not have collected them yet.
@@ -323,6 +325,15 @@ def _is_disconnect_symptom(error: TrueNASError) -> bool:
     )
 
 
+def _is_absent_optional_graph(graph: str, result: object) -> bool:
+    """Whether ``result`` is TrueNAS reporting an optional graph as unknown."""
+    return (
+        graph in _OPTIONAL_GRAPHS
+        and isinstance(result, TrueNASCallError)
+        and result.errname == _ERRNAME_NO_SUCH_GRAPH
+    )
+
+
 def _primary_error(errors: list[tuple[str, TrueNASError]]) -> TrueNASError:
     """Pick the error to raise from several failed graph calls.
 
@@ -417,11 +428,13 @@ class TrueNASSystem:
 
         Any failing graph fails the whole call with its error (the root cause
         is preferred over the connection-closed errors a timeout triggers in
-        the other in-flight calls). The one exception is ``cputemp``: a
-        JSON-RPC error for it (e.g. no temperature chart on that hardware)
-        only leaves ``cpu_temperature`` ``None``. A graph response of the wrong
-        shape (not a list of items with a ``legend`` list, or an ``interface``
-        item without ``identifier``) raises
+        the other in-flight calls). The one exception is ``cputemp``: if
+        TrueNAS does not know that graph at all (JSON-RPC error with errname
+        ``ENOENT``), only ``cpu_temperature`` is ``None``. On hardware without
+        a temperature sensor TrueNAS returns the graph without series, which
+        also yields ``None``. A graph response of the wrong shape (not a list
+        of items with a ``legend`` list, or an ``interface`` item without
+        ``identifier``) raises
         :class:`~aiotruenas.exceptions.TrueNASMalformedResponseError`; a
         well-formed one that lacks a series yields ``None`` for that field.
         """
@@ -468,8 +481,12 @@ class TrueNASSystem:
         data: dict[str, list[Any]] = {}
         errors: list[tuple[str, TrueNASError]] = []
         for graph, result in zip(graphs, results, strict=True):
-            if isinstance(result, TrueNASCallError) and graph in _OPTIONAL_GRAPHS:
-                _LOGGER.debug("Optional netdata graph '%s' failed: %s", graph, result)
+            if _is_absent_optional_graph(graph, result):
+                _LOGGER.debug(
+                    "Optional netdata graph '%s' not available on server: %s",
+                    graph,
+                    result,
+                )
             elif isinstance(result, TrueNASError):
                 errors.append((graph, result))
             elif isinstance(result, BaseException):
