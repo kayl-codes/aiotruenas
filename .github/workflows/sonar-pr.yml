@@ -66,7 +66,10 @@ jobs:
       - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
         with:
           fetch-depth: 0  # Shallow clones should be disabled for a better relevancy of analysis
-          ref: refs/pull/${{ env.PR_NUMBER }}/head
+          # The exact commit build.yml measured coverage on (its PR head), not
+          # the moving refs/pull/N/head: after a further push that ref would
+          # pair newer sources with the older run's coverage.xml.
+          ref: ${{ github.event.workflow_run.head_sha }}
           persist-credentials: false
           # checkout refuses fork-PR refs in a workflow_run job by default (the
           # "pwn request" guard - see https://gh.io/securely-using-pull_request_target),

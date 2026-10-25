@@ -45,8 +45,13 @@ jobs:
     permissions:
       contents: read
     steps:
+      # The PR head, not the default merge ref: sonar-pr.yml scans this same
+      # commit (workflow_run.head_sha), and coverage measured on the merge
+      # result is attributed to shifted lines whenever main changed a file's
+      # line count.
       - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
         with:
+          ref: ${{ github.event.pull_request.head.sha }}
           persist-credentials: false
       - uses: actions/setup-python@ece7cb06caefa5fff74198d8649806c4678c61a1 # v6.3.0
         with:
