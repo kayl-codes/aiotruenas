@@ -20,10 +20,12 @@ and are the reference for these rules; the README's "Semantics" and stale-data p
   TrueNAS middleware (LGPL-3.0) — protocol understanding only.
 - **Complexity:** cognitive complexity ≤ 15 per function (SonarQube S3776); no duplicated string literals — extract
   constants (S1192).
-- **Error contract per layer:** for operational failures (connection, auth, RPC, timeout, malformed response)
-  `TrueNASClient` and `TrueNASSystem` raise typed `TrueNASError` subclasses and never fall back to previous values.
-  Documented caller-input errors stay standard exceptions (e.g. `ValueError` for an invalid host, `KeyError` for an
-  unknown subscription, the `json.dumps` error for unserializable `params`) and are not violations. `TrueNASState` may fall back to its cached snapshot, but every new fallback must be
+- **Error contract per layer:** for operational failures (connection, auth, RPC, request timeout, malformed
+  response) `TrueNASClient` and `TrueNASSystem` raise typed `TrueNASError` subclasses and never fall back to
+  previous values. Documented caller-input errors stay standard exceptions (e.g. `ValueError` for an invalid host,
+  `KeyError` for an unknown subscription, the `json.dumps` error for unserializable `params`), and a caller-requested
+  wait that simply expires (`get_subscription_events(event_timeout=...)` returning `[]`) is not a failure; neither
+  is a violation. `TrueNASState` may fall back to its cached snapshot, but every new fallback must be
   reflected in its stale signal (`stale_endpoints`, `systemstats_stale_graphs`, `ups_stale_graphs`) or the README
   must say why not. Flag a fallback that changes neither.
 - **Tolerances match verified error shapes:** an error that is deliberately tolerated must be matched as narrowly as
@@ -36,14 +38,16 @@ and are the reference for these rules; the README's "Semantics" and stale-data p
   `gather(..., return_exceptions=True)`) is re-raised, never swallowed or converted. Where the client awaits one
   of its own background tasks (the read loop in `close()`), it may suppress that task's own `CancelledError`, but
   only when the awaiting task is not itself being cancelled (`asyncio.current_task().cancelling()`), so the
-  caller's cancellation still propagates. State a call registers for itself (its `_pending_calls` entry) is removed on **every** exit path —
-  success, error, cancellation, and an error raised before the wait starts (e.g. while building or sending the
+  caller's cancellation still propagates. State a call registers for itself (its `_pending_calls` entry) is
+  removed on **every** exit path — success, error, cancellation, and an error raised before the wait starts (e.g. while building or sending the
   request) — whether by `finally` or by a phase-specific handler. Caller-owned state is not per-call: a cancelled
   read from a subscription must not remove that subscription — it stays until `unsubscribe()` or connection
   teardown.
 - **Shared connection:** one `asyncio.Lock` serializes sends and guards the shared state (`_pending_calls`,
   `_subscriptions`, connection close); the background `_read_loop` receives without holding it. Flag a change
-  that holds the lock across `recv()` or across waiting for a response — that blocks every other call. A failure
+  that holds the lock across `recv()` or across waiting for a response on an established connection — that blocks
+  every other call. Connection setup is the exception: `connect()` holds the lock through the login handshake on
+  purpose (no call can run before login, and concurrent `connect()`s must not race). A failure
   or cancel while holding it must not leave the lock held or the connection unusable for the next call.
 - **Docs follow behaviour:** a change to what a public method raises, tolerates or returns updates its docstring,
   the README contract text and `CHANGELOG.md` (`[Unreleased]`) in the same PR.
