@@ -25,6 +25,11 @@ jobs:
       github.event.workflow_run.event == 'pull_request' &&
       github.event.workflow_run.conclusion == 'success'
     runs-on: ubuntu-latest
+    # One scan per PR branch at a time; a newer one cancels an older one still
+    # running, so an outdated analysis cannot finish last and replace it.
+    concurrency:
+      group: sonar-pr-${{ github.event.workflow_run.head_repository.full_name }}-${{ github.event.workflow_run.head_branch }}
+      cancel-in-progress: true
     permissions:
       contents: read
       actions: read
