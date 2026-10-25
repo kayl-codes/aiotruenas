@@ -55,6 +55,8 @@ class FakeTrueNASServer:
     )
     close_on_method: set[str] = field(default_factory=set)
     close_before_login_response: bool = False
+    #: Never answer the login, so a test can cancel connect() mid-login.
+    hang_login: bool = False
     ssl_context: ssl.SSLContext | None = None
 
     host: str = "127.0.0.1"
@@ -181,6 +183,8 @@ class FakeTrueNASServer:
     ) -> None:
         if self.close_before_login_response:
             await ws.close()
+            return
+        if self.hang_login:
             return
         key = params[0] if params else None
         result = key == self.valid_api_key
