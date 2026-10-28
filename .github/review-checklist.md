@@ -38,7 +38,8 @@ and are the reference for these rules; the README's "Semantics" and stale-data p
   as stale follows the state-layer contract above and is not a violation. Neither is the opt-in partial mode:
   `get_system_stats(partial=True)` catching a single graph's `TrueNASCallError` or `TrueNASMalformedResponseError`
   is no tolerance and no breach of the error contract above, because the error is reported in
-  `SystemStats.failed_graphs` (that graph's fields `None`, no previous values) and connection, timeout and auth
+  `SystemStats.failed_graphs` (that graph's fields `None`, or an empty `interfaces` mapping for the `interface`
+  graph; never previous values) and connection, timeout and auth
   errors still raise. Flag a partial-mode change that drops an error from `failed_graphs` or catches more than
   those two classes (`_PER_GRAPH_ERRORS` in `system.py`).
 - **Cancellation:** `asyncio.CancelledError` (and any non-`TrueNASError` `BaseException` from
