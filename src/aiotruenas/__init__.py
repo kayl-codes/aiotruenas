@@ -25,7 +25,7 @@ from .exceptions import (
 from .models import InterfaceTraffic, NetworkInterface, SystemInfo, SystemStats
 from .system import TrueNASSystem
 
-__version__ = "1.7.0"
+__version__ = "1.8.0"
 
 __all__ = [
     "DEFAULT_QUERY_TIMEOUT",
