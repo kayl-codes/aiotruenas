@@ -179,7 +179,7 @@ async with TrueNASClient("truenas.local", "1-abcdef...") as client:
 | `get_system_id()` | `system.global.id` | `str` |
 | `get_system_info()` | `system.info` | `SystemInfo`: hostname, version, manufacturer, product, serial, `physical_memory` (bytes), `boot_time` (UTC `datetime`), `uptime_seconds`, `load_1m`/`load_5m`/`load_15m`, `is_virtual` |
 | `get_network_interfaces()` | `interface.query` | `dict[id, NetworkInterface]`: name, description, mtu, `link_state`, `link_up`, media type/subtype, link address |
-| `get_system_stats(system_info=None)` | `reporting.netdata_graph` (`cpu`, `cputemp`, `memory`, `arcsize`, `interface`) | `SystemStats`: `cpu_usage_percent`, `cpu_temperature` (°C), `memory_available` (bytes), `memory_usage_percent`, `arc_size` (bytes), `interfaces` (read-only `Mapping[id, InterfaceTraffic]` with `rx_kbps`/`tx_kbps` in kilobits/s) |
+| `get_system_stats(system_info=None, *, partial=False)` | `reporting.netdata_graph` (`cpu`, `cputemp`, `memory`, `arcsize`, `interface`) | `SystemStats`: `cpu_usage_percent`, `cpu_temperature` (°C), `memory_available` (bytes), `memory_usage_percent`, `arc_size` (bytes), `interfaces` (read-only `Mapping[id, InterfaceTraffic]` with `rx_kbps`/`tx_kbps` in kilobits/s) |
 
 Passing the `SystemInfo` to `get_system_stats()` enables `memory_usage_percent` (needs the physical
 memory size) and skips the `cputemp` graph on a virtual machine.
@@ -199,6 +199,10 @@ Semantics:
   sensor, or when netdata cannot deliver a chart, TrueNAS returns the graph without series, so the
   field is `None`. A `None` reading therefore does not distinguish "not supported" from "netdata
   had no data".
+- `get_system_stats(partial=True)` reports a graph that fails on its own (a JSON-RPC error for
+  that graph call, or a response of the wrong shape) in `SystemStats.failed_graphs` (graph name →
+  error) and leaves that graph's fields `None` instead of failing the whole call. Connection,
+  timeout and authentication errors are raised in both modes. The default stays strict.
 - When several graph calls fail at once, the root cause (e.g. the call timeout) is raised rather
   than the connection-closed / "not connected" errors it triggers in the other graph calls.
 

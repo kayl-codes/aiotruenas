@@ -16,6 +16,7 @@ from aiotruenas import (
     NetworkInterface,
     SystemInfo,
     SystemStats,
+    TrueNASAuthenticationError,
     TrueNASCallError,
     TrueNASCallTimeoutError,
     TrueNASClient,
@@ -1099,3 +1100,188 @@ async def test_get_system_stats_raw_fallback_time_not_first() -> None:
     ]
     result = await _run({NETDATA: _netdata(graphs)}, lambda s: s.get_system_stats())
     assert result.interfaces == {"eno1": InterfaceTraffic(rx_kbps=20.0, tx_kbps=200.0)}
+
+
+# --- get_system_stats(partial=True) -----------------------------------------
+
+# Fields that stay None when a graph fails in partial mode (memory also blanks
+# the usage percent derived from it).
+_FIELDS_BY_GRAPH = {
+    "cpu": ("cpu_usage_percent",),
+    "cputemp": ("cpu_temperature",),
+    "memory": ("memory_available", "memory_usage_percent"),
+    "arcsize": ("arc_size",),
+}
+_STRICT_RESULT_FIELDS = {
+    "cpu_usage_percent": 12.5,
+    "cpu_temperature": 47.25,
+    "memory_available": 8589934592,
+    "memory_usage_percent": 75.0,
+    "arc_size": 4294967296,
+}
+
+
+async def _partial_stats(graphs: dict[str, Any]) -> SystemStats:
+    return await _run(
+        {NETDATA: _netdata(graphs)},
+        lambda s: s.get_system_stats(_info(physical_memory=34359738368), partial=True),
+    )
+
+
+_ALL_GRAPHS = ["cpu", "cputemp", "memory", "arcsize", "interface"]
+
+
+def _assert_only_graph_failed(result: SystemStats, graph: str) -> None:
+    """Assert ``graph`` is the only failure and blanked exactly its own fields."""
+    assert list(result.failed_graphs) == [graph]
+    for name, value in _STRICT_RESULT_FIELDS.items():
+        expected = None if name in _FIELDS_BY_GRAPH.get(graph, ()) else value
+        assert getattr(result, name) == expected, name
+    expected_interfaces = set() if graph == "interface" else {"eno1", "eno2"}
+    assert set(result.interfaces) == expected_interfaces
+
+
+@pytest.mark.parametrize("graph", _ALL_GRAPHS)
+async def test_get_system_stats_partial_reports_failed_graph(graph: str) -> None:
+    graphs = dict(_GRAPHS)
+    graphs[graph] = _CALL_ERROR
+    result = await _partial_stats(graphs)
+    _assert_only_graph_failed(result, graph)
+    error = result.failed_graphs[graph]
+    assert isinstance(error, TrueNASCallError)
+    assert error.errname == "EFAULT"
+
+
+@pytest.mark.parametrize("graph", _ALL_GRAPHS)
+async def test_get_system_stats_partial_reports_malformed_graph(graph: str) -> None:
+    graphs = dict(_GRAPHS)
+    graphs[graph] = {"not": "a list"}
+    result = await _partial_stats(graphs)
+    _assert_only_graph_failed(result, graph)
+    assert isinstance(result.failed_graphs[graph], TrueNASMalformedResponseError)
+
+
+@pytest.mark.parametrize("graph", ["cpu", "memory", "arcsize", "interface"])
+async def test_get_system_stats_partial_reports_unknown_required_graph(
+    graph: str,
+) -> None:
+    # Near miss of the cputemp tolerance: ENOENT on a required graph is a
+    # failure, not "no sensor".
+    graphs = dict(_GRAPHS)
+    graphs[graph] = _NO_SUCH_GRAPH_ERROR
+    result = await _partial_stats(graphs)
+    _assert_only_graph_failed(result, graph)
+    error = result.failed_graphs[graph]
+    assert isinstance(error, TrueNASCallError)
+    assert error.errname == "ENOENT"
+
+
+async def test_get_system_stats_partial_reports_every_failed_graph() -> None:
+    graphs = dict(_GRAPHS)
+    graphs["cpu"] = _CALL_ERROR
+    graphs["arcsize"] = {"not": "a list"}
+    result = await _partial_stats(graphs)
+    assert set(result.failed_graphs) == {"cpu", "arcsize"}
+    assert result.memory_available == 8589934592
+
+
+async def test_get_system_stats_partial_without_failures_matches_strict() -> None:
+    strict = await _run(
+        {NETDATA: _netdata(_GRAPHS)},
+        lambda s: s.get_system_stats(_info(physical_memory=34359738368)),
+    )
+    partial = await _partial_stats(dict(_GRAPHS))
+    assert partial == strict
+    assert not strict.failed_graphs
+    assert not partial.failed_graphs
+
+
+async def test_get_system_stats_partial_unknown_cputemp_is_not_a_failure() -> None:
+    graphs = dict(_GRAPHS)
+    graphs["cputemp"] = _NO_SUCH_GRAPH_ERROR
+    result = await _partial_stats(graphs)
+    assert result.cpu_temperature is None
+    assert not result.failed_graphs
+
+
+@pytest.mark.parametrize(
+    "error",
+    [
+        TrueNASCallTimeoutError("timed out"),
+        TrueNASConnectionClosedError("closed", phase="call"),
+        TrueNASConnectionError("not connected; call connect() first"),
+        TrueNASAuthenticationError("rejected"),
+    ],
+)
+async def test_get_system_stats_partial_raises_connection_wide_errors(
+    error: TrueNASError,
+) -> None:
+    outcomes: dict[str, Any] = dict(_GRAPHS)
+    outcomes["arcsize"] = error
+    system = TrueNASSystem(cast(TrueNASClient, _StubClient(outcomes)))
+    with pytest.raises(TrueNASError) as excinfo:
+        await system.get_system_stats(partial=True)
+    assert excinfo.value is error
+
+
+async def test_get_system_stats_partial_mixed_errors_raise_root_cause(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    timeout = TrueNASCallTimeoutError("timed out")
+    outcomes: dict[str, Any] = dict(_GRAPHS)
+    outcomes["cpu"] = TrueNASCallError("boom", errname="EFAULT")
+    outcomes["memory"] = TrueNASConnectionClosedError("closed", phase="disconnect")
+    outcomes["arcsize"] = timeout
+    system = TrueNASSystem(cast(TrueNASClient, _StubClient(outcomes)))
+    caplog.set_level(logging.DEBUG, logger="aiotruenas.system")
+    with pytest.raises(TrueNASCallTimeoutError) as excinfo:
+        await system.get_system_stats(partial=True)
+    assert excinfo.value is timeout
+    assert "while fetching netdata graph 'arcsize'" in excinfo.value.__notes__
+    # The per-graph error is not raised, but its context is not lost either.
+    assert any("'cpu' failed" in r.getMessage() for r in caplog.records)
+
+
+@pytest.mark.parametrize(
+    "symptom",
+    [
+        TrueNASConnectionClosedError("closed", phase="disconnect"),
+        TrueNASConnectionError("not connected; call connect() first"),
+    ],
+)
+async def test_get_system_stats_partial_raises_disconnect_over_graph_error(
+    symptom: TrueNASError,
+) -> None:
+    outcomes: dict[str, Any] = dict(_GRAPHS)
+    outcomes["cpu"] = TrueNASCallError("boom", errname="EFAULT")
+    outcomes["arcsize"] = symptom
+    system = TrueNASSystem(cast(TrueNASClient, _StubClient(outcomes)))
+    with pytest.raises(TrueNASError) as excinfo:
+        await system.get_system_stats(partial=True)
+    assert excinfo.value is symptom
+
+
+async def test_get_system_stats_partial_reraises_non_truenas_errors() -> None:
+    outcomes: dict[str, Any] = dict(_GRAPHS)
+    outcomes["cpu"] = TrueNASCallError("boom", errname="EFAULT")
+    outcomes["memory"] = RuntimeError("bug")
+    system = TrueNASSystem(cast(TrueNASClient, _StubClient(outcomes)))
+    with pytest.raises(RuntimeError, match="bug"):
+        await system.get_system_stats(partial=True)
+
+
+def test_system_stats_copies_failed_graphs() -> None:
+    source: dict[str, TrueNASError] = {"cpu": TrueNASCallError("boom")}
+    stats = SystemStats(
+        cpu_usage_percent=None,
+        cpu_temperature=None,
+        memory_available=None,
+        memory_usage_percent=None,
+        arc_size=None,
+        interfaces={},
+        failed_graphs=source,
+    )
+    source["memory"] = TrueNASCallError("later")
+    assert set(stats.failed_graphs) == {"cpu"}
+    with pytest.raises(TypeError):
+        stats.failed_graphs["arcsize"] = source["cpu"]  # type: ignore[index]
