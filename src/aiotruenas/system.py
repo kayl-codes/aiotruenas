@@ -8,6 +8,9 @@ falls back to previous values: an RPC failure propagates as the client's own
 top-level shape is wrong raises
 :class:`~aiotruenas.exceptions.TrueNASMalformedResponseError`. Only an
 individual field missing from an otherwise valid response becomes ``None``.
+The one opt-in exception is ``get_system_stats(partial=True)``: it reports a
+graph that fails on its own in ``SystemStats.failed_graphs`` instead of
+raising; connection, timeout and authentication errors still propagate.
 """
 
 from __future__ import annotations
@@ -57,6 +60,10 @@ _GRAPH_INTERFACE = "interface"
 # the graph with no series.
 _OPTIONAL_GRAPHS = frozenset({_GRAPH_CPUTEMP})
 _ERRNAME_NO_SUCH_GRAPH = "ENOENT"
+# Errors that concern one graph only: TrueNAS rejected that graph call, or its
+# response has the wrong shape. get_system_stats(partial=True) reports these
+# per graph; connection, timeout and authentication errors always propagate.
+_PER_GRAPH_ERRORS = (TrueNASCallError, TrueNASMalformedResponseError)
 
 # Netdata aggregation window, relative to now: the most recent samples are
 # skipped since netdata may not have collected them yet.
@@ -354,11 +361,38 @@ def _primary_error(errors: list[tuple[str, TrueNASError]]) -> TrueNASError:
     return error
 
 
+def _reportable_failures(
+    errors: list[tuple[str, TrueNASError]], *, partial: bool
+) -> dict[str, TrueNASError]:
+    """Return the graph failures partial mode reports, or raise the primary error.
+
+    Only per-graph errors are reported. In partial mode a connection-wide
+    error among them is raised instead, since it -- not a per-graph error
+    alongside it -- is what failed the call; strict mode raises any error.
+    Either way the root cause is preferred (see ``_primary_error``). Per-graph
+    errors are logged at DEBUG in partial mode, also when one is raised.
+    """
+    if not errors:
+        return {}
+    if not partial:
+        raise _primary_error(errors)
+    fatal: list[tuple[str, TrueNASError]] = []
+    for graph, err in errors:
+        if isinstance(err, _PER_GRAPH_ERRORS):
+            _LOGGER.debug("netdata graph '%s' failed: %r", graph, err)
+        else:
+            fatal.append((graph, err))
+    if fatal:
+        raise _primary_error(fatal)
+    return dict(errors)
+
+
 class TrueNASSystem:
     """Typed, stateless reader for TrueNAS system, network and stats data.
 
     Every method issues fresh RPC call(s) and returns an immutable snapshot;
-    errors are raised, never swallowed (see the module docstring).
+    errors are raised, never swallowed -- partial-mode graph failures are
+    reported in ``SystemStats.failed_graphs`` (see the module docstring).
     """
 
     def __init__(self, client: TrueNASClient) -> None:
@@ -413,7 +447,7 @@ class TrueNASSystem:
         return interfaces
 
     async def get_system_stats(
-        self, system_info: SystemInfo | None = None
+        self, system_info: SystemInfo | None = None, *, partial: bool = False
     ) -> SystemStats:
         """Return current CPU, memory, ARC and per-interface throughput readings.
 
@@ -437,19 +471,32 @@ class TrueNASSystem:
         ``identifier``) raises
         :class:`~aiotruenas.exceptions.TrueNASMalformedResponseError`; a
         well-formed one that lacks a series yields ``None`` for that field.
+
+        With ``partial=True`` a graph that fails on its own -- TrueNAS rejects
+        the call (:class:`~aiotruenas.exceptions.TrueNASCallError`) or its
+        response has the wrong shape -- no longer fails the call: its fields
+        are ``None`` and the error is reported in ``failed_graphs``, keyed by
+        graph name (``cpu`` -> ``cpu_usage_percent``, ``cputemp`` ->
+        ``cpu_temperature``, ``memory`` -> ``memory_available`` and
+        ``memory_usage_percent``, ``arcsize`` -> ``arc_size``, ``interface`` ->
+        an empty ``interfaces``). Check ``failed_graphs`` to tell a failed
+        graph from one that just had no data. A permission error on a graph
+        call is a per-graph error too. Connection, timeout and authentication
+        errors concern the whole connection, not one graph, and are raised in
+        both modes.
         """
         graphs = [_GRAPH_CPU, _GRAPH_MEMORY, _GRAPH_ARCSIZE, _GRAPH_INTERFACE]
         if system_info is None or system_info.is_virtual is not True:
             graphs.append(_GRAPH_CPUTEMP)
-        data = await self._fetch_graphs(graphs)
+        data, failed_graphs = await self._fetch_graphs(graphs, partial=partial)
 
         memory_available = _optional_bytes(
-            _first_item_means(data[_GRAPH_MEMORY]).get("available")
+            _first_item_means(data.get(_GRAPH_MEMORY, [])).get("available")
         )
         core_temperatures = _first_item_means(data.get(_GRAPH_CPUTEMP, [])).values()
         return SystemStats(
             cpu_usage_percent=_non_negative(
-                _first_item_means(data[_GRAPH_CPU]).get("cpu")
+                _first_item_means(data.get(_GRAPH_CPU, [])).get("cpu")
             ),
             cpu_temperature=max(core_temperatures, default=None),
             memory_available=memory_available,
@@ -458,15 +505,19 @@ class TrueNASSystem:
                 memory_available,
             ),
             arc_size=_optional_bytes(
-                _first_item_means(data[_GRAPH_ARCSIZE]).get("size")
+                _first_item_means(data.get(_GRAPH_ARCSIZE, [])).get("size")
             ),
-            interfaces=_interface_traffic(data[_GRAPH_INTERFACE]),
+            interfaces=_interface_traffic(data.get(_GRAPH_INTERFACE, [])),
+            failed_graphs=failed_graphs,
         )
 
-    async def _fetch_graphs(self, graphs: list[str]) -> dict[str, list[Any]]:
+    async def _fetch_graphs(
+        self, graphs: list[str], *, partial: bool
+    ) -> tuple[dict[str, list[Any]], dict[str, TrueNASError]]:
         """Fetch netdata graphs concurrently; see get_system_stats() for errors.
 
-        A tolerated optional graph is absent from the result.
+        Returns the graph data and, in partial mode, the per-graph failures. A
+        tolerated optional graph and a reported failure are absent from the data.
         """
         now = int(datetime.now(UTC).timestamp())
         query = {
@@ -496,6 +547,4 @@ class TrueNASSystem:
                 errors.append((graph, _malformed(_NETDATA_GRAPH_METHOD, shape_error)))
             else:
                 data[graph] = result
-        if errors:
-            raise _primary_error(errors)
-        return data
+        return data, _reportable_failures(errors, partial=partial)

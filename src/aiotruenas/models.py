@@ -11,9 +11,11 @@ no unit conversion happens here.
 from __future__ import annotations
 
 from collections.abc import Mapping
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from datetime import datetime
 from types import MappingProxyType
+
+from .exceptions import TrueNASError
 
 
 @dataclass(frozen=True, slots=True, kw_only=True)
@@ -88,8 +90,17 @@ class SystemStats:
     #: Throughput per interface, keyed by interface id (``NetworkInterface.id``);
     #: a read-only copy of whatever mapping was passed in.
     interfaces: Mapping[str, InterfaceTraffic]
+    #: Only filled by ``get_system_stats(partial=True)``: each graph that failed
+    #: on its own, mapped to its error; that graph's fields are ``None`` (an
+    #: empty ``interfaces`` for the ``interface`` graph), so a ``None`` field
+    #: means "failed" only if its graph is listed here. Always empty in the
+    #: default (strict) mode. Read-only like ``interfaces``.
+    failed_graphs: Mapping[str, TrueNASError] = field(default_factory=dict)
 
     def __post_init__(self) -> None:
         # frozen=True blocks normal assignment; copy so the snapshot can't be
-        # changed through the caller's original dict either.
+        # changed through the caller's original dicts either.
         object.__setattr__(self, "interfaces", MappingProxyType(dict(self.interfaces)))
+        object.__setattr__(
+            self, "failed_graphs", MappingProxyType(dict(self.failed_graphs))
+        )
