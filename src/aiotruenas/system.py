@@ -8,6 +8,9 @@ falls back to previous values: an RPC failure propagates as the client's own
 top-level shape is wrong raises
 :class:`~aiotruenas.exceptions.TrueNASMalformedResponseError`. Only an
 individual field missing from an otherwise valid response becomes ``None``.
+The one opt-in exception is ``get_system_stats(partial=True)``: it reports a
+graph that fails on its own in ``SystemStats.failed_graphs`` instead of
+raising; connection, timeout and authentication errors still propagate.
 """
 
 from __future__ import annotations
@@ -388,7 +391,8 @@ class TrueNASSystem:
     """Typed, stateless reader for TrueNAS system, network and stats data.
 
     Every method issues fresh RPC call(s) and returns an immutable snapshot;
-    errors are raised, never swallowed (see the module docstring).
+    errors are raised, never swallowed -- partial-mode graph failures are
+    reported in ``SystemStats.failed_graphs`` (see the module docstring).
     """
 
     def __init__(self, client: TrueNASClient) -> None:

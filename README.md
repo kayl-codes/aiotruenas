@@ -192,8 +192,8 @@ Semantics:
 - RPC failures propagate as the usual `TrueNASError` subclasses; a response with the wrong
   shape (e.g. a netdata graph item with neither a `legend` list nor `aggregations.mean`, or an
   `interface` item without
-  `identifier`) raises `TrueNASMalformedResponseError`. Nothing is swallowed. The one
-  exception: if TrueNAS does not know the optional `cputemp` graph at all (JSON-RPC error with
+  `identifier`) raises `TrueNASMalformedResponseError`. Nothing is swallowed (opt-in
+  `partial=True` reports per-graph failures instead, see below). The one exception: if TrueNAS does not know the optional `cputemp` graph at all (JSON-RPC error with
   errname `ENOENT`), only `cpu_temperature` is `None`; any other error for it is raised.
 - A missing netdata chart is not an error on the TrueNAS side: on hardware without a temperature
   sensor, or when netdata cannot deliver a chart, TrueNAS returns the graph without series, so the

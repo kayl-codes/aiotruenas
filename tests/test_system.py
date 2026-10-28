@@ -1199,7 +1199,19 @@ async def test_get_system_stats_partial_without_failures_matches_strict() -> Non
 async def test_get_system_stats_partial_unknown_cputemp_is_not_a_failure() -> None:
     graphs = dict(_GRAPHS)
     graphs["cputemp"] = _NO_SUCH_GRAPH_ERROR
-    result = await _partial_stats(graphs)
+    requested: list[str] = []
+    netdata = _netdata(graphs)
+
+    def handler(params: list[Any]) -> Any:
+        requested.append(params[0])
+        return netdata(params)
+
+    result = await _run(
+        {NETDATA: handler},
+        lambda s: s.get_system_stats(_info(physical_memory=34359738368), partial=True),
+    )
+    # The ENOENT path must actually run, not be skipped by never asking.
+    assert "cputemp" in requested
     assert result.cpu_temperature is None
     assert not result.failed_graphs
 
