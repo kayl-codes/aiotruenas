@@ -5,9 +5,11 @@ published on the [GitHub releases page](https://github.com/kayl-codes/aiotruenas
 
 ## [Unreleased]
 
+## [1.8.0] - 2026-10-28
+
 ### Added
 
-- `TrueNASSystem.get_system_stats(partial=True)`: a graph that fails on its own (TrueNAS
+- `TrueNASSystem.get_system_stats(partial=True)` (#68): a graph that fails on its own (TrueNAS
   rejects the call, or the response has the wrong shape) no longer fails the whole call. Its
   fields are `None` and the error is reported in the new `SystemStats.failed_graphs` (graph name
   → error, read-only). Connection, timeout and authentication errors are still raised. The
