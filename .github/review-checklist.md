@@ -35,7 +35,15 @@ and are the reference for these rules; the README's "Semantics" and stale-data p
   `ENOENT`), never a whole exception class. The evidence (live run or TrueNAS source, with version) belongs in the
   PR. Flag a broad `except`/`isinstance` tolerance without it. This rule is about suppressing an error while
   presenting a fresh result; a `TrueNASState` cache fallback that catches `TrueNASError` and reports the endpoint
-  as stale follows the state-layer contract above and is not a violation.
+  as stale follows the state-layer contract above and is not a violation. Neither is the opt-in partial mode:
+  `get_system_stats(partial=True)` catching a single graph's `TrueNASCallError` or `TrueNASMalformedResponseError`
+  is no tolerance and no breach of the error contract above: when the call returns, every such error is reported
+  in `SystemStats.failed_graphs` (that graph's fields `None`, or an empty `interfaces` mapping for the `interface`
+  graph; never previous values). A connection, timeout or auth error still raises, and then the whole call fails
+  without a result, including any per-graph errors alongside it. The tolerated `cputemp` `ENOENT` above is the
+  one graph error that is neither raised nor reported. Flag a partial-mode change that drops an error from
+  `failed_graphs`, tolerates another error the way `cputemp` `ENOENT` is, or catches more than those two classes
+  (`_PER_GRAPH_ERRORS` in `system.py`).
 - **Cancellation:** `asyncio.CancelledError` (and any non-`TrueNASError` `BaseException` from
   `gather(..., return_exceptions=True)`) is re-raised, never swallowed or converted. Where the client awaits one
   of its own background tasks (the read loop in `close()`), it may suppress that task's own `CancelledError`, but
