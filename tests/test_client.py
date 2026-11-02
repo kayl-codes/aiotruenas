@@ -1972,6 +1972,11 @@ async def test_concurrent_enable_private_methods_retries_after_cancel() -> None:
 
             server.drop_response_for.clear()
             server.responses["core.set_options"] = _recording_set_options(sent)
+            # The first caller holds client._lock until its send() returns (the
+            # second waits on the private-methods lock): the cancel below hits
+            # the wait for the reply, not the send.
+            async with client._lock:
+                pass
             first.cancel()
             with pytest.raises(asyncio.CancelledError):
                 await first
