@@ -53,6 +53,8 @@ class FakeTrueNASServer:
     request_seen: defaultdict[str, asyncio.Event] = field(
         default_factory=lambda: defaultdict(asyncio.Event), init=False
     )
+    #: Every request's method, in the order the server received them.
+    requests: list[str] = field(default_factory=list, init=False)
     #: Events whose ``core.subscribe`` reply is followed at once by one
     #: notification, as from an event source that sends its current state.
     notify_after_subscribe: set[str] = field(default_factory=set)
@@ -163,6 +165,7 @@ class FakeTrueNASServer:
         rpc_id = message.get("id")
         params = message.get("params") or []
         self.request_seen[method].set()
+        self.requests.append(method)
 
         if method == "auth.login_with_api_key":
             await self._handle_login(ws, rpc_id, params)

@@ -1811,6 +1811,7 @@ async def test_enable_private_methods_before_connect_sends_after_login() -> None
         await client.connect()
         try:
             assert sent == [_PRIVATE_METHODS_PARAMS]
+            assert server.requests == ["auth.login_with_api_key", "core.set_options"]
             # Already sent by connect(): no second request on this connection.
             await client.enable_private_methods()
             assert sent == [_PRIVATE_METHODS_PARAMS]
@@ -1883,13 +1884,18 @@ async def test_enable_private_methods_timeout_raises() -> None:
     async with FakeTrueNASServer(
         valid_api_key=API_KEY, drop_response_for={"core.set_options"}
     ) as server:
-        client = make_client(server, query_timeout=0.2)
+        client = make_client(server, query_timeout=1.0)
         await client.connect()
         try:
+            task = asyncio.create_task(client.enable_private_methods())
+            await server.request_seen["core.set_options"].wait()
+            # The send returned (lock released) and the call waits for its reply.
+            async with client._lock:
+                pass
+            assert not task.done()
+            assert len(client._pending_calls) == 1
             with pytest.raises(TrueNASCallTimeoutError, match="core.set_options"):
-                await client.enable_private_methods()
-            # Sent and unanswered: the timeout is the wait for the reply.
-            assert server.request_seen["core.set_options"].is_set()
+                await asyncio.wait_for(task, 5)
             assert not client.connected
         finally:
             await client.close()
