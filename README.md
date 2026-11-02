@@ -58,6 +58,10 @@ rather than returned as an error code/string, so callers can `except TrueNASAuth
   Notifications the server sends right after its `core.subscribe` reply are already in the queue.
 - `unsubscribe()` sends `core.unsubscribe` only for a subscription of the current connection. For a
   subscription that already ended with its connection, it returns without a request.
+- `enable_private_methods()` sends `core.set_options({"private_methods": True})`, and `connect()`
+  sends it again after every login. Without it, TrueNAS still runs private methods such as
+  `smb.status` (with a key that has the role), but logs a warning to `middlewared.log` for each call.
+  A server that rejects the option is logged, not raised.
 
 ### Normalized domain state
 
@@ -87,6 +91,10 @@ history.
 exception to the dict-keyed-by-id shape above: they have no natural object id and instead return a
 flat dict of scalar/aggregate readings (e.g. `{"battery_charge": 80.0, ...}`,
 `{"count": 2, "critical": 1, ...}` for alerts, or `{"connections": 3}` for `get_smb()`).
+`get_smb()` queries the private method `smb.status`, which needs an API key with the `FULL_ADMIN`
+role; it enables private methods on the client first. If TrueNAS refuses the call with `EACCES`, it
+logs that once at INFO and stops querying for the lifetime of the `TrueNASState` object; the
+count then stays at its last value (or the initial `0`) and `"smb"` stays in `stale_endpoints`.
 `get_systemstats()` enriches that same flat `ds["system_info"]` dict (CPU/load/memory/ARC-size)
 and, as a side effect, `ds["interface"][id]["rx"/"tx"]` (interface throughput) rather than
 returning its own endpoint. Its underlying netdata graph queries are best-effort: a failed graph

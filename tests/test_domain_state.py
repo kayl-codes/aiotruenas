@@ -3532,6 +3532,112 @@ async def test_get_smb_logs_warning_when_status_query_raises(
     assert len(recoveries) == 1
 
 
+def _smb_error(errname: str) -> dict[str, Any]:
+    return {
+        "error": {
+            "code": -32603,
+            "message": "Not authorized",
+            "data": {"error": 13, "errname": errname, "reason": None},
+        }
+    }
+
+
+def _recording(calls: list[str], name: str, result: Any) -> Any:
+    def respond(_params: list) -> Any:
+        calls.append(name)
+        return result
+
+    return respond
+
+
+async def test_get_smb_enables_private_methods_before_status() -> None:
+    calls: list[str] = []
+    async with FakeTrueNASServer(
+        valid_api_key=API_KEY,
+        responses={
+            "core.set_options": _recording(calls, "set_options", {}),
+            "smb.status": _recording(calls, "smb.status", [{}]),
+        },
+    ) as server:
+        async with make_client(server) as client:
+            state = TrueNASState(client)
+            await state.get_smb()
+            await state.get_smb()
+
+    # The option is sent once per connection, before the first smb.status.
+    assert calls == ["set_options", "smb.status", "smb.status"]
+
+
+async def test_get_smb_stops_querying_after_eacces(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    calls: list[str] = []
+    async with FakeTrueNASServer(
+        valid_api_key=API_KEY,
+        responses={
+            "core.set_options": {},
+            "smb.status": _recording(calls, "smb.status", [{}, {}]),
+        },
+    ) as server:
+        async with make_client(server) as client:
+            state = TrueNASState(client)
+            await state.get_smb()
+
+            server.responses["smb.status"] = _recording(
+                calls, "smb.status", _smb_error("EACCES")
+            )
+            with caplog.at_level(logging.DEBUG, logger="aiotruenas.domain.state"):
+                first = await state.get_smb()
+                second = await state.get_smb()
+
+    assert calls == ["smb.status", "smb.status"]
+    assert first == second == {"connections": 2}
+    assert "smb" in state.stale_endpoints
+    state_records = [r for r in caplog.records if r.name == "aiotruenas.domain.state"]
+    assert [r.levelno for r in state_records] == [logging.INFO]
+    assert "FULL_ADMIN" in state_records[0].getMessage()
+
+
+async def test_get_smb_eacces_on_first_call_keeps_initial_count() -> None:
+    calls: list[str] = []
+    async with FakeTrueNASServer(
+        valid_api_key=API_KEY,
+        responses={
+            "core.set_options": {},
+            "smb.status": _recording(calls, "smb.status", _smb_error("EACCES")),
+        },
+    ) as server:
+        async with make_client(server) as client:
+            state = TrueNASState(client)
+            first = await state.get_smb()
+            second = await state.get_smb()
+
+    assert calls == ["smb.status"]
+    assert first == second == {"connections": 0}
+    assert "smb" in state.stale_endpoints
+
+
+async def test_get_smb_keeps_querying_after_other_call_errors() -> None:
+    calls: list[str] = []
+    async with FakeTrueNASServer(
+        valid_api_key=API_KEY,
+        responses={
+            "core.set_options": {},
+            "smb.status": _recording(calls, "smb.status", _smb_error("EPERM")),
+        },
+    ) as server:
+        async with make_client(server) as client:
+            state = TrueNASState(client)
+            await state.get_smb()
+            await state.get_smb()
+
+            server.responses["smb.status"] = [{}]
+            result = await state.get_smb()
+
+    assert calls == ["smb.status", "smb.status"]
+    assert result == {"connections": 1}
+
+
 async def test_get_smb_logs_warning_when_status_query_returns_malformed_response(
     caplog: pytest.LogCaptureFixture,
 ) -> None:

@@ -8,6 +8,7 @@ import json
 import logging
 import socket
 import ssl
+from collections.abc import Callable
 
 import pytest
 import trustme
@@ -1764,3 +1765,163 @@ async def test_cancel_during_send_does_not_leak_pending_future(monkeypatch) -> N
             assert not client._lock.locked()
             monkeypatch.setattr(client._ws, "send", real_send)
             assert await client.call("system.version") == "25.04"
+
+
+# --- Private methods (core.set_options) -------------------------------------
+
+_PRIVATE_METHODS_PARAMS = [{"private_methods": True}]
+_SET_OPTIONS_RESULT = {
+    "legacy_jobs": True,
+    "private_methods": True,
+    "py_exceptions": False,
+}
+
+
+def _recording_set_options(sent: list[list]) -> Callable[[list], dict]:
+    def respond(params: list) -> dict:
+        sent.append(params)
+        return _SET_OPTIONS_RESULT
+
+    return respond
+
+
+async def test_enable_private_methods_sends_option_once_per_connection() -> None:
+    sent: list[list] = []
+    async with FakeTrueNASServer(
+        valid_api_key=API_KEY,
+        responses={"core.set_options": _recording_set_options(sent)},
+    ) as server:
+        async with make_client(server) as client:
+            await client.enable_private_methods()
+            await client.enable_private_methods()
+
+    assert sent == [_PRIVATE_METHODS_PARAMS]
+
+
+async def test_enable_private_methods_before_connect_sends_after_login() -> None:
+    sent: list[list] = []
+    async with FakeTrueNASServer(
+        valid_api_key=API_KEY,
+        responses={"core.set_options": _recording_set_options(sent)},
+    ) as server:
+        client = make_client(server)
+        await client.enable_private_methods()
+        assert not sent
+
+        await client.connect()
+        try:
+            assert sent == [_PRIVATE_METHODS_PARAMS]
+            # Already sent by connect(): no second request on this connection.
+            await client.enable_private_methods()
+            assert sent == [_PRIVATE_METHODS_PARAMS]
+        finally:
+            await client.close()
+
+
+async def test_private_methods_option_is_resent_after_reconnect() -> None:
+    sent: list[list] = []
+    async with FakeTrueNASServer(
+        valid_api_key=API_KEY,
+        responses={"core.set_options": _recording_set_options(sent)},
+        close_on_method={"system.info"},
+    ) as server:
+        client = make_client(server)
+        await client.connect()
+        await client.enable_private_methods()
+        with pytest.raises(TrueNASConnectionClosedError):
+            await client.call("system.info")
+        assert not client.connected
+
+        await client.connect()
+        try:
+            assert client.connected
+            assert sent == [_PRIVATE_METHODS_PARAMS, _PRIVATE_METHODS_PARAMS]
+        finally:
+            await client.close()
+
+
+async def test_rejected_private_methods_option_is_not_fatal(caplog) -> None:
+    """A server that rejects core.set_options (here: unknown method) leaves
+    the client usable, logs one warning, and does not fail a reconnect.
+    """
+    async with FakeTrueNASServer(
+        valid_api_key=API_KEY, responses={"system.version": "25.10"}
+    ) as server:
+        client = make_client(server)
+        with caplog.at_level(logging.DEBUG, logger="aiotruenas.client"):
+            await client.connect()
+            await client.enable_private_methods()
+            assert await client.call("system.version") == "25.10"
+
+            await client.close()
+            await client.connect()
+            try:
+                assert client.connected
+                assert await client.call("system.version") == "25.10"
+            finally:
+                await client.close()
+
+    failures = [
+        r for r in caplog.records if "could not enable private methods" in r.message
+    ]
+    assert [r.levelno for r in failures] == [logging.WARNING, logging.DEBUG]
+
+
+async def test_connect_fails_if_connection_drops_while_sending_option() -> None:
+    async with FakeTrueNASServer(
+        valid_api_key=API_KEY, close_on_method={"core.set_options"}
+    ) as server:
+        client = make_client(server)
+        await client.enable_private_methods()
+        with pytest.raises(TrueNASConnectionClosedError) as exc_info:
+            await client.connect()
+        assert exc_info.value.phase == "login"
+        assert not client.connected
+
+
+async def test_enable_private_methods_timeout_raises() -> None:
+    async with FakeTrueNASServer(
+        valid_api_key=API_KEY, drop_response_for={"core.set_options"}
+    ) as server:
+        client = make_client(server, query_timeout=0.2)
+        await client.connect()
+        try:
+            with pytest.raises(TrueNASCallTimeoutError):
+                await client.enable_private_methods()
+            assert not client.connected
+        finally:
+            await client.close()
+
+
+async def test_connect_fails_if_private_methods_option_times_out() -> None:
+    async with FakeTrueNASServer(
+        valid_api_key=API_KEY, drop_response_for={"core.set_options"}
+    ) as server:
+        client = make_client(server, query_timeout=0.2)
+        await client.enable_private_methods()
+        with pytest.raises(TrueNASCallTimeoutError, match="core.set_options"):
+            await client.connect()
+        assert not client.connected
+
+
+async def test_cancelled_enable_private_methods_is_retried() -> None:
+    """A cancel before the reply must not mark the connection as done, or
+    the option would never be sent on it.
+    """
+    sent: list[list] = []
+    async with FakeTrueNASServer(
+        valid_api_key=API_KEY, drop_response_for={"core.set_options"}
+    ) as server:
+        async with make_client(server) as client:
+            task = asyncio.ensure_future(client.enable_private_methods())
+            await asyncio.wait_for(server.request_seen["core.set_options"].wait(), 2)
+            task.cancel()
+            with pytest.raises(asyncio.CancelledError):
+                await task
+
+            server.drop_response_for.clear()
+            server.responses["core.set_options"] = _recording_set_options(sent)
+            await client.enable_private_methods()
+            assert client.connected
+
+    assert sent == [_PRIVATE_METHODS_PARAMS]
