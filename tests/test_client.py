@@ -1785,6 +1785,19 @@ def _recording_set_options(sent: list[list]) -> Callable[[list], dict]:
     return respond
 
 
+class _WaitSignalingLock(asyncio.Lock):
+    """Sets ``waiting`` when a caller has to wait for the lock."""
+
+    def __init__(self) -> None:
+        super().__init__()
+        self.waiting = asyncio.Event()
+
+    async def acquire(self) -> bool:
+        if self.locked():
+            self.waiting.set()
+        return await super().acquire()
+
+
 async def test_enable_private_methods_sends_option_once_per_connection() -> None:
     sent: list[list] = []
     async with FakeTrueNASServer(
@@ -1948,10 +1961,12 @@ async def test_concurrent_enable_private_methods_waits_for_request_in_flight() -
         valid_api_key=API_KEY, drop_response_for={"core.set_options"}
     ) as server:
         async with make_client(server) as client:
+            lock = client._private_methods_lock = _WaitSignalingLock()
             first = asyncio.ensure_future(client.enable_private_methods())
             await asyncio.wait_for(server.request_seen["core.set_options"].wait(), 2)
             second = asyncio.ensure_future(client.enable_private_methods())
-            await asyncio.sleep(0.05)
+            # The second caller waits for the lock the first one holds.
+            await asyncio.wait_for(lock.waiting.wait(), 2)
             assert not second.done()
 
             server.drop_response_for.clear()
@@ -1970,10 +1985,12 @@ async def test_concurrent_enable_private_methods_retries_after_cancel() -> None:
         valid_api_key=API_KEY, drop_response_for={"core.set_options"}
     ) as server:
         async with make_client(server) as client:
+            lock = client._private_methods_lock = _WaitSignalingLock()
             first = asyncio.ensure_future(client.enable_private_methods())
             await asyncio.wait_for(server.request_seen["core.set_options"].wait(), 2)
             second = asyncio.ensure_future(client.enable_private_methods())
-            await asyncio.sleep(0.05)
+            # The second caller waits for the lock the first one holds.
+            await asyncio.wait_for(lock.waiting.wait(), 2)
             assert not second.done()
 
             server.drop_response_for.clear()
