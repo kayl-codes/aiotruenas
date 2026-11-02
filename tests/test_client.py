@@ -1886,8 +1886,10 @@ async def test_enable_private_methods_timeout_raises() -> None:
         client = make_client(server, query_timeout=0.2)
         await client.connect()
         try:
-            with pytest.raises(TrueNASCallTimeoutError):
+            with pytest.raises(TrueNASCallTimeoutError, match="core.set_options"):
                 await client.enable_private_methods()
+            # Sent and unanswered: the timeout is the wait for the reply.
+            assert server.request_seen["core.set_options"].is_set()
             assert not client.connected
         finally:
             await client.close()
@@ -1915,6 +1917,10 @@ async def test_cancelled_enable_private_methods_is_retried() -> None:
         async with make_client(server) as client:
             task = asyncio.ensure_future(client.enable_private_methods())
             await asyncio.wait_for(server.request_seen["core.set_options"].wait(), 2)
+            # send() returned once the lock is free: the cancel below hits the
+            # wait for the reply, not the send.
+            async with client._lock:
+                pass
             task.cancel()
             with pytest.raises(asyncio.CancelledError):
                 await task
@@ -1925,3 +1931,79 @@ async def test_cancelled_enable_private_methods_is_retried() -> None:
             assert client.connected
 
     assert sent == [_PRIVATE_METHODS_PARAMS]
+
+
+async def test_concurrent_enable_private_methods_waits_for_request_in_flight() -> None:
+    """A second caller must not return, and go on to call a private method,
+    while the option is still unconfirmed, nor send it again once confirmed.
+    """
+    sent: list[list] = []
+    async with FakeTrueNASServer(
+        valid_api_key=API_KEY, drop_response_for={"core.set_options"}
+    ) as server:
+        async with make_client(server) as client:
+            first = asyncio.ensure_future(client.enable_private_methods())
+            await asyncio.wait_for(server.request_seen["core.set_options"].wait(), 2)
+            second = asyncio.ensure_future(client.enable_private_methods())
+            await asyncio.sleep(0.05)
+            assert not second.done()
+
+            server.drop_response_for.clear()
+            server.responses["core.set_options"] = _recording_set_options(sent)
+            (rpc_id,) = client._pending_calls
+            await server.send_reply(rpc_id, _SET_OPTIONS_RESULT)
+            await asyncio.wait_for(asyncio.gather(first, second), 2)
+
+    assert sent == []
+
+
+async def test_concurrent_enable_private_methods_retries_after_cancel() -> None:
+    """If the request in flight is cancelled, the waiting caller sends it."""
+    sent: list[list] = []
+    async with FakeTrueNASServer(
+        valid_api_key=API_KEY, drop_response_for={"core.set_options"}
+    ) as server:
+        async with make_client(server) as client:
+            first = asyncio.ensure_future(client.enable_private_methods())
+            await asyncio.wait_for(server.request_seen["core.set_options"].wait(), 2)
+            second = asyncio.ensure_future(client.enable_private_methods())
+            await asyncio.sleep(0.05)
+            assert not second.done()
+
+            server.drop_response_for.clear()
+            server.responses["core.set_options"] = _recording_set_options(sent)
+            first.cancel()
+            with pytest.raises(asyncio.CancelledError):
+                await first
+            await asyncio.wait_for(second, 2)
+            assert client.connected
+
+    assert sent == [_PRIVATE_METHODS_PARAMS]
+
+
+async def test_private_methods_option_without_result_is_not_fatal(caplog) -> None:
+    """A core.set_options reply with neither result nor error is logged like a
+    rejection, both from enable_private_methods() and from connect().
+    """
+    async with FakeTrueNASServer(
+        valid_api_key=API_KEY,
+        responses={"core.set_options": NO_RESULT, "system.version": "25.10"},
+    ) as server:
+        client = make_client(server)
+        with caplog.at_level(logging.DEBUG, logger="aiotruenas.client"):
+            await client.connect()
+            await client.enable_private_methods()
+
+            await client.close()
+            await client.connect()
+            try:
+                assert client.connected
+                assert await client.call("system.version") == "25.10"
+            finally:
+                await client.close()
+
+    failures = [
+        r for r in caplog.records if "could not enable private methods" in r.message
+    ]
+    assert [r.levelno for r in failures] == [logging.WARNING, logging.DEBUG]
+    assert all("has no result" in r.message for r in failures)

@@ -61,7 +61,8 @@ rather than returned as an error code/string, so callers can `except TrueNASAuth
 - `enable_private_methods()` sends `core.set_options({"private_methods": True})`, and `connect()`
   sends it again after every login. Without it, TrueNAS still runs private methods such as
   `smb.status` (with a key that has the role), but logs a warning to `middlewared.log` for each call.
-  A server that rejects the option is logged, not raised.
+  A server that rejects the option, or answers without a result, is logged, not raised.
+  Concurrent calls wait for the request in flight.
 
 ### Normalized domain state
 

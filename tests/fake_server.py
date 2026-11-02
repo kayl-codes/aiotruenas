@@ -120,6 +120,11 @@ class FakeTrueNASServer:
                 payload["collection"] = collection_override
         await connection.send(json.dumps(payload))
 
+    async def send_reply(self, rpc_id: Any, result: Any) -> None:
+        """Answer request ``rpc_id`` late, e.g. one held by ``drop_response_for``."""
+        assert self._connection is not None
+        await self._connection.send(_envelope(rpc_id, **{_KEY_RESULT: result}))
+
     async def close_connection(self) -> None:
         """Abruptly close the active client connection, simulating a server drop."""
         if self._connection is not None:

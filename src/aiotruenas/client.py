@@ -21,6 +21,7 @@ from .exceptions import (
     TrueNASCallTimeoutError,
     TrueNASConnectionClosedError,
     TrueNASConnectionError,
+    TrueNASError,
     TrueNASMalformedResponseError,
 )
 
@@ -131,6 +132,9 @@ class TrueNASClient:
         # The connection the option was last sent on, so that repeated
         # enable_private_methods() calls send it once per connection.
         self._private_methods_ws: ClientConnection | None = None
+        # Makes concurrent enable_private_methods() calls wait for the request
+        # in flight, so none returns before the option is in effect.
+        self._private_methods_lock = asyncio.Lock()
         self._private_methods_warned = False
 
     @property
@@ -260,8 +264,14 @@ class TrueNASClient:
         )
         if response.get(_KEY_ERROR):
             self._log_private_methods_failure(build_call_error(response[_KEY_ERROR]))
+        elif _KEY_RESULT not in response:
+            self._log_private_methods_failure(
+                TrueNASMalformedResponseError(
+                    f"response for {_SET_OPTIONS!r} has no result"
+                )
+            )
 
-    def _log_private_methods_failure(self, err: TrueNASCallError) -> None:
+    def _log_private_methods_failure(self, err: TrueNASError) -> None:
         """Log a rejected ``core.set_options`` once as a warning, then at DEBUG."""
         log = _LOGGER.debug if self._private_methods_warned else _LOGGER.warning
         self._private_methods_warned = True
@@ -517,29 +527,27 @@ class TrueNASClient:
         login, since TrueNAS keeps it per connection. Sent at most once per
         connection, so repeated calls are cheap.
 
-        A server that rejects the option is logged (once as a warning, then at
-        DEBUG), not raised: private methods keep working, only the server-side
-        warning stays. A timeout or a lost connection raises like
-        :meth:`call` does (and fails :meth:`connect` the same way).
+        A server that rejects the option, or answers without a result, is
+        logged (once as a warning, then at DEBUG), not raised: private methods
+        keep working, only the server-side warning stays. A timeout or a lost
+        connection raises like :meth:`call` does (and fails :meth:`connect`
+        the same way). Concurrent calls wait for the one in flight.
         """
         self._private_methods = True
-        ws = self._ws
-        if ws is None or self._private_methods_ws is ws:
-            return
-        # Marked before the call, so a concurrent caller does not send it too.
-        self._private_methods_ws = ws
-        try:
-            await self._call_on_connection(
-                _SET_OPTIONS, [_PRIVATE_METHODS_OPTION], expected_ws=ws
-            )
-        except TrueNASCallError as err:
-            self._log_private_methods_failure(err)
-        except BaseException:
-            # Not confirmed (cancelled, timed out, connection lost): let the
-            # next call on this connection send it again.
-            if self._private_methods_ws is ws:
-                self._private_methods_ws = None
-            raise
+        async with self._private_methods_lock:
+            ws = self._ws
+            if ws is None or self._private_methods_ws is ws:
+                return
+            try:
+                await self._call_on_connection(
+                    _SET_OPTIONS, [_PRIVATE_METHODS_OPTION], expected_ws=ws
+                )
+            except (TrueNASCallError, TrueNASMalformedResponseError) as err:
+                self._log_private_methods_failure(err)
+            # Not reached if cancelled, timed out or the connection was lost:
+            # the next call on this connection sends it again.
+            if self._ws is ws:
+                self._private_methods_ws = ws
 
     async def close(self) -> None:
         """Close the WebSocket connection, if any. Safe to call repeatedly.

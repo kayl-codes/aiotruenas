@@ -12,7 +12,8 @@ published on the [GitHub releases page](https://github.com/kayl-codes/aiotruenas
   the login of every later (re)connect, since TrueNAS keeps the option per connection. Without it,
   TrueNAS logs "Private method ... called on a connection without private_methods enabled" to
   `middlewared.log` for every private call, even with a `FULL_ADMIN` key. A server that rejects the
-  option is logged (once as a warning), not raised.
+  option, or answers without a result, is logged (once as a warning), not raised. Concurrent calls
+  wait for the request in flight, so none returns before the option is in effect.
 
 ### Changed
 
