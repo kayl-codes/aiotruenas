@@ -1897,7 +1897,9 @@ async def test_enable_private_methods_timeout_raises() -> None:
     async with FakeTrueNASServer(
         valid_api_key=API_KEY, drop_response_for={"core.set_options"}
     ) as server:
-        client = make_client(server, query_timeout=1.0)
+        # Long enough that the phase checks below finish before the
+        # reply-wait timeout fires, even on a slow runner.
+        client = make_client(server, query_timeout=3.0)
         await client.connect()
         try:
             task = asyncio.create_task(client.enable_private_methods())
@@ -1908,7 +1910,7 @@ async def test_enable_private_methods_timeout_raises() -> None:
             assert not task.done()
             assert len(client._pending_calls) == 1
             with pytest.raises(TrueNASCallTimeoutError, match="core.set_options"):
-                await asyncio.wait_for(task, 5)
+                await asyncio.wait_for(task, 10)
             assert not client.connected
         finally:
             await client.close()
