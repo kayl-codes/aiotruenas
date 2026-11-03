@@ -59,6 +59,13 @@ and are the reference for these rules; the README's "Semantics" and stale-data p
   every other call. Connection setup is the exception: `connect()` holds the lock through the login handshake on
   purpose (no call can run before login, and concurrent `connect()`s must not race). A failure
   or cancel while holding it must not leave the lock held or the connection unusable for the next call.
+- **State follows confirmation:** state that records something as done (a flag, the
+  connection a setting was sent on) is set only after the awaited confirmation has
+  returned, never before the `await`. If the await times out, loses the connection or
+  is cancelled, the state still says "not done", so the next attempt sends it again.
+  (A documented, logged server rejection may count as done, as for
+  `enable_private_methods()`.) Flag a state change placed before the request it
+  depends on.
 - **Docs follow behaviour:** a change to what a public method raises, tolerates or returns updates its docstring,
   the README contract text and `CHANGELOG.md` (`[Unreleased]`) in the same PR.
 
@@ -77,6 +84,26 @@ and are the reference for these rules; the README's "Semantics" and stale-data p
   and, after acquiring the lock, that the call is still pending (its task not done, its `_pending_calls` entry
   present), so that a timeout firing in `send()` would fail it. Flag sleep-based timing and tests that would also
   pass if the cancel or timeout landed in a different phase.
+- **Prove a waiter waits:** to show that a second caller waits for a lock (or an event),
+  hold it in the test and take the signal that the second caller reached it (e.g. a
+  lock subclass that sets an `asyncio.Event` in `acquire()`). Then check that the
+  second caller is not done, release the lock and check the result. No sleep stands
+  in for "it is waiting by now".
+- **Real timeouts leave margin:** when a real timeout fires in a test, it is long enough
+  for the test to finish its phase checks before it fires (lock taken and released,
+  call still pending), not just long enough for the happy path on a fast machine.
+- **Shorten only the timeout under test:** when several requests share one timeout
+  (`_query_timeout` covers both `_login` and the option request after it), only the
+  request under test runs with the short value. Earlier requests get a generous one,
+  e.g. by shortening it in a wrapper after they finish. Otherwise a slow login on a
+  CI runner fails the test with the wrong method in the error.
+- **Bounded waits for server events:** wait for fake-server evidence
+  (`request_seen[...]`) with `asyncio.wait_for(event.wait(), <seconds>)`. Do not check
+  `is_set()` once after the action: the server task may not have run yet.
+- **Order is part of the contract:** when the spec requires requests in a given order
+  (e.g. `core.set_options` right after the login, before any other call), a test checks
+  the order of the requests the fake server received (`FakeTrueNASServer.requests`),
+  not just that each one arrived.
 - **Fake responses match the real server:** fake-server payloads for a new or changed RPC follow the shape TrueNAS
   actually sends (live run or middleware source), including the "no data" shapes (e.g. a netdata graph item with
   `legend: ["time"]` and empty aggregations), not just the happy path.
