@@ -59,13 +59,18 @@ and are the reference for these rules; the README's "Semantics" and stale-data p
   every other call. Connection setup is the exception: `connect()` holds the lock through the login handshake on
   purpose (no call can run before login, and concurrent `connect()`s must not race). A failure
   or cancel while holding it must not leave the lock held or the connection unusable for the next call.
-- **State follows confirmation:** state that records something as done (a flag, the
-  connection a setting was sent on) is set only after the awaited confirmation has
-  returned, never before the `await`. If the await times out, loses the connection or
-  is cancelled, the state still says "not done", so the next attempt sends it again.
-  (A documented, logged server rejection may count as done, as for
-  `enable_private_methods()`.) Flag a state change placed before the request it
-  depends on.
+- **State follows confirmation:** state that records a request as done (e.g.
+  `_private_methods_ws`, the connection the option was sent on) is set only after the
+  awaited confirmation has returned, never before the `await`. State that only records
+  what the caller asked for (e.g. `_private_methods`, which later `connect()` calls
+  read) is not covered. For an idempotent request (a setting such as
+  `core.set_options`) that times out, loses the connection or is cancelled, the state
+  still says "not done", so the next attempt sends it again. (A documented, logged
+  server rejection may count as done, as for `enable_private_methods()`.) A
+  non-idempotent or state-removing request (starting a scrub, `unsubscribe()`) may
+  already have taken effect on the server, so the client does not resend it on its
+  own; that operation's documented handling decides. Flag a done-state change placed
+  before the request it depends on.
 - **Docs follow behaviour:** a change to what a public method raises, tolerates or returns updates its docstring,
   the README contract text and `CHANGELOG.md` (`[Unreleased]`) in the same PR.
 
@@ -102,8 +107,9 @@ and are the reference for these rules; the README's "Semantics" and stale-data p
   `is_set()` once after the action: the server task may not have run yet. The event
   stays set once a method was seen, so it must be fresh evidence for **this** request:
   a method no earlier step of the test called, or an event cleared right before the
-  action. Otherwise the wait returns at once and the test passes even if the request
-  never reached the server.
+  action while no earlier request for that method is still in flight (a late one
+  sets the same event). Otherwise the wait returns at once and the test passes even
+  if the request never reached the server.
 - **Order is part of the contract:** when the spec requires requests in a given order
   (e.g. `core.set_options` right after the login, before any other call), a test checks
   the order of the requests the fake server received (`FakeTrueNASServer.requests`),
