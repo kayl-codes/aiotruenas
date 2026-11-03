@@ -1916,14 +1916,26 @@ async def test_enable_private_methods_timeout_raises() -> None:
             await client.close()
 
 
-async def test_connect_fails_if_private_methods_option_times_out() -> None:
+async def test_connect_fails_if_private_methods_option_times_out(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
     async with FakeTrueNASServer(
         valid_api_key=API_KEY, drop_response_for={"core.set_options"}
     ) as server:
-        client = make_client(server, query_timeout=0.2)
+        # Login gets a generous timeout; only the option request after it
+        # runs with the short one, so a slow login cannot fail the test.
+        client = make_client(server, query_timeout=10.0)
+        login = client._login
+
+        async def login_then_shorten(ws):
+            await login(ws)
+            client._query_timeout = 0.2
+
+        monkeypatch.setattr(client, "_login", login_then_shorten)
         await client.enable_private_methods()
         with pytest.raises(TrueNASCallTimeoutError, match="core.set_options"):
             await client.connect()
+        await asyncio.wait_for(server.request_seen["core.set_options"].wait(), 2)
         assert not client.connected
 
 
