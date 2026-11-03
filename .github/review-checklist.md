@@ -59,6 +59,18 @@ and are the reference for these rules; the README's "Semantics" and stale-data p
   every other call. Connection setup is the exception: `connect()` holds the lock through the login handshake on
   purpose (no call can run before login, and concurrent `connect()`s must not race). A failure
   or cancel while holding it must not leave the lock held or the connection unusable for the next call.
+- **State follows confirmation:** state that records a request as done (e.g.
+  `_private_methods_ws`, the connection the option was sent on) is set only after the
+  awaited confirmation has returned, never before the `await`. State that only records
+  what the caller asked for (e.g. `_private_methods`, which later `connect()` calls
+  read) is not covered. For an idempotent request (a setting such as
+  `core.set_options`) that times out, loses the connection or is cancelled, the state
+  still says "not done", so the next attempt sends it again. (A documented, logged
+  server rejection may count as done, as for `enable_private_methods()`.) A
+  non-idempotent or state-removing request (starting a scrub, `unsubscribe()`) may
+  already have taken effect on the server, so the client does not resend it on its
+  own; that operation's documented handling decides. Flag a done-state change placed
+  before the request it depends on.
 - **Docs follow behaviour:** a change to what a public method raises, tolerates or returns updates its docstring,
   the README contract text and `CHANGELOG.md` (`[Unreleased]`) in the same PR.
 
@@ -77,6 +89,31 @@ and are the reference for these rules; the README's "Semantics" and stale-data p
   and, after acquiring the lock, that the call is still pending (its task not done, its `_pending_calls` entry
   present), so that a timeout firing in `send()` would fail it. Flag sleep-based timing and tests that would also
   pass if the cancel or timeout landed in a different phase.
+- **Prove a waiter waits:** to show that a second caller waits for a lock (or an event),
+  hold it in the test and take the signal that the second caller reached it (e.g. a
+  lock subclass that sets an `asyncio.Event` in `acquire()`). Then check that the
+  second caller is not done, release the lock and check the result. No sleep stands
+  in for "it is waiting by now".
+- **Real timeouts leave margin:** when a real timeout fires in a test, it is long enough
+  for the test to finish its phase checks before it fires (lock taken and released,
+  call still pending), not just long enough for the happy path on a fast machine.
+- **Shorten only the timeout under test:** when several requests share one timeout
+  (`_query_timeout` covers both `_login` and the option request after it), only the
+  request under test runs with the short value. Earlier requests get a generous one,
+  e.g. by shortening it in a wrapper after they finish. Otherwise a slow login on a
+  CI runner fails the test with the wrong method in the error.
+- **Bounded waits for server events:** wait for fake-server evidence
+  (`request_seen[...]`) with `asyncio.wait_for(event.wait(), <seconds>)`. Do not check
+  `is_set()` once after the action: the server task may not have run yet. The event
+  stays set once a method was seen, so it must be fresh evidence for **this** request:
+  a method no earlier step of the test called, or an event cleared right before the
+  action while no earlier request for that method is still in flight (a late one
+  sets the same event). Otherwise the wait returns at once and the test passes even
+  if the request never reached the server.
+- **Order is part of the contract:** when the spec requires requests in a given order
+  (e.g. `core.set_options` right after the login, before any other call), a test checks
+  the order of the requests the fake server received (`FakeTrueNASServer.requests`),
+  not just that each one arrived.
 - **Fake responses match the real server:** fake-server payloads for a new or changed RPC follow the shape TrueNAS
   actually sends (live run or middleware source), including the "no data" shapes (e.g. a netdata graph item with
   `legend: ["time"]` and empty aggregations), not just the happy path.
