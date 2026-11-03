@@ -99,7 +99,11 @@ and are the reference for these rules; the README's "Semantics" and stale-data p
   CI runner fails the test with the wrong method in the error.
 - **Bounded waits for server events:** wait for fake-server evidence
   (`request_seen[...]`) with `asyncio.wait_for(event.wait(), <seconds>)`. Do not check
-  `is_set()` once after the action: the server task may not have run yet.
+  `is_set()` once after the action: the server task may not have run yet. The event
+  stays set once a method was seen, so it must be fresh evidence for **this** request:
+  a method no earlier step of the test called, or an event cleared right before the
+  action. Otherwise the wait returns at once and the test passes even if the request
+  never reached the server.
 - **Order is part of the contract:** when the spec requires requests in a given order
   (e.g. `core.set_options` right after the login, before any other call), a test checks
   the order of the requests the fake server received (`FakeTrueNASServer.requests`),
