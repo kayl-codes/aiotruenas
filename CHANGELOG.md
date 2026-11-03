@@ -5,6 +5,8 @@ published on the [GitHub releases page](https://github.com/kayl-codes/aiotruenas
 
 ## [Unreleased]
 
+## [1.9.0] - 2026-11-03
+
 ### Added
 
 - `TrueNASClient.enable_private_methods()` (kayl-codes/homeassistant-truenas#220): sends
