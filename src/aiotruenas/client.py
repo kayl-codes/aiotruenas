@@ -21,6 +21,7 @@ from .exceptions import (
     TrueNASCallTimeoutError,
     TrueNASConnectionClosedError,
     TrueNASConnectionError,
+    TrueNASError,
     TrueNASMalformedResponseError,
 )
 
@@ -49,6 +50,8 @@ _JSONRPC_VERSION = "2.0"
 _KEY_ERROR = "error"
 _KEY_RESULT = "result"
 _CLOSED_BY_CLIENT = "connection closed by the client"
+_SET_OPTIONS = "core.set_options"
+_PRIVATE_METHODS_OPTION = {"private_methods": True}
 
 
 class _SubscriptionTerminator:
@@ -123,6 +126,16 @@ class TrueNASClient:
         self._subscriptions: dict[str, asyncio.Queue[_SubscriptionMessage]] = {}
         self._subscription_events: dict[str, str] = {}
         self._reader_task: asyncio.Task[None] | None = None
+        # Set by enable_private_methods(); TrueNAS keeps connection options
+        # per connection, so connect() re-sends the option after every login.
+        self._private_methods = False
+        # The connection the option was last sent on, so that repeated
+        # enable_private_methods() calls send it once per connection.
+        self._private_methods_ws: ClientConnection | None = None
+        # Makes concurrent enable_private_methods() calls wait for the request
+        # in flight, so none returns before the option is in effect.
+        self._private_methods_lock = asyncio.Lock()
+        self._private_methods_warned = False
 
     @property
     def connected(self) -> bool:
@@ -207,30 +220,67 @@ class TrueNASClient:
             if isinstance(candidate, dict) and candidate.get("id") == rpc_id:
                 return candidate
 
-    async def _login(self, ws: ClientConnection) -> None:
+    async def _request_before_reader(
+        self, ws: ClientConnection, method: str, params: list, *, what: str
+    ) -> dict[str, Any]:
+        """Send one request on ``ws`` and wait for its raw reply.
+
+        Only for ``connect()``, before the reader of ``ws`` runs: nothing
+        routes replies yet, and a lost connection counts as lost at login.
+        """
         rpc_id = self._next_id()
         payload = {
             "jsonrpc": _JSONRPC_VERSION,
             "id": rpc_id,
-            "method": "auth.login_with_api_key",
-            "params": [self._api_key],
+            "method": method,
+            "params": params,
         }
         try:
             await ws.send(json.dumps(payload))
             async with asyncio.timeout(self._query_timeout):
-                response = await self._await_response(ws, rpc_id)
+                return await self._await_response(ws, rpc_id)
         except TimeoutError as exc:
             raise TrueNASCallTimeoutError(
-                "timed out while waiting for login response"
+                f"timed out while waiting for {what} response"
             ) from exc
         except (ConnectionClosed, OSError, WebSocketException) as exc:
             raise TrueNASConnectionClosedError(str(exc), phase="login") from exc
+
+    async def _login(self, ws: ClientConnection) -> None:
+        response = await self._request_before_reader(
+            ws, "auth.login_with_api_key", [self._api_key], what="login"
+        )
 
         if response.get(_KEY_ERROR):
             raise build_call_error(response[_KEY_ERROR])
 
         if response.get(_KEY_RESULT) is not True:
             raise TrueNASAuthenticationError("TrueNAS rejected the API key")
+
+    async def _send_private_methods_option(self, ws: ClientConnection) -> None:
+        """Re-enable private methods on ``ws`` right after its login."""
+        response = await self._request_before_reader(
+            ws, _SET_OPTIONS, [_PRIVATE_METHODS_OPTION], what=_SET_OPTIONS
+        )
+        if response.get(_KEY_ERROR):
+            self._log_private_methods_failure(build_call_error(response[_KEY_ERROR]))
+        elif _KEY_RESULT not in response:
+            self._log_private_methods_failure(
+                TrueNASMalformedResponseError(
+                    f"response for {_SET_OPTIONS!r} has no result"
+                )
+            )
+
+    def _log_private_methods_failure(self, err: TrueNASError) -> None:
+        """Log a rejected ``core.set_options`` once as a warning, then at DEBUG."""
+        log = _LOGGER.debug if self._private_methods_warned else _LOGGER.warning
+        self._private_methods_warned = True
+        log(
+            "TrueNAS %s: could not enable private methods (%s); private "
+            "methods still work, but TrueNAS logs a warning for each call",
+            self._host,
+            err,
+        )
 
     async def _read_loop(self, ws: ClientConnection) -> None:
         """Background reader that routes the messages of ``ws``."""
@@ -379,6 +429,7 @@ class TrueNASClient:
         Caller must already hold ``self._lock``.
         """
         self._ws = None
+        self._private_methods_ws = None
         reader_task = self._reader_task
         self._reader_task = None
 
@@ -432,6 +483,9 @@ class TrueNASClient:
         ``quiet=True`` downgrades the ``verify_ssl=False`` warning to DEBUG,
         for callers (e.g. discovery probing) that intentionally attempt many
         expected-to-fail insecure connections.
+
+        After :meth:`enable_private_methods`, every connect re-sends that
+        option right after the login (see there for its failure handling).
         """
         async with self._lock:
             if self._ws is not None:
@@ -440,6 +494,10 @@ class TrueNASClient:
             ws = await self._open_websocket(quiet=quiet)
             try:
                 await self._login(ws)
+                # Read after the login: enable_private_methods() called while
+                # it ran saw no connection and left sending the option to us.
+                if self._private_methods:
+                    await self._send_private_methods_option(ws)
             except BaseException as exc:
                 # Nothing tracks this socket yet: release it on any failure,
                 # and drop it outright if the login or its graceful close is
@@ -453,7 +511,43 @@ class TrueNASClient:
                 raise
 
             self._ws = ws
+            if self._private_methods:
+                self._private_methods_ws = ws
             self._reader_task = asyncio.create_task(self._read_loop(ws))
+
+    async def enable_private_methods(self) -> None:
+        """Allow private TrueNAS API methods (e.g. ``smb.status``) without warnings.
+
+        TrueNAS runs a private method on any connection whose API key has the
+        needed role, but logs "Private method ... called on a connection
+        without private_methods enabled" to ``middlewared.log`` for each call
+        unless the connection has sent ``core.set_options({"private_methods":
+        True})``. This sends that option on the current connection, if any,
+        and makes every later :meth:`connect` send it again right after the
+        login, since TrueNAS keeps it per connection. Sent at most once per
+        connection, so repeated calls are cheap.
+
+        A server that rejects the option, or answers without a result, is
+        logged (once as a warning, then at DEBUG), not raised: private methods
+        keep working, only the server-side warning stays. A timeout or a lost
+        connection raises like :meth:`call` does (and fails :meth:`connect`
+        the same way). Concurrent calls wait for the one in flight.
+        """
+        self._private_methods = True
+        async with self._private_methods_lock:
+            ws = self._ws
+            if ws is None or self._private_methods_ws is ws:
+                return
+            try:
+                await self._call_on_connection(
+                    _SET_OPTIONS, [_PRIVATE_METHODS_OPTION], expected_ws=ws
+                )
+            except (TrueNASCallError, TrueNASMalformedResponseError) as err:
+                self._log_private_methods_failure(err)
+            # Not reached if cancelled, timed out or the connection was lost:
+            # the next call on this connection sends it again.
+            if self._ws is ws:
+                self._private_methods_ws = ws
 
     async def close(self) -> None:
         """Close the WebSocket connection, if any. Safe to call repeatedly.

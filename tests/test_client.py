@@ -8,6 +8,7 @@ import json
 import logging
 import socket
 import ssl
+from collections.abc import Callable
 
 import pytest
 import trustme
@@ -1764,3 +1765,287 @@ async def test_cancel_during_send_does_not_leak_pending_future(monkeypatch) -> N
             assert not client._lock.locked()
             monkeypatch.setattr(client._ws, "send", real_send)
             assert await client.call("system.version") == "25.04"
+
+
+# --- Private methods (core.set_options) -------------------------------------
+
+_PRIVATE_METHODS_PARAMS = [{"private_methods": True}]
+_SET_OPTIONS_RESULT = {
+    "legacy_jobs": True,
+    "private_methods": True,
+    "py_exceptions": False,
+}
+
+
+def _recording_set_options(sent: list[list]) -> Callable[[list], dict]:
+    def respond(params: list) -> dict:
+        sent.append(params)
+        return _SET_OPTIONS_RESULT
+
+    return respond
+
+
+class _WaitSignalingLock(asyncio.Lock):
+    """Sets ``waiting`` when a caller has to wait for the lock."""
+
+    def __init__(self) -> None:
+        super().__init__()
+        self.waiting = asyncio.Event()
+
+    async def acquire(self) -> bool:
+        if self.locked():
+            self.waiting.set()
+        return await super().acquire()
+
+
+async def test_enable_private_methods_sends_option_once_per_connection() -> None:
+    sent: list[list] = []
+    async with FakeTrueNASServer(
+        valid_api_key=API_KEY,
+        responses={"core.set_options": _recording_set_options(sent)},
+    ) as server:
+        async with make_client(server) as client:
+            await client.enable_private_methods()
+            await client.enable_private_methods()
+
+    assert sent == [_PRIVATE_METHODS_PARAMS]
+
+
+async def test_enable_private_methods_before_connect_sends_after_login() -> None:
+    sent: list[list] = []
+    async with FakeTrueNASServer(
+        valid_api_key=API_KEY,
+        responses={"core.set_options": _recording_set_options(sent)},
+    ) as server:
+        client = make_client(server)
+        await client.enable_private_methods()
+        assert not sent
+
+        await client.connect()
+        try:
+            assert sent == [_PRIVATE_METHODS_PARAMS]
+            assert server.requests == ["auth.login_with_api_key", "core.set_options"]
+            # Already sent by connect(): no second request on this connection.
+            await client.enable_private_methods()
+            assert sent == [_PRIVATE_METHODS_PARAMS]
+        finally:
+            await client.close()
+
+
+async def test_private_methods_option_is_resent_after_reconnect() -> None:
+    sent: list[list] = []
+    async with FakeTrueNASServer(
+        valid_api_key=API_KEY,
+        responses={"core.set_options": _recording_set_options(sent)},
+        close_on_method={"system.info"},
+    ) as server:
+        client = make_client(server)
+        await client.connect()
+        await client.enable_private_methods()
+        with pytest.raises(TrueNASConnectionClosedError):
+            await client.call("system.info")
+        assert not client.connected
+
+        await client.connect()
+        try:
+            assert client.connected
+            assert sent == [_PRIVATE_METHODS_PARAMS, _PRIVATE_METHODS_PARAMS]
+        finally:
+            await client.close()
+
+
+async def test_rejected_private_methods_option_is_not_fatal(caplog) -> None:
+    """A server that rejects core.set_options (here: unknown method) leaves
+    the client usable, logs one warning, and does not fail a reconnect.
+    """
+    async with FakeTrueNASServer(
+        valid_api_key=API_KEY, responses={"system.version": "25.10"}
+    ) as server:
+        client = make_client(server)
+        with caplog.at_level(logging.DEBUG, logger="aiotruenas.client"):
+            await client.connect()
+            await client.enable_private_methods()
+            assert await client.call("system.version") == "25.10"
+
+            await client.close()
+            await client.connect()
+            try:
+                assert client.connected
+                assert await client.call("system.version") == "25.10"
+            finally:
+                await client.close()
+
+    failures = [
+        r for r in caplog.records if "could not enable private methods" in r.message
+    ]
+    assert [r.levelno for r in failures] == [logging.WARNING, logging.DEBUG]
+
+
+async def test_connect_fails_if_connection_drops_while_sending_option() -> None:
+    async with FakeTrueNASServer(
+        valid_api_key=API_KEY, close_on_method={"core.set_options"}
+    ) as server:
+        client = make_client(server)
+        await client.enable_private_methods()
+        with pytest.raises(TrueNASConnectionClosedError) as exc_info:
+            await client.connect()
+        assert exc_info.value.phase == "login"
+        assert not client.connected
+
+
+async def test_enable_private_methods_timeout_raises() -> None:
+    async with FakeTrueNASServer(
+        valid_api_key=API_KEY, drop_response_for={"core.set_options"}
+    ) as server:
+        # Long enough that the phase checks below finish before the
+        # reply-wait timeout fires, even on a slow runner.
+        client = make_client(server, query_timeout=3.0)
+        await client.connect()
+        try:
+            task = asyncio.create_task(client.enable_private_methods())
+            await server.request_seen["core.set_options"].wait()
+            # The send returned (lock released) and the call waits for its reply.
+            async with client._lock:
+                pass
+            assert not task.done()
+            assert len(client._pending_calls) == 1
+            with pytest.raises(TrueNASCallTimeoutError, match="core.set_options"):
+                await asyncio.wait_for(task, 10)
+            assert not client.connected
+        finally:
+            await client.close()
+
+
+async def test_connect_fails_if_private_methods_option_times_out(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    async with FakeTrueNASServer(
+        valid_api_key=API_KEY, drop_response_for={"core.set_options"}
+    ) as server:
+        # Login gets a generous timeout; only the option request after it
+        # runs with the short one, so a slow login cannot fail the test.
+        client = make_client(server, query_timeout=10.0)
+        login = client._login
+
+        async def login_then_shorten(ws):
+            await login(ws)
+            client._query_timeout = 0.2
+
+        monkeypatch.setattr(client, "_login", login_then_shorten)
+        await client.enable_private_methods()
+        with pytest.raises(TrueNASCallTimeoutError, match="core.set_options"):
+            await client.connect()
+        await asyncio.wait_for(server.request_seen["core.set_options"].wait(), 2)
+        assert not client.connected
+
+
+async def test_cancelled_enable_private_methods_is_retried() -> None:
+    """A cancel before the reply must not mark the connection as done, or
+    the option would never be sent on it.
+    """
+    sent: list[list] = []
+    async with FakeTrueNASServer(
+        valid_api_key=API_KEY, drop_response_for={"core.set_options"}
+    ) as server:
+        async with make_client(server) as client:
+            task = asyncio.ensure_future(client.enable_private_methods())
+            await asyncio.wait_for(server.request_seen["core.set_options"].wait(), 2)
+            # send() returned once the lock is free: the cancel below hits the
+            # wait for the reply, not the send.
+            async with client._lock:
+                pass
+            task.cancel()
+            with pytest.raises(asyncio.CancelledError):
+                await task
+
+            server.drop_response_for.clear()
+            server.responses["core.set_options"] = _recording_set_options(sent)
+            await client.enable_private_methods()
+            assert client.connected
+
+    assert sent == [_PRIVATE_METHODS_PARAMS]
+
+
+async def test_concurrent_enable_private_methods_waits_for_request_in_flight() -> None:
+    """A second caller must not return, and go on to call a private method,
+    while the option is still unconfirmed, nor send it again once confirmed.
+    """
+    sent: list[list] = []
+    async with FakeTrueNASServer(
+        valid_api_key=API_KEY, drop_response_for={"core.set_options"}
+    ) as server:
+        async with make_client(server) as client:
+            lock = client._private_methods_lock = _WaitSignalingLock()
+            first = asyncio.ensure_future(client.enable_private_methods())
+            await asyncio.wait_for(server.request_seen["core.set_options"].wait(), 2)
+            second = asyncio.ensure_future(client.enable_private_methods())
+            # The second caller waits for the lock the first one holds.
+            await asyncio.wait_for(lock.waiting.wait(), 2)
+            assert not second.done()
+
+            server.drop_response_for.clear()
+            server.responses["core.set_options"] = _recording_set_options(sent)
+            (rpc_id,) = client._pending_calls
+            await server.send_reply(rpc_id, _SET_OPTIONS_RESULT)
+            await asyncio.wait_for(asyncio.gather(first, second), 2)
+
+    assert sent == []
+
+
+async def test_concurrent_enable_private_methods_retries_after_cancel() -> None:
+    """If the request in flight is cancelled, the waiting caller sends it."""
+    sent: list[list] = []
+    async with FakeTrueNASServer(
+        valid_api_key=API_KEY, drop_response_for={"core.set_options"}
+    ) as server:
+        async with make_client(server) as client:
+            lock = client._private_methods_lock = _WaitSignalingLock()
+            first = asyncio.ensure_future(client.enable_private_methods())
+            await asyncio.wait_for(server.request_seen["core.set_options"].wait(), 2)
+            second = asyncio.ensure_future(client.enable_private_methods())
+            # The second caller waits for the lock the first one holds.
+            await asyncio.wait_for(lock.waiting.wait(), 2)
+            assert not second.done()
+
+            server.drop_response_for.clear()
+            server.responses["core.set_options"] = _recording_set_options(sent)
+            # The first caller holds client._lock until its send() returns (the
+            # second waits on the private-methods lock): the cancel below hits
+            # the wait for the reply, not the send.
+            async with client._lock:
+                pass
+            first.cancel()
+            with pytest.raises(asyncio.CancelledError):
+                await first
+            await asyncio.wait_for(second, 2)
+            assert client.connected
+
+    assert sent == [_PRIVATE_METHODS_PARAMS]
+
+
+async def test_private_methods_option_without_result_is_not_fatal(caplog) -> None:
+    """A core.set_options reply with neither result nor error is logged like a
+    rejection, both from enable_private_methods() and from connect().
+    """
+    async with FakeTrueNASServer(
+        valid_api_key=API_KEY,
+        responses={"core.set_options": NO_RESULT, "system.version": "25.10"},
+    ) as server:
+        client = make_client(server)
+        with caplog.at_level(logging.DEBUG, logger="aiotruenas.client"):
+            await client.connect()
+            await client.enable_private_methods()
+
+            await client.close()
+            await client.connect()
+            try:
+                assert client.connected
+                assert await client.call("system.version") == "25.10"
+            finally:
+                await client.close()
+
+    failures = [
+        r for r in caplog.records if "could not enable private methods" in r.message
+    ]
+    assert [r.levelno for r in failures] == [logging.WARNING, logging.DEBUG]
+    assert all("has no result" in r.message for r in failures)

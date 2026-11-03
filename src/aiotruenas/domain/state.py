@@ -25,7 +25,7 @@ from logging import getLogger
 from typing import Any, TypedDict, cast
 
 from ..client import TrueNASClient
-from ..exceptions import TrueNASError
+from ..exceptions import TrueNASCallError, TrueNASError
 from ._helpers import (
     _aggregate_topology_errors,
     _arc_value,
@@ -668,6 +668,10 @@ class TrueNASState:
         # a guid to str, so a hashable-but-non-str guid (e.g. an int) is
         # technically possible and would be stored as-is.
         self._boot_pool_uid: Hashable | None = None
+        # Set once smb.status was refused with EACCES (the API key lacks
+        # FULL_ADMIN); get_smb() then stops querying it for this object's
+        # lifetime instead of failing the same way every poll.
+        self._smb_denied = False
 
     @property
     def ds(self) -> _PublicStateMap:
@@ -2041,11 +2045,27 @@ class TrueNASState:
         Flat dict (single ``connections`` key), matching the ``arc``/``ups``
         endpoints' shape. A malformed/failed response keeps the previous
         count rather than reporting a false "0 connections".
+
+        ``smb.status`` is a *private* TrueNAS method that needs an API key
+        with the ``FULL_ADMIN`` role. Each call therefore first enables
+        private methods on the client
+        (:meth:`~aiotruenas.TrueNASClient.enable_private_methods`, a no-op
+        once done on the current connection), which keeps TrueNAS from
+        logging a warning for every query. If TrueNAS refuses the call with
+        ``EACCES`` (a key without ``FULL_ADMIN``), this logs it once at INFO
+        and, for the lifetime of this object, returns the previous count
+        (the initial 0 if there never was one) without querying again;
+        ``"smb"`` then stays in :attr:`stale_endpoints`.
         """
         async with self._lock:
+            if self._smb_denied:
+                return self._ds["smb"]
             try:
+                await self._client.enable_private_methods()
                 raw = await self._client.call("smb.status")
             except TrueNASError as err:
+                if self._latch_smb_denied(err):
+                    return self._ds["smb"]
                 self._note_fallback_outcome(
                     _KEY_SMB_STATUS,
                     failed=True,
@@ -2069,6 +2089,21 @@ class TrueNASState:
                 _KEY_SMB_STATUS, failed=False, recovered="SMB status recovered"
             )
             return self._ds["smb"]
+
+    def _latch_smb_denied(self, err: TrueNASError) -> bool:
+        """Stop querying ``smb.status`` if ``err`` is an ``EACCES`` refusal."""
+        if not isinstance(err, TrueNASCallError) or err.errname != "EACCES":
+            return False
+        self._smb_denied = True
+        # Logged once at INFO below, not through _note_fallback_outcome()'s
+        # warning, but the cached count stays in stale_endpoints for good.
+        self._fallback_failing[_KEY_SMB_STATUS] = True
+        _LOGGER.info(
+            "'smb.status' was refused (%s); it needs an API key with the "
+            "FULL_ADMIN role, so the SMB connection count is no longer queried",
+            err,
+        )
+        return True
 
     @staticmethod
     def _no_update_pending() -> _UpdateMap:

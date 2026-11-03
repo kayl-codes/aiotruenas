@@ -53,6 +53,8 @@ class FakeTrueNASServer:
     request_seen: defaultdict[str, asyncio.Event] = field(
         default_factory=lambda: defaultdict(asyncio.Event), init=False
     )
+    #: Every request's method, in the order the server received them.
+    requests: list[str] = field(default_factory=list, init=False)
     #: Events whose ``core.subscribe`` reply is followed at once by one
     #: notification, as from an event source that sends its current state.
     notify_after_subscribe: set[str] = field(default_factory=set)
@@ -120,6 +122,11 @@ class FakeTrueNASServer:
                 payload["collection"] = collection_override
         await connection.send(json.dumps(payload))
 
+    async def send_reply(self, rpc_id: Any, result: Any) -> None:
+        """Answer request ``rpc_id`` late, e.g. one held by ``drop_response_for``."""
+        assert self._connection is not None
+        await self._connection.send(_envelope(rpc_id, **{_KEY_RESULT: result}))
+
     async def close_connection(self) -> None:
         """Abruptly close the active client connection, simulating a server drop."""
         if self._connection is not None:
@@ -158,6 +165,7 @@ class FakeTrueNASServer:
         rpc_id = message.get("id")
         params = message.get("params") or []
         self.request_seen[method].set()
+        self.requests.append(method)
 
         if method == "auth.login_with_api_key":
             await self._handle_login(ws, rpc_id, params)

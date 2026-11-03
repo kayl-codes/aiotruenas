@@ -5,6 +5,26 @@ published on the [GitHub releases page](https://github.com/kayl-codes/aiotruenas
 
 ## [Unreleased]
 
+### Added
+
+- `TrueNASClient.enable_private_methods()` (kayl-codes/homeassistant-truenas#220): sends
+  `core.set_options({"private_methods": True})` on the current connection and again right after
+  the login of every later (re)connect, since TrueNAS keeps the option per connection. Without it,
+  TrueNAS logs "Private method ... called on a connection without private_methods enabled" to
+  `middlewared.log` for every private call, even with a `FULL_ADMIN` key. A server that rejects the
+  option, or answers without a result, is logged (once as a warning), not raised. A timeout or a
+  lost connection raises like `call()`, and fails `connect()` when it happens there. Concurrent
+  calls wait for the request in flight, so none returns before the option is in effect.
+
+### Changed
+
+- `TrueNASState.get_smb()` enables private methods before calling `smb.status`, so polling the SMB
+  connection count no longer fills `middlewared.log` with warnings. If TrueNAS refuses
+  `smb.status` with `EACCES` (an API key without `FULL_ADMIN`), it logs that once at INFO, keeps
+  the previous count, reports `smb` in `stale_endpoints` and stops querying for the lifetime of
+  the `TrueNASState` object. Other errors
+  keep the previous behaviour (warning, previous count, retried on the next call).
+
 ## [1.8.0] - 2026-10-28
 
 ### Added
